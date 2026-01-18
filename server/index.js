@@ -25,7 +25,7 @@ const app = express()
 app.use(cors())
 app.use(express.json())
 
-const PORT = process.env.PORT || 5175
+const PORT = process.env.PORT || 8080
 
 // Canonical WBNB/USDT addresses (lowercase) for BSC
 const WBNB_ADDRESS = '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c'
