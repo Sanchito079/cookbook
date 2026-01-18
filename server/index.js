@@ -3078,8 +3078,8 @@ app.get('/test/watchcount', async (req, res) => {
 })
 
 // Start HTTP server
-const server = app.listen(PORT, () => {
-  console.log(`Indexer server listening on http://localhost:${PORT}`)
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Indexer server listening on http://0.0.0.0:${PORT}`)
 })
 server.on('error', (err) => {
   console.error('[server] listen error:', err?.code || err?.message || err)
