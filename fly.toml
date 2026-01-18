@@ -2,5 +2,13 @@
   builder = "paketobuildpacks/builder:base"
   buildpacks = ["paketobuildpacks/nodejs"]
 
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+  [services.concurrency]
+    hard_limit = 25
+    soft_limit = 20
+    type = "connections"
+
 [processes]
   app = "npm start"
