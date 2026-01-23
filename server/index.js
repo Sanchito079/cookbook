@@ -3106,6 +3106,21 @@ const wss = new WebSocketServer({ server })
 // Map of pair keys to set of WebSocket connections
 const subscribers = new Map()
 
+// Function to broadcast updates to subscribers
+const broadcastUpdate = (network, base, quote, updateType, data) => {
+  const pairKey = `${network}:${base}:${quote}`
+  const conns = subscribers.get(pairKey)
+  if (conns) {
+    const message = JSON.stringify({ type: updateType, data, timestamp: new Date().toISOString() })
+    conns.forEach(ws => {
+      if (ws.readyState === ws.OPEN) {
+        ws.send(message)
+      }
+    })
+    console.log(`[WS] Broadcasted ${updateType} to ${conns.size} subscribers for ${pairKey}`)
+  }
+}
+
 wss.on('connection', (ws) => {
   console.log('[WS] New connection')
 
@@ -3142,21 +3157,6 @@ wss.on('connection', (ws) => {
   })
 })
 
-// Function to broadcast updates to subscribers
-const broadcastUpdate = (network, base, quote, updateType, data) => {
-  const pairKey = `${network}:${base}:${quote}`
-  const conns = subscribers.get(pairKey)
-  if (conns) {
-    const message = JSON.stringify({ type: updateType, data, timestamp: new Date().toISOString() })
-    conns.forEach(ws => {
-      if (ws.readyState === ws.OPEN) {
-        ws.send(message)
-      }
-    })
-    console.log(`[WS] Broadcasted ${updateType} to ${conns.size} subscribers for ${pairKey}`)
-  }
-}
-
 // Endpoint for broadcasting updates (called by executor)
 app.post('/api/broadcast', (req, res) => {
   const { network, base, quote, type, data } = req.body
@@ -3174,3 +3174,4 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
