@@ -3082,7 +3082,7 @@ app.get('/test/watchcount', async (req, res) => {
 // Endpoint for broadcasting updates (called by executor)
 app.post('/api/broadcast', (req, res) => {
   const { network, base, quote, type, data } = req.body
-  console.log('[BROADCAST] Received:', { network, base, quote, type, data })
+console.log('[BROADCAST] Received:', { network, base, quote, type, data })
   if (!network || !base || !quote || !type) {
     return res.status(400).json({ error: 'Missing required fields' })
   }
@@ -3175,3 +3175,4 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+

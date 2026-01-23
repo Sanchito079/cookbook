@@ -1563,7 +1563,7 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
 
       // Broadcast real-time update to clients
       try {
-        const INDEXER_BASE = 'https://cookbook-hjnhgq.fly.dev'
+      const INDEXER_BASE = 'https://cookbook-hjnhgq.fly.dev'
         await fetch(`${INDEXER_BASE}/api/broadcast`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
