@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node ./server/index.js",
     "dev": "vite",
+    "build": "node --max-old-space-size=4096 node_modules/vite/bin/vite.js build",
     "lint": "eslint .",
     "preview": "vite preview",
     "server": "node ./server/index.js",
@@ -20,17 +21,21 @@
     "@solana/wallet-adapter-wallets": "^0.19.37",
     "@solana/web3.js": "^1.98.4",
     "@supabase/supabase-js": "^2.75.1",
+    "@web3icons/react": "^4.1.14",
     "bs58": "^6.0.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "ethers": "^6.15.0",
     "express": "^4.21.1",
     "i18next": "^25.7.4",
+    "lucide-react": "^0.562.0",
     "node-fetch": "^3.3.2",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "react-hot-toast": "^2.6.0",
-    "react-i18next": "^16.5.2"
+    "react-i18next": "^16.5.2",
+    "react-icons": "^5.5.0",
+    "ws": "^8.19.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.36.0",

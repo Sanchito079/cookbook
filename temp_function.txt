@@ -1,0 +1,25 @@
+﻿function classifyOrder(base, quote, order, tokenInDec, tokenOutDec) {
+  const baseL = toLower(base), quoteL = toLower(quote)
+  const tokenIn = toLower(order?.tokenIn), tokenOut = toLower(order?.tokenOut)
+  if (!baseL || !quoteL || !tokenIn || !tokenOut) return { side: null, price: null }
+  const amountIn = BigInt(order.amountIn || 0n)
+  const amountOutMin = BigInt(order.amountOutMin || 0n)
+  if (amountIn === 0n) return { side: null, price: null }
+  // ask: selling base for quote
+  // Price = quote amount / base amount
+  if (tokenIn === baseL && tokenOut === quoteL) {
+    const baseAmount = Number(amountIn) / 10**tokenInDec
+    const quoteAmount = Number(amountOutMin) / 10**tokenOutDec
+    const price = quoteAmount / baseAmount
+    return { side: 'ask', price }
+  }
+  // bid: buying base with quote
+  // Price = quote amount / base amount
+  if (tokenIn === quoteL && tokenOut === baseL) {
+    const quoteAmount = Number(amountIn) / 10**tokenInDec
+    const baseAmount = Number(amountOutMin) / 10**tokenOutDec
+    const price = quoteAmount / baseAmount
+    return { side: 'bid', price }
+  }
+  return { side: null, price: null }
+}
