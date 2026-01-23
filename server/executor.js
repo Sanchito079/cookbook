@@ -1560,6 +1560,29 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
         block_number: receipt.blockNumber,
         created_at: new Date().toISOString()
       })
+
+      // Broadcast real-time update to clients
+      try {
+        const INDEXER_BASE = process.env.INDEXER_BASE || 'http://localhost:8080'
+        await fetch(`${INDEXER_BASE}/api/broadcast`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            network,
+            base: baseAddr,
+            quote: quoteAddr,
+            type: 'new_fill',
+            data: {
+              amount_base: baseOut.toString(),
+              amount_quote: quoteIn.toString(),
+              price: priceHuman,
+              tx_hash: receipt.hash || tx.hash
+            }
+          })
+        })
+      } catch (broadcastErr) {
+        console.warn('[executor] failed to broadcast update:', broadcastErr?.message || broadcastErr)
+      }
     } catch (insErr) {
       console.warn('[executor] failed to insert trade records:', insErr?.message || insErr)
     }
