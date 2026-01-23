@@ -8,6 +8,7 @@ import { Contract as EthContract, JsonRpcProvider, Wallet } from 'ethers'
 import { PublicKey } from '@solana/web3.js'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { WebSocketServer } from 'ws'
 
 // Simple indexer service for new WBNB pools on BSC (extensible for other networks)
 // Exposes REST endpoints the UI can consume.
@@ -3077,6 +3078,17 @@ app.get('/test/watchcount', async (req, res) => {
   }
 })
 
+
+// Endpoint for broadcasting updates (called by executor)
+app.post('/api/broadcast', (req, res) => {
+  const { network, base, quote, type, data } = req.body
+  if (!network || !base || !quote || !type) {
+    return res.status(400).json({ error: 'Missing required fields' })
+  }
+  broadcastUpdate(network, base, quote, type, data)
+  res.json({ success: true })
+})
+
 // Start HTTP server
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Indexer server listening on http://0.0.0.0:${PORT}`)
@@ -3086,6 +3098,73 @@ server.on('error', (err) => {
   if (err?.code === 'EADDRINUSE') {
     console.error(`[server] Port ${PORT} is already in use. Set a different PORT in .env or stop the conflicting process.`)
   }
+})
+
+// WebSocket server for real-time updates
+const wss = new WebSocketServer({ server })
+
+// Map of pair keys to set of WebSocket connections
+const subscribers = new Map()
+
+wss.on('connection', (ws) => {
+  console.log('[WS] New connection')
+
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message.toString())
+      if (data.type === 'subscribe' && data.pair) {
+        const pairKey = `${data.network}:${data.base}:${data.quote}`
+        if (!subscribers.has(pairKey)) {
+          subscribers.set(pairKey, new Set())
+        }
+        subscribers.get(pairKey).add(ws)
+        console.log(`[WS] Subscribed to ${pairKey}, total subscribers: ${subscribers.get(pairKey).size}`)
+        ws.send(JSON.stringify({ type: 'subscribed', pair: data.pair }))
+      }
+    } catch (e) {
+      console.error('[WS] Error parsing message:', e)
+    }
+  })
+
+  ws.on('close', () => {
+    console.log('[WS] Connection closed')
+    // Remove from all subscriptions
+    for (const [pairKey, conns] of subscribers) {
+      conns.delete(ws)
+      if (conns.size === 0) {
+        subscribers.delete(pairKey)
+      }
+    }
+  })
+
+  ws.on('error', (err) => {
+    console.error('[WS] Error:', err)
+  })
+})
+
+// Function to broadcast updates to subscribers
+const broadcastUpdate = (network, base, quote, updateType, data) => {
+  const pairKey = `${network}:${base}:${quote}`
+  const conns = subscribers.get(pairKey)
+  if (conns) {
+    const message = JSON.stringify({ type: updateType, data, timestamp: new Date().toISOString() })
+    conns.forEach(ws => {
+      if (ws.readyState === ws.OPEN) {
+        ws.send(message)
+      }
+    })
+    console.log(`[WS] Broadcasted ${updateType} to ${conns.size} subscribers for ${pairKey}`)
+  }
+}
+
+// Endpoint for broadcasting updates (called by executor)
+app.post('/api/broadcast', (req, res) => {
+  const { network, base, quote, type, data } = req.body
+  if (!network || !base || !quote || !type) {
+    return res.status(400).json({ error: 'Missing required fields' })
+  }
+  broadcastUpdate(network, base, quote, type, data)
+  res.json({ success: true })
 })
 
 // Start on-chain executor in background
