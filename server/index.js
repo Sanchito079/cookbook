@@ -3047,22 +3047,59 @@ app.get('/api/orders', async (req, res) => {
     const asks = []
     const bids = []
     for (const r of rows) {
-      const tokenInComp = network === 'solana' ? r.token_in : toLower(r.token_in)
-      const tokenOutComp = network === 'solana' ? r.token_out : toLower(r.token_out)
-      const side = (tokenInComp === base && tokenOutComp === quote) ? 'ask' : (tokenInComp === quote && tokenOutComp === base ? 'bid' : null)
+      let side = null
       let price = null
-      if (r.price != null) {
-        price = Number(r.price)
-      } else if (side === 'ask') {
-        // ask: selling base for quote, price = amountOutMin / 10^quoteDec / (amountIn / 10^baseDec)
-        price = Number(r.amount_out_min) / 10**quoteDec / (Number(r.amount_in) / 10**baseDec)
-      } else if (side === 'bid') {
-        // bid: selling quote for base, price = amountIn / 10^baseDec / (amountOutMin / 10^quoteDec)
-        price = Number(r.amount_in) / 10**baseDec / (Number(r.amount_out_min) / 10**quoteDec)
+      let amountIn = null
+
+      if (r.is_sal_order) {
+        // SAL order handling
+        const tokenInComp = network === 'solana' ? r.token_in : toLower(r.token_in)
+        const tokenOutComp = network === 'solana' ? r.token_out : toLower(r.token_out)
+
+        // SAL orders are always asks (selling base for quote)
+        if (tokenInComp === base && tokenOutComp === quote) {
+          side = 'ask'
+          price = Number(r.sal_current_price || r.sal_initial_price || 0)
+          // Available inventory = total - sold
+          const totalInventory = Number(r.sal_total_inventory || 0)
+          const soldAmount = Number(r.sal_sold_amount || 0)
+          amountIn = Math.max(0, totalInventory - soldAmount)
+
+          // Skip if no inventory left
+          if (amountIn <= 0) continue
+        }
+      } else {
+        // Regular order handling
+        const tokenInComp = network === 'solana' ? r.token_in : toLower(r.token_in)
+        const tokenOutComp = network === 'solana' ? r.token_out : toLower(r.token_out)
+        side = (tokenInComp === base && tokenOutComp === quote) ? 'ask' : (tokenInComp === quote && tokenOutComp === base ? 'bid' : null)
+
+        if (r.price != null) {
+          price = Number(r.price)
+        } else if (side === 'ask') {
+          // ask: selling base for quote, price = amountOutMin / 10^quoteDec / (amountIn / 10^baseDec)
+          price = Number(r.amount_out_min) / 10**quoteDec / (Number(r.amount_in) / 10**baseDec)
+        } else if (side === 'bid') {
+          // bid: selling quote for base, price = amountIn / 10^baseDec / (amountOutMin / 10^quoteDec)
+          price = Number(r.amount_in) / 10**baseDec / (Number(r.amount_out_min) / 10**quoteDec)
+        }
+        amountIn = Number(r.remaining)
       }
-      const rec = { id: r.order_id, maker: r.maker, price, amountIn: r.remaining, amountOutMin: r.amount_out_min, tokenIn: r.token_in, tokenOut: r.token_out }
-      if (side === 'ask') asks.push(rec)
-      else if (side === 'bid') bids.push(rec)
+
+      if (side && price != null && amountIn > 0) {
+        const rec = {
+          id: r.order_id,
+          maker: r.maker,
+          price,
+          amountIn,
+          amountOutMin: r.is_sal_order ? 'Adaptive' : r.amount_out_min,
+          tokenIn: r.token_in,
+          tokenOut: r.token_out,
+          isSalOrder: r.is_sal_order || false
+        }
+        if (side === 'ask') asks.push(rec)
+        else if (side === 'bid') bids.push(rec)
+      }
     }
 
     console.log('[SERVER ORDERS] Asks found:', asks.length, 'Bids found:', bids.length)
@@ -3601,6 +3638,7 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
 
 
 
