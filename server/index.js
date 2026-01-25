@@ -3092,6 +3092,7 @@ app.get('/api/orders', async (req, res) => {
           maker: r.maker,
           price,
           amountIn,
+          remaining: amountIn,
           amountOutMin: r.is_sal_order ? 'Adaptive' : r.amount_out_min,
           tokenIn: r.token_in,
           tokenOut: r.token_out,
@@ -3638,7 +3639,6 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
-
 
 
 
