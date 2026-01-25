@@ -3404,10 +3404,22 @@ app.get('/api/tokens/validate', async (req, res) => {
     // Check if token has existing markets
     const { data: marketData, error: marketError } = await supabase
       .from('markets')
-      .select('*')
+      .select('base_address, quote_address, base_symbol, quote_symbol')
       .eq('network', network)
       .or(`base_address.eq.${tokenAddr},quote_address.eq.${tokenAddr}`)
       .limit(10)
+
+    // Find suggested quote token
+    let suggestedQuote = null
+    if (marketData && marketData.length > 0) {
+      const market = marketData.find(m => m.base_address.toLowerCase() === tokenAddr.toLowerCase())
+      if (market) {
+        suggestedQuote = {
+          address: market.quote_address,
+          symbol: market.quote_symbol
+        }
+      }
+    }
 
     const result = {
       address: tokenAddr,
@@ -3415,6 +3427,7 @@ app.get('/api/tokens/validate', async (req, res) => {
       existsInTokens: !tokenError && tokenData,
       tokenInfo: tokenData || null,
       existingMarkets: marketError ? [] : (marketData || []),
+      suggestedQuote,
       canCreateSAL: !tokenError && tokenData // Only allow SAL for indexed tokens
     }
 
