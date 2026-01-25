@@ -3115,7 +3115,8 @@ app.post('/api/sal-orders', async (req, res) => {
       minPrice,
       expiration,
       receiver,
-      salt
+      salt,
+      signature
     } = req.body
 
     // Validate required fields
@@ -3134,6 +3135,18 @@ app.post('/api/sal-orders', async (req, res) => {
 
     if (!validation.isValid) {
       return res.status(400).json({ error: 'Invalid parameters', details: validation.errors })
+    }
+
+    // Validate that tokenIn is an indexed token
+    const { data: tokenData, error: tokenError } = await supabase
+      .from('tokens')
+      .select('address')
+      .eq('network', network)
+      .eq('address', tokenIn.toLowerCase())
+      .single()
+
+    if (tokenError || !tokenData) {
+      return res.status(400).json({ error: 'Token not indexed. Only indexed tokens can be used for SAL orders.' })
     }
 
     // Generate order ID and hash
@@ -3175,6 +3188,7 @@ app.post('/api/sal-orders', async (req, res) => {
         sal_max_price: maxPrice?.toString(),
         sal_min_price: minPrice?.toString(),
         sal_total_inventory: totalAmount.toString(),
+        sal_signature: signature,
         order_json: orderData
       })
 
@@ -3506,4 +3520,6 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
+
 
