@@ -3451,7 +3451,9 @@ app.get('/api/tokens/validate', async (req, res) => {
       result.message = `Token found in ${result.existingMarkets.length} existing market(s). You can add SAL liquidity to these markets!`
       result.marketPairs = result.existingMarkets.map(m => `${m.base_symbol || 'UNKNOWN'}/${m.quote_symbol || 'UNKNOWN'}`)
     } else if (result.existsInTokens) {
-      result.message = 'Token found in database. Perfect for SAL liquidity!'
+      const tokenSymbol = result.tokenInfo?.symbol || 'TOKEN'
+      const quoteSymbol = result.suggestedQuote?.symbol || 'QUOTE'
+      result.message = `Token found in database. SAL order will use ${tokenSymbol}/${quoteSymbol} pairing.`
     } else {
       result.message = 'Token not indexed. SAL orders are only available for indexed tokens to ensure quality and security.'
     }
@@ -3548,6 +3550,10 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
+
+
+
 
 
 
