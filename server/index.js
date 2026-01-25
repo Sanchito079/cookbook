@@ -3418,6 +3418,21 @@ app.get('/api/tokens/validate', async (req, res) => {
           address: market.quote_address,
           symbol: market.quote_symbol
         }
+      } else {
+        // If not found as base, use the first market's quote as default
+        suggestedQuote = {
+          address: marketData[0].quote_address,
+          symbol: marketData[0].quote_symbol
+        }
+      }
+    } else {
+      // No markets, use default quote
+      suggestedQuote = network === 'bsc' ? {
+        address: '0x55d398326f99059ff775485246999027b3197955',
+        symbol: 'USDT'
+      } : {
+        address: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
+        symbol: 'USDC'
       }
     }
 
@@ -3428,7 +3443,7 @@ app.get('/api/tokens/validate', async (req, res) => {
       tokenInfo: tokenData || null,
       existingMarkets: marketError ? [] : (marketData || []),
       suggestedQuote,
-      canCreateSAL: !tokenError && tokenData // Only allow SAL for indexed tokens
+      canCreateSAL: !tokenError && tokenData // Allow SAL for all indexed tokens
     }
 
     // Add helpful messages
@@ -3436,7 +3451,7 @@ app.get('/api/tokens/validate', async (req, res) => {
       result.message = `Token found in ${result.existingMarkets.length} existing market(s). You can add SAL liquidity to these markets!`
       result.marketPairs = result.existingMarkets.map(m => `${m.base_symbol || 'UNKNOWN'}/${m.quote_symbol || 'UNKNOWN'}`)
     } else if (result.existsInTokens) {
-      result.message = 'Token found in database but no active markets yet. Perfect for SAL liquidity!'
+      result.message = 'Token found in database. Perfect for SAL liquidity!'
     } else {
       result.message = 'Token not indexed. SAL orders are only available for indexed tokens to ensure quality and security.'
     }
