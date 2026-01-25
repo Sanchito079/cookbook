@@ -3016,6 +3016,8 @@ app.get('/api/orders', async (req, res) => {
       fetchTokenDecimals(quote, network)
     ])
 
+    console.log('[SERVER ORDERS] Base decimals:', baseDec, 'Quote decimals:', quoteDec)
+
     const nowIso = new Date().toISOString()
     const tableName = network === 'crosschain' ? 'cross_chain_orders' : 'orders'
     let rows = []
@@ -3639,6 +3641,7 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
 
 
 
