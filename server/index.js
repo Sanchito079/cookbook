@@ -3415,7 +3415,7 @@ app.get('/api/tokens/validate', async (req, res) => {
       existsInTokens: !tokenError && tokenData,
       tokenInfo: tokenData || null,
       existingMarkets: marketError ? [] : (marketData || []),
-      canCreateSAL: true // Always allow SAL creation
+      canCreateSAL: !tokenError && tokenData // Only allow SAL for indexed tokens
     }
 
     // Add helpful messages
@@ -3425,7 +3425,7 @@ app.get('/api/tokens/validate', async (req, res) => {
     } else if (result.existsInTokens) {
       result.message = 'Token found in database but no active markets yet. Perfect for SAL liquidity!'
     } else {
-      result.message = 'New token - SAL order will help establish initial liquidity.'
+      result.message = 'Token not indexed. SAL orders are only available for indexed tokens to ensure quality and security.'
     }
 
     res.json(result)
@@ -3520,6 +3520,7 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
 
 
 
