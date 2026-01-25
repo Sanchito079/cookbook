@@ -3160,8 +3160,6 @@ app.post('/api/sal-orders', async (req, res) => {
       receiver,
       salt,
       signature,
-      baseSymbol,
-      quoteSymbol,
       baseAddress,
       quoteAddress,
       pair
@@ -3238,8 +3236,8 @@ app.post('/api/sal-orders', async (req, res) => {
         sal_total_inventory: totalAmount.toString(),
         sal_signature: signature,
         order_json: orderData,
-        base_symbol: baseSymbol,
-        quote_symbol: quoteSymbol,
+        base: baseAddress,
+        quote: quoteAddress,
         base_address: baseAddress,
         quote_address: quoteAddress,
         pair: pair
@@ -3603,6 +3601,7 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
 
 
 
