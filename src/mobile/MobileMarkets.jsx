@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useThemeStyles } from '../theme';
 import { formatPrice } from '../helpers';
 import { useTranslation } from 'react-i18next';
@@ -112,6 +112,11 @@ const MobileMarkets = ({ searchQuery, onSelectPair, account, selectedNetwork: pr
   const [searchError, setSearchError] = useState('')
   const isSearching = (searchQuery || '').trim().length > 0
 
+  // WebSocket ref
+  const wsRef = useRef(null)
+  // Reference prices for calculating 24h change
+  const referencePricesRef = useRef(new Map())
+
 
   const modalNetworks = [
     { id: 'bsc', label: 'BSC' },
@@ -200,6 +205,18 @@ const MobileMarkets = ({ searchQuery, onSelectPair, account, selectedNetwork: pr
       setTotalMarkets(json.total || 0);
       setTotalPages(Math.ceil((json.total || 0) / itemsPerPage));
       setCurrentPage(page);
+      // Initialize reference prices for 24h change
+      newMarkets.forEach(pair => {
+        const network = pair.network || selectedNetwork
+        const baseAddr = network === 'solana' ? pair.base.address : pair.base.address.toLowerCase()
+        const quoteAddr = network === 'solana' ? pair.quote.address : pair.quote.address.toLowerCase()
+        if (pair.price && pair.change) {
+          const currentPrice = parseFloat(pair.price)
+          const currentChange = parseFloat(pair.change.replace('%', ''))
+          const referencePrice = currentPrice / (1 + currentChange / 100)
+          referencePricesRef.current.set(`${network}:${baseAddr}:${quoteAddr}`, referencePrice)
+        }
+      });
     } catch (e) {
       console.error('Markets fetch error:', e);
       setMarketsError(e?.message || String(e));
@@ -208,10 +225,91 @@ const MobileMarkets = ({ searchQuery, onSelectPair, account, selectedNetwork: pr
     }
   };
 
+  // WebSocket connection for real-time updates
+  const connectWebSocket = () => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) return
+
+    const wsUrl = INDEXER_BASE.replace('http', 'ws').replace('https', 'wss')
+    wsRef.current = new WebSocket(wsUrl)
+
+    wsRef.current.onopen = () => {
+      console.log('[WS Markets] Connected')
+      // Subscribe to all pairs in markets
+      markets.forEach(pair => {
+        if (pair.base?.address && pair.quote?.address) {
+          const network = pair.network || selectedNetwork
+          const baseAddr = network === 'solana' ? pair.base.address : pair.base.address.toLowerCase()
+          const quoteAddr = network === 'solana' ? pair.quote.address : pair.quote.address.toLowerCase()
+          wsRef.current.send(JSON.stringify({
+            type: 'subscribe',
+            network,
+            base: baseAddr,
+            quote: quoteAddr,
+            pair: `${baseAddr}/${quoteAddr}`
+          }))
+        }
+      })
+    }
+
+    wsRef.current.onmessage = (event) => {
+      console.log('[WS Markets] Received message:', event.data)
+      try {
+        const message = JSON.parse(event.data)
+        if (message.type === 'new_fill') {
+          // Update the pair in markets
+          setMarkets(prev => prev.map(pair => {
+            const network = pair.network || selectedNetwork
+            const baseAddr = network === 'solana' ? pair.base.address : pair.base.address.toLowerCase()
+            const quoteAddr = network === 'solana' ? pair.quote.address : pair.quote.address.toLowerCase()
+            if (baseAddr === message.data.base && quoteAddr === message.data.quote && network === message.data.network) {
+              const newPrice = parseFloat(message.data.price)
+              const reference = referencePricesRef.current.get(`${network}:${baseAddr}:${quoteAddr}`)
+              const changePercent = reference ? ((newPrice - reference) / reference * 100).toFixed(2) : pair.change.replace('%', '')
+
+              return {
+                ...pair,
+                price: message.data.price,
+                change: (changePercent > 0 ? '+' : '') + changePercent + '%'
+              }
+            }
+            return pair
+          }))
+        }
+      } catch (e) {
+        console.error('[WS Markets] Error parsing message:', e)
+      }
+    }
+
+    wsRef.current.onclose = () => {
+      console.log('[WS Markets] Disconnected')
+    }
+
+    wsRef.current.onerror = (error) => {
+      console.error('[WS Markets] Error:', error)
+    }
+  }
+
+  const disconnectWebSocket = () => {
+    if (wsRef.current) {
+      wsRef.current.close()
+      wsRef.current = null
+    }
+  }
+
   // Load markets on mount and when network changes
   useEffect(() => {
     loadMarkets(1);
   }, [selectedNetwork]);
+
+  // Connect WebSocket when markets are loaded
+  useEffect(() => {
+    if (markets.length > 0) {
+      connectWebSocket();
+    }
+    return () => {
+      disconnectWebSocket();
+    }
+  }, [markets, selectedNetwork]);
 
   // Reset page and load markets only when not searching
   useEffect(() => {

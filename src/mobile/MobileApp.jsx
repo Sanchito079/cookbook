@@ -5,12 +5,15 @@ import { BrowserProvider, Contract } from 'ethers';
 import toast, { Toaster } from 'react-hot-toast';
 import { useTranslation } from 'react-i18next';
 import i18n from '../i18n';
+import { Menu, X } from 'lucide-react';
 
 // Mobile-specific components
 import MobileMarkets from './MobileMarkets';
 import MobileTrade from './MobileTrade';
 import MobileOrders from './MobileOrders';
 import MobileWatchlist from './MobileWatchlist';
+import SALOrderModal from '../SALOrderModal';
+import './MobileMarkets.css';
 
 // Network constants
 const BSC_CHAIN_ID = 56;
@@ -40,6 +43,8 @@ const MobileApp = ({ theme: propTheme }) => {
     const [isSearchOpen, setIsSearchOpen] = useState(false);
     const [selectedPair, setSelectedPair] = useState(null);
     const [geckoPoolId, setGeckoPoolId] = useState('');
+    const [isMenuOpen, setIsMenuOpen] = useState(false);
+    const [showSALOrderModal, setShowSALOrderModal] = useState(false);
     const { theme, styles, toggleTheme } = useThemeStyles();
     const currentTheme = propTheme || theme;
     console.log('MobileApp theme:', currentTheme, 'propTheme:', propTheme, 'hookTheme:', theme);
@@ -92,6 +97,14 @@ const MobileApp = ({ theme: propTheme }) => {
   const closeSearch = () => {
     setIsSearchOpen(false);
     setSearchQuery('');
+  };
+
+  const toggleMenu = () => {
+    setIsMenuOpen(!isMenuOpen);
+  };
+
+  const closeMenu = () => {
+    setIsMenuOpen(false);
   };
 
   const handleSelectPair = async (market) => {
@@ -493,6 +506,20 @@ const MobileApp = ({ theme: propTheme }) => {
             </div>
           </div>
         )}
+  
+        {/* SAL Order Modal */}
+        {showSALOrderModal && (
+          <SALOrderModal
+            theme={currentTheme}
+            selectedNetwork={selectedNetwork}
+            account={account}
+            onClose={() => setShowSALOrderModal(false)}
+            onSuccess={() => {
+              setShowSALOrderModal(false)
+              toast.success('SAL Order created successfully!')
+            }}
+          />
+        )}
       </div>
     );
   };
@@ -600,54 +627,44 @@ const MobileApp = ({ theme: propTheme }) => {
             style={{
               padding: '8px',
               borderRadius: '6px',
+              background: 'linear-gradient(135deg, #4da3ff, #00e39f)',
+              border: '1px solid rgba(255,255,255,0.2)',
+              color: '#fff',
+              cursor: 'pointer',
+              fontSize: '14px',
+              minWidth: '36px',
+              minHeight: '36px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              fontWeight: '600'
+            }}
+            onClick={() => setShowSALOrderModal(true)}
+          >
+            🚀
+          </button>
+          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            {primaryWallet ? <WalletBox /> : <DynamicWidget buttonClassName="btn-secondary" variant="modal" />}
+          </div>
+          <button
+            style={{
+              padding: '8px',
+              borderRadius: '6px',
               background: theme === 'dark' ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.05)',
               border: `1px solid ${theme === 'dark' ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.1)'}`,
-              color: theme === 'dark' ? '#ffa94d' : '#ff8c00',
+              color: theme === 'dark' ? '#e6f1ff' : '#333',
               cursor: 'pointer',
               fontSize: '16px',
               minWidth: '36px',
               minHeight: '36px',
               display: 'flex',
               alignItems: 'center',
-              justifyContent: 'center',
-              fontWeight: '500'
+              justifyContent: 'center'
             }}
-            onClick={toggleTheme}
+            onClick={toggleMenu}
           >
-            {theme === 'dark' ? '☀️' : '🌙'}
+            <Menu size={20} />
           </button>
-          <select
-            value={i18n.language}
-            onChange={(e) => {
-              const lang = e.target.value;
-              i18n.changeLanguage(lang);
-              localStorage.setItem('selectedLanguage', lang);
-            }}
-            style={{
-              background: theme === 'dark' ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.05)',
-              border: `1px solid ${theme === 'dark' ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.1)'}`,
-              borderRadius: '6px',
-              color: theme === 'dark' ? '#e6f1ff' : '#333',
-              padding: '8px 10px',
-              fontSize: '12px',
-              fontWeight: '600',
-              minHeight: '36px',
-              cursor: 'pointer',
-              outline: 'none'
-            }}
-          >
-            <option value="en">EN</option>
-            <option value="zh">中文</option>
-            <option value="es">ES</option>
-            <option value="ru">RU</option>
-            <option value="ko">KO</option>
-            <option value="pt">PT</option>
-            <option value="tr">TR</option>
-            <option value="ar">AR</option>
-          </select>
-          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-            {primaryWallet ? <WalletBox /> : <DynamicWidget buttonClassName="btn-secondary" variant="modal" />}
-          </div>
         </div>
       </div>
 
@@ -692,6 +709,199 @@ const MobileApp = ({ theme: propTheme }) => {
           >
             {t('app.cancel')}
           </button>
+        </div>
+      )}
+
+      {/* Hamburger Menu Overlay */}
+      {isMenuOpen && (
+        <div
+          style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: 'rgba(0, 0, 0, 0.5)',
+            zIndex: 300,
+            backdropFilter: 'blur(4px)'
+          }}
+          onClick={closeMenu}
+        />
+      )}
+
+      {/* Hamburger Menu Slide-in */}
+      {isMenuOpen && (
+        <div
+          style={{
+            position: 'fixed',
+            top: 0,
+            right: 0,
+            bottom: 0,
+            width: '280px',
+            maxWidth: '80vw',
+            background: theme === 'dark' ? '#0b0f14' : '#ffffff',
+            zIndex: 400,
+            boxShadow: '-4px 0 20px rgba(0, 0, 0, 0.3)',
+            overflowY: 'auto',
+            animation: 'slideIn 0.3s ease-out'
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {/* Menu Header */}
+          <div style={{
+            padding: '16px',
+            borderBottom: `1px solid ${theme === 'dark' ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)'}`,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between'
+          }}>
+            <span style={{
+              fontSize: '18px',
+              fontWeight: '700',
+              color: theme === 'dark' ? '#e6f1ff' : '#0b0f14'
+            }}>
+              {t('app.menu') || 'Menu'}
+            </span>
+            <button
+              onClick={closeMenu}
+              style={{
+                padding: '8px',
+                borderRadius: '6px',
+                background: 'transparent',
+                border: 'none',
+                color: theme === 'dark' ? '#e6f1ff' : '#333',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center'
+              }}
+            >
+              <X size={24} />
+            </button>
+          </div>
+
+          {/* Menu Content */}
+          <div style={{ padding: '20px 16px' }}>
+            {/* Language Selector Section */}
+            <div style={{ marginBottom: '24px' }}>
+              <label style={{
+                display: 'block',
+                fontSize: '14px',
+                fontWeight: '600',
+                color: theme === 'dark' ? '#8fb3c9' : '#666',
+                marginBottom: '8px'
+              }}>
+                {t('app.language') || 'Language'}
+              </label>
+              <select
+                value={i18n.language}
+                onChange={(e) => {
+                  const lang = e.target.value;
+                  i18n.changeLanguage(lang);
+                  localStorage.setItem('selectedLanguage', lang);
+                }}
+                style={{
+                  width: '100%',
+                  background: theme === 'dark' ? '#1a2332' : 'rgba(0,0,0,0.05)',
+                  border: `1px solid ${theme === 'dark' ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.1)'}`,
+                  borderRadius: '8px',
+                  color: theme === 'dark' ? '#e6f1ff' : '#333',
+                  padding: '12px 14px',
+                  fontSize: '14px',
+                  fontWeight: '500',
+                  cursor: 'pointer',
+                  outline: 'none',
+                  colorScheme: theme === 'dark' ? 'dark' : 'light'
+                }}
+              >
+                <option value="en" style={{ background: theme === 'dark' ? '#1a2332' : '#fff', color: theme === 'dark' ? '#e6f1ff' : '#333' }}>English (EN)</option>
+                <option value="zh" style={{ background: theme === 'dark' ? '#1a2332' : '#fff', color: theme === 'dark' ? '#e6f1ff' : '#333' }}>中文 (ZH)</option>
+                <option value="es" style={{ background: theme === 'dark' ? '#1a2332' : '#fff', color: theme === 'dark' ? '#e6f1ff' : '#333' }}>Español (ES)</option>
+                <option value="ru" style={{ background: theme === 'dark' ? '#1a2332' : '#fff', color: theme === 'dark' ? '#e6f1ff' : '#333' }}>Русский (RU)</option>
+                <option value="ko" style={{ background: theme === 'dark' ? '#1a2332' : '#fff', color: theme === 'dark' ? '#e6f1ff' : '#333' }}>한국어 (KO)</option>
+                <option value="pt" style={{ background: theme === 'dark' ? '#1a2332' : '#fff', color: theme === 'dark' ? '#e6f1ff' : '#333' }}>Português (PT)</option>
+                <option value="tr" style={{ background: theme === 'dark' ? '#1a2332' : '#fff', color: theme === 'dark' ? '#e6f1ff' : '#333' }}>Türkçe (TR)</option>
+                <option value="ar" style={{ background: theme === 'dark' ? '#1a2332' : '#fff', color: theme === 'dark' ? '#e6f1ff' : '#333' }}>العربية (AR)</option>
+              </select>
+            </div>
+
+            {/* Theme Toggle */}
+            <div style={{ marginBottom: '24px' }}>
+              <button
+                onClick={() => {
+                  toggleTheme();
+                  closeMenu();
+                }}
+                style={{
+                  width: '100%',
+                  padding: '14px 16px',
+                  borderRadius: '8px',
+                  background: theme === 'dark' ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.05)',
+                  border: `1px solid ${theme === 'dark' ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.1)'}`,
+                  color: theme === 'dark' ? '#e6f1ff' : '#333',
+                  cursor: 'pointer',
+                  fontSize: '14px',
+                  fontWeight: '600',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between'
+                }}
+              >
+                <span>{t('app.theme') || 'Theme'}</span>
+                <span style={{ fontSize: '18px' }}>
+                  {theme === 'dark' ? '☀️' : '🌙'}
+                </span>
+              </button>
+            </div>
+
+            {/* Navigation Links */}
+            <div style={{
+              borderTop: `1px solid ${theme === 'dark' ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)'}`,
+              paddingTop: '20px'
+            }}>
+              <div style={{
+                fontSize: '14px',
+                fontWeight: '600',
+                color: theme === 'dark' ? '#8fb3c9' : '#666',
+                marginBottom: '12px'
+              }}>
+                {t('app.navigation') || 'Navigation'}
+              </div>
+              
+              {tabs.map(tab => (
+                <button
+                  key={tab.id}
+                  onClick={() => {
+                    if (tab.id === 'docs') {
+                      window.open('https://docs.cookbook.finance/', '_blank');
+                    } else {
+                      setActiveTab(tab.id);
+                    }
+                    closeMenu();
+                  }}
+                  style={{
+                    width: '100%',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '12px',
+                    padding: '14px 16px',
+                    marginBottom: '8px',
+                    borderRadius: '8px',
+                    background: activeTab === tab.id ? 'rgba(77, 163, 255, 0.1)' : 'transparent',
+                    color: activeTab === tab.id ? '#4da3ff' : (theme === 'dark' ? '#e6f1ff' : '#333'),
+                    border: 'none',
+                    cursor: 'pointer',
+                    fontSize: '14px',
+                    fontWeight: activeTab === tab.id ? '600' : '500',
+                    textAlign: 'left'
+                  }}
+                >
+                  <span style={{ fontSize: '20px' }}>{tab.icon}</span>
+                  <span>{tab.label}</span>
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
       )}
 

@@ -148,8 +148,8 @@ const MobileTrade = ({ selectedPair, geckoPoolId, onGeckoPoolIdChange, onBackToM
 
   // WebSocket ref
   const wsRef = useRef(null)
-  // Previous price for calculating change
-  const prevPriceRef = useRef(null)
+  // Reference price for calculating 24h change
+  const referencePriceRef = useRef(null)
 
   // Update currentPair when selectedPair changes
   useEffect(() => {
@@ -158,8 +158,11 @@ const MobileTrade = ({ selectedPair, geckoPoolId, onGeckoPoolIdChange, onBackToM
       // Set decimals from pair data first
       setBaseDecimals(selectedPair.base.decimals);
       setQuoteDecimals(selectedPair.quote.decimals);
-      // Set previous price for change calculation
-      prevPriceRef.current = selectedPair.price;
+      // Calculate reference price for 24h change
+      const currentPrice = parseFloat(selectedPair.price)
+      const currentChange = parseFloat((selectedPair.change || '0').replace('%', ''))
+      const referencePrice = currentPrice / (1 + currentChange / 100)
+      referencePriceRef.current = referencePrice;
       // Fetch correct decimals from contract
       refreshTokenMeta(selectedPair.base.address, selectedPair.quote.address, selectedPair.network);
     }
@@ -362,17 +365,16 @@ const MobileTrade = ({ selectedPair, geckoPoolId, onGeckoPoolIdChange, onBackToM
         console.log('[WS] Parsed message:', message)
         if (message.type === 'new_fill') {
           const newPrice = parseFloat(message.data.price)
-          const prevPrice = prevPriceRef.current ? parseFloat(prevPriceRef.current) : newPrice
-          const change = ((newPrice - prevPrice) / prevPrice * 100).toFixed(2)
-          prevPriceRef.current = message.data.price
+          const reference = referencePriceRef.current
+          const changePercent = reference ? ((newPrice - reference) / reference * 100).toFixed(2) : '0.00'
 
           // Update recent fills
           setRecentFills(prev => [message.data, ...prev.slice(0, 49)])
-          // Update price and change
+          // Update price and recalculated 24h change
           setCurrentPair(prev => ({
             ...prev,
             price: message.data.price,
-            change: (change > 0 ? '+' : '') + change + '%'
+            change: (changePercent > 0 ? '+' : '') + changePercent + '%'
           }))
         }
       } catch (e) {
@@ -670,18 +672,20 @@ const MobileTrade = ({ selectedPair, geckoPoolId, onGeckoPoolIdChange, onBackToM
           }} className="card chart-card mobile-chart-container">
             {currentPair.base.symbol === 'WBNB' && currentPair.quote.symbol === 'USDC' ? (
               <iframe
+                key={`tradingview-${theme}`}
                 title="TradingView Chart"
                 width="100%"
                 height="100%"
-                src="https://www.tradingview.com/widgetembed/?frameElementId=tradingview_chart&symbol=BINANCE:BNBUSDT&interval=30&hidesidetoolbar=1&symboledit=1&saveimage=1&toolbarbg=f1f3f6&studies=[]&theme=dark&style=1&timezone=Etc%2FUTC&withdateranges=1&showpopupbutton=1&studies_overrides={}&overrides={}&enabled_features=[]&disabled_features=[]&showpopupbutton=1&locale=en"
+                src={`https://www.tradingview.com/widgetembed/?frameElementId=tradingview_chart&symbol=BINANCE:BNBUSDT&interval=30&hidesidetoolbar=1&symboledit=1&saveimage=1&toolbarbg=f1f3f6&studies=[]&theme=${theme}&style=1&timezone=Etc%2FUTC&withdateranges=1&showpopupbutton=1&studies_overrides={}&overrides={}&enabled_features=[]&disabled_features=[]&showpopupbutton=1&locale=en`}
                 style={{ width: '100%', height: '100%', border: 'none', borderRadius: 0, display: 'block' }}
                 allow="clipboard-write; web-share; fullscreen"
               />
             ) : geckoPoolId ? (
               <iframe
+                key={`geckoterminal-${theme}`}
                 className="chart-embed mobile-chart-embed"
                 title="GeckoTerminal Chart"
-                src={`https://www.geckoterminal.com/${geckoPoolId}?embed=1&info=0&swaps=0`}
+                src={`https://www.geckoterminal.com/${geckoPoolId}?embed=1&info=0&swaps=0&light_chart=${theme === 'light' ? 1 : 0}`}
                 width="100%"
                 height="100%"
                 style={{ border: 0, borderRadius: 0, width: '100%', height: '100%', display: 'block' }}
