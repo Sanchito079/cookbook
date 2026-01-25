@@ -1936,6 +1936,49 @@ app.post('/api/markets/wbnb/refresh', async (req, res) => {
   }
 })
 
+// Get markets for a specific token address (for SAL order creation)
+app.get('/api/markets/for-token', async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) return res.status(503).json({ error: 'database disabled' })
+    const network = (req.query.network || 'bsc').toString()
+    const tokenAddress = (req.query.tokenAddress || '').toString().toLowerCase()
+    if (!tokenAddress) return res.status(400).json({ error: 'tokenAddress is required' })
+
+    // Find all markets where the token is either base or quote
+    const { data, error } = await supabase
+      .from('markets')
+      .select('*')
+      .eq('network', network)
+      .or(`base_address.eq.${tokenAddress},quote_address.eq.${tokenAddress}`)
+      .order('updated_at', { ascending: false })
+
+    if (error) throw error
+
+    // Map to frontend format
+    const markets = (data || []).map(row => ({
+      base: { symbol: row.base_symbol, address: row.base_address, decimals: row.base_decimals, name: row.base_name, logoUrl: row.base_logo_url },
+      quote: { symbol: row.quote_symbol, address: row.quote_address, decimals: row.quote_decimals, name: row.quote_name, logoUrl: row.quote_logo_url },
+      pair: row.pair,
+      price: row.price,
+      change: row.change,
+      volume: row.volume,
+      poolAddress: row.pool_address,
+      geckoPoolId: row.gecko_pool_id,
+      pairKey: row.pair_key,
+      updatedAt: row.updated_at,
+      network: row.network
+    }))
+
+    // Enrich with trading stats
+    const enrichedMarkets = await enrichMarketsWithTradingStats(network, markets)
+    const withLogos = await ensureLogos(network, enrichedMarkets)
+
+    return res.json({ network, tokenAddress, data: withLogos })
+  } catch (e) {
+    return res.status(500).json({ error: e?.message || String(e) })
+  }
+})
+
 // Markets search endpoint: returns ALL pairs matching query across DB for a network
 app.get('/api/markets/search', async (req, res) => {
   try {
@@ -3116,7 +3159,12 @@ app.post('/api/sal-orders', async (req, res) => {
       expiration,
       receiver,
       salt,
-      signature
+      signature,
+      baseSymbol,
+      quoteSymbol,
+      baseAddress,
+      quoteAddress,
+      pair
     } = req.body
 
     // Validate required fields
@@ -3189,7 +3237,12 @@ app.post('/api/sal-orders', async (req, res) => {
         sal_min_price: minPrice?.toString(),
         sal_total_inventory: totalAmount.toString(),
         sal_signature: signature,
-        order_json: orderData
+        order_json: orderData,
+        base_symbol: baseSymbol,
+        quote_symbol: quoteSymbol,
+        base_address: baseAddress,
+        quote_address: quoteAddress,
+        pair: pair
       })
 
     if (error) throw error
@@ -3550,6 +3603,7 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
 
 
 
