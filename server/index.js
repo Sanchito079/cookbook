@@ -3090,6 +3090,337 @@ console.log('[BROADCAST] Received:', { network, base, quote, type, data })
   res.json({ success: true })
 })
 
+// SAL Order API Endpoints
+import {
+  getSALOrderPrice,
+  updateSALOrderPrice,
+  validateSALOrderParams,
+  calculateSALOrderPrice
+} from './sal_order_utils.js'
+
+// Create SAL Order
+app.post('/api/sal-orders', async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) return res.status(503).json({ error: 'database disabled' })
+
+    const {
+      network,
+      maker,
+      tokenIn,
+      tokenOut,
+      totalAmount,
+      initialPrice,
+      curveType = 'linear',
+      maxPrice,
+      minPrice,
+      expiration,
+      receiver,
+      salt
+    } = req.body
+
+    // Validate required fields
+    if (!network || !maker || !tokenIn || !tokenOut || !totalAmount || !initialPrice) {
+      return res.status(400).json({ error: 'Missing required fields' })
+    }
+
+    // Validate SAL order parameters
+    const validation = validateSALOrderParams({
+      totalAmount: totalAmount.toString(),
+      initialPrice: initialPrice.toString(),
+      curveType,
+      maxPrice: maxPrice?.toString(),
+      minPrice: minPrice?.toString()
+    })
+
+    if (!validation.isValid) {
+      return res.status(400).json({ error: 'Invalid parameters', details: validation.errors })
+    }
+
+    // Generate order ID and hash
+    const orderId = crypto.randomBytes(32).toString('hex')
+    const orderData = {
+      maker: maker.toLowerCase(),
+      tokenIn: tokenIn.toLowerCase(),
+      tokenOut: tokenOut.toLowerCase(),
+      amountIn: totalAmount.toString(),
+      amountOutMin: '0', // Will be calculated dynamically
+      expiration: expiration || 0,
+      nonce: Date.now(), // Use timestamp as nonce for SAL orders
+      receiver: receiver || '0x0000000000000000000000000000000000000000',
+      salt: salt || crypto.randomBytes(32).readUInt32BE(0)
+    }
+
+    // Create order record
+    const { error } = await supabase
+      .from('orders')
+      .insert({
+        network,
+        order_id: orderId,
+        order_hash: orderId, // Use orderId as hash for SAL orders
+        maker: orderData.maker,
+        token_in: orderData.tokenIn,
+        token_out: orderData.tokenOut,
+        amount_in: orderData.amountIn,
+        amount_out_min: orderData.amountOutMin,
+        remaining: orderData.amountIn,
+        nonce: orderData.nonce,
+        receiver: orderData.receiver,
+        salt: orderData.salt,
+        expiration: expiration ? new Date(expiration * 1000) : null,
+        status: 'open',
+        is_sal_order: true,
+        sal_initial_price: initialPrice.toString(),
+        sal_current_price: initialPrice.toString(),
+        sal_price_curve: curveType,
+        sal_max_price: maxPrice?.toString(),
+        sal_min_price: minPrice?.toString(),
+        sal_total_inventory: totalAmount.toString(),
+        order_json: orderData
+      })
+
+    if (error) throw error
+
+    res.json({
+      success: true,
+      orderId,
+      order: orderData,
+      salConfig: {
+        initialPrice,
+        currentPrice: initialPrice,
+        curveType,
+        maxPrice,
+        minPrice,
+        totalInventory: totalAmount
+      }
+    })
+  } catch (error) {
+    console.error('Error creating SAL order:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// Get SAL Order Price
+app.get('/api/sal-orders/:orderId/price', async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) return res.status(503).json({ error: 'database disabled' })
+
+    const { orderId } = req.params
+    const { network = 'bsc' } = req.query
+
+    const priceData = await getSALOrderPrice(orderId, network)
+
+    if (priceData.error) {
+      return res.status(404).json({ error: priceData.error })
+    }
+
+    res.json(priceData)
+  } catch (error) {
+    console.error('Error getting SAL order price:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// Get SAL Order Details
+app.get('/api/sal-orders/:orderId', async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) return res.status(503).json({ error: 'database disabled' })
+
+    const { orderId } = req.params
+    const { network = 'bsc' } = req.query
+
+    const { data: order, error } = await supabase
+      .from('orders')
+      .select('*')
+      .eq('order_id', orderId)
+      .eq('network', network)
+      .eq('is_sal_order', true)
+      .single()
+
+    if (error) throw error
+    if (!order) {
+      return res.status(404).json({ error: 'SAL order not found' })
+    }
+
+    res.json({
+      orderId: order.order_id,
+      network: order.network,
+      maker: order.maker,
+      tokenIn: order.token_in,
+      tokenOut: order.token_out,
+      status: order.status,
+      createdAt: order.created_at,
+      salConfig: {
+        initialPrice: order.sal_initial_price,
+        currentPrice: order.sal_current_price,
+        priceCurve: order.sal_price_curve,
+        maxPrice: order.sal_max_price,
+        minPrice: order.sal_min_price,
+        soldAmount: order.sal_sold_amount,
+        totalInventory: order.sal_total_inventory,
+        lastPriceUpdate: order.sal_last_price_update
+      }
+    })
+  } catch (error) {
+    console.error('Error getting SAL order:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// Update SAL Order (for price adjustments)
+app.put('/api/sal-orders/:orderId', async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) return res.status(503).json({ error: 'database disabled' })
+
+    const { orderId } = req.params
+    const { network = 'bsc', curveType, maxPrice, minPrice } = req.body
+
+    const updates = {}
+    if (curveType) updates.sal_price_curve = curveType
+    if (maxPrice) updates.sal_max_price = maxPrice.toString()
+    if (minPrice) updates.sal_min_price = minPrice.toString()
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No valid updates provided' })
+    }
+
+    const { error } = await supabase
+      .from('orders')
+      .update(updates)
+      .eq('order_id', orderId)
+      .eq('network', network)
+      .eq('is_sal_order', true)
+
+    if (error) throw error
+
+    res.json({ success: true, message: 'SAL order updated' })
+  } catch (error) {
+    console.error('Error updating SAL order:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// Cancel SAL Order
+app.delete('/api/sal-orders/:orderId', async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) return res.status(503).json({ error: 'database disabled' })
+
+    const { orderId } = req.params
+    const { network = 'bsc' } = req.query
+
+    const { error } = await supabase
+      .from('orders')
+      .update({ status: 'cancelled' })
+      .eq('order_id', orderId)
+      .eq('network', network)
+      .eq('is_sal_order', true)
+
+    if (error) throw error
+
+    res.json({ success: true, message: 'SAL order cancelled' })
+  } catch (error) {
+    console.error('Error cancelling SAL order:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// Get SAL Order Analytics
+app.get('/api/sal-orders/:orderId/analytics', async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) return res.status(503).json({ error: 'database disabled' })
+
+    const { orderId } = req.params
+    const { network = 'bsc' } = req.query
+
+    const { data: analytics, error } = await supabase
+      .from('sal_order_analytics')
+      .select('*')
+      .eq('order_id', orderId)
+      .eq('network', network)
+      .single()
+
+    if (error && error.code !== 'PGRST116') throw error
+
+    if (!analytics) {
+      return res.json({
+        orderId,
+        network,
+        totalSold: '0',
+        totalVolumeUsd: '0',
+        averageFillPrice: '0',
+        priceHistory: []
+      })
+    }
+
+    res.json({
+      orderId: analytics.order_id,
+      network: analytics.network,
+      totalSold: analytics.total_sold,
+      totalVolumeUsd: analytics.total_volume_usd,
+      averageFillPrice: analytics.average_fill_price,
+      priceHistory: analytics.price_history,
+      lastUpdated: analytics.updated_at
+    })
+  } catch (error) {
+    console.error('Error getting SAL analytics:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// Check if token exists in database and get market info
+app.get('/api/tokens/validate', async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) return res.status(503).json({ error: 'database disabled' })
+
+    const { address, network = 'bsc' } = req.query
+
+    if (!address) {
+      return res.status(400).json({ error: 'Token address required' })
+    }
+
+    const tokenAddr = network === 'solana' ? address : address.toLowerCase()
+
+    // Check if token exists in tokens table
+    const { data: tokenData, error: tokenError } = await supabase
+      .from('tokens')
+      .select('*')
+      .eq('network', network)
+      .eq('address', tokenAddr)
+      .single()
+
+    // Check if token has existing markets
+    const { data: marketData, error: marketError } = await supabase
+      .from('markets')
+      .select('*')
+      .eq('network', network)
+      .or(`base_address.eq.${tokenAddr},quote_address.eq.${tokenAddr}`)
+      .limit(10)
+
+    const result = {
+      address: tokenAddr,
+      network,
+      existsInTokens: !tokenError && tokenData,
+      tokenInfo: tokenData || null,
+      existingMarkets: marketError ? [] : (marketData || []),
+      canCreateSAL: true // Always allow SAL creation
+    }
+
+    // Add helpful messages
+    if (result.existingMarkets.length > 0) {
+      result.message = `Token found in ${result.existingMarkets.length} existing market(s). You can add SAL liquidity to these markets!`
+      result.marketPairs = result.existingMarkets.map(m => `${m.base_symbol || 'UNKNOWN'}/${m.quote_symbol || 'UNKNOWN'}`)
+    } else if (result.existsInTokens) {
+      result.message = 'Token found in database but no active markets yet. Perfect for SAL liquidity!'
+    } else {
+      result.message = 'New token - SAL order will help establish initial liquidity.'
+    }
+
+    res.json(result)
+  } catch (error) {
+    console.error('Error validating token:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
 // Start HTTP server
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Indexer server listening on http://0.0.0.0:${PORT}`)

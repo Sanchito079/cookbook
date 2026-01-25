@@ -6,6 +6,13 @@ import fetch from 'node-fetch'
 import { createClient } from '@supabase/supabase-js'
 import { Contract, JsonRpcProvider, Wallet, FetchRequest } from 'ethers'
 
+// Import SAL Order utilities
+import {
+  getSALOrderPrice,
+  updateSALOrderPrice,
+  calculateSALOrderPrice
+} from './sal_order_utils.js'
+
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const envPath = path.join(__dirname, '..', '.env')
@@ -386,14 +393,43 @@ function getNetworkForToken(address) {
   return 'bsc' // default
 }
 
-function priceAsk(r) {
+async function priceAsk(r) {
+  // Check if this is a SAL order
+  if (r.is_sal_order) {
+    try {
+      const salPriceData = await getSALOrderPrice(r.order_id, r.network || 'bsc')
+      if (salPriceData.currentPrice && !salPriceData.error) {
+        // Convert to 1e18 scaled format
+        return BigInt(Math.floor(parseFloat(salPriceData.currentPrice) * 1e18))
+      }
+    } catch (error) {
+      console.warn(`[executor] Failed to get SAL ask price for ${r.order_id}:`, error.message)
+    }
+  }
+
+  // Fallback to regular price calculation
   // quote per base in integer math scaled by 1e18
   const ain = toBN(r.amount_in || r.amountIn || 0n) // base in
   const aout = toBN(r.amount_out_min || r.amountOutMin || 0n) // quote min out
   if (ain <= 0n) return null
   return (aout * 10n ** 18n) / ain
 }
-function priceBid(r) {
+
+async function priceBid(r) {
+  // Check if this is a SAL order
+  if (r.is_sal_order) {
+    try {
+      const salPriceData = await getSALOrderPrice(r.order_id, r.network || 'bsc')
+      if (salPriceData.currentPrice && !salPriceData.error) {
+        // Convert to 1e18 scaled format
+        return BigInt(Math.floor(parseFloat(salPriceData.currentPrice) * 1e18))
+      }
+    } catch (error) {
+      console.warn(`[executor] Failed to get SAL bid price for ${r.order_id}:`, error.message)
+    }
+  }
+
+  // Fallback to regular price calculation
   // quote per base in integer math scaled by 1e18
   const ain = toBN(r.amount_in || r.amountIn || 0n) // quote in
   const aout = toBN(r.amount_out_min || r.amountOutMin || 0n) // base min out
@@ -996,8 +1032,8 @@ async function tryMatchPairCrossChain(base, quote, bids, asks) {
     return 0
   }) // lowest ask first
 
-  const bestBid = bids[0]
-  const bestAsk = asks[0]
+  const bestBid = bidsWithPrices[0]
+  const bestAsk = asksWithPrices[0]
 
   if (!bestBid || !bestAsk) {
     console.log(`[executor] cross-chain: no best bid or ask available for ${base}/${quote}`)
@@ -1251,6 +1287,14 @@ async function tryMatchPairCrossChain(base, quote, bids, asks) {
     await updateOrderRemaining(buyRow.order_id, newBuyRem, newBuyRem === 0n ? 'filled' : 'open', buyRow.network)
     await updateOrderRemaining(sellRow.order_id, newSellRem, newSellRem === 0n ? 'filled' : 'open', sellRow.network)
 
+    // Update SAL Order prices if applicable
+    if (buyRow.is_sal_order) {
+      await updateSALOrderPrice(buyRow.order_id, buyRow.network, buyRow.sal_current_price, quoteIn.toString())
+    }
+    if (sellRow.is_sal_order) {
+      await updateSALOrderPrice(sellRow.order_id, sellRow.network, sellRow.sal_current_price, baseOut.toString())
+    }
+
     return true
 
   } catch (e) {
@@ -1297,9 +1341,19 @@ async function tryMatchPairCrossChain(base, quote, bids, asks) {
 async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   console.log(`[executor] ${network}: sorting ${bids.length} bids and ${asks.length} asks for ${base}/${quote}`)
 
-  bids.sort((a, b) => {
-    const pb = priceBid(b)
-    const pa = priceBid(a)
+  // Sort bids and asks with async price fetching for SAL orders
+  const bidsWithPrices = await Promise.all(bids.map(async (bid) => ({
+    ...bid,
+    price: await priceBid(bid)
+  })))
+  const asksWithPrices = await Promise.all(asks.map(async (ask) => ({
+    ...ask,
+    price: await priceAsk(ask)
+  })))
+
+  bidsWithPrices.sort((a, b) => {
+    const pb = b.price
+    const pa = a.price
     if (pb === null && pa === null) return 0
     if (pb === null) return 1
     if (pa === null) return -1
@@ -1307,9 +1361,10 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
     // same price, earlier time first
     return new Date(a.created_at || a.updated_at) - new Date(b.created_at || b.updated_at)
   }) // highest bid first, then earliest time
-  asks.sort((a, b) => {
-    const pa = priceAsk(a)
-    const pb = priceAsk(b)
+
+  asksWithPrices.sort((a, b) => {
+    const pa = a.price
+    const pb = b.price
     if (pa === null && pb === null) return 0
     if (pa === null) return 1
     if (pb === null) return -1
@@ -1332,8 +1387,8 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
     return false
   }
 
-  const pBid = priceBid(bestBid)
-  const pAsk = priceAsk(bestAsk)
+  const pBid = bestBid.price
+  const pAsk = bestAsk.price
 
   console.log(`[executor] ${network}: best bid price: ${pBid ? Number(pBid) / 1e18 : 'null'}, best ask price: ${pAsk ? Number(pAsk) / 1e18 : 'null'}`)
   console.log(`[executor] ${network}: order sources - bid: ${bestBid?.source || 'regular'} (${bestBid?.order_id}), ask: ${bestAsk?.source || 'regular'} (${bestAsk?.order_id})`)
