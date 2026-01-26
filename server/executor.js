@@ -677,7 +677,7 @@ async function fetchOpenOrdersAll(network = 'bsc') {
   if (error) throw error
   let orders = data || []
 
-  // Add SAL orders as pseudo sell orders
+  // Add SAL orders as pseudo sell orders (convert human inventory to raw units)
   const { data: salData, error: salError } = await supabase
     .from('orders')
     .select('*')
@@ -687,18 +687,40 @@ async function fetchOpenOrdersAll(network = 'bsc') {
     .order('updated_at', { ascending: true })
     .limit(100)
 
-  if (!salError && salData) {
+  if (!salError && salData && salData.length) {
+    // fetch decimals for all involved base tokens in one query
+    const baseAddrs = Array.from(new Set(salData.map(s => (s.base_address || '').toLowerCase()).filter(Boolean)))
+    let decMap = new Map()
+    try {
+      if (baseAddrs.length) {
+        const { data: trows } = await supabase
+          .from('tokens')
+          .select('address,decimals')
+          .eq('network', network)
+          .in('address', baseAddrs)
+        if (Array.isArray(trows)) {
+          for (const r of trows) {
+            decMap.set((r.address || '').toLowerCase(), Number(r.decimals) || 18)
+          }
+        }
+      }
+    } catch {}
+
     for (const sal of salData) {
-      // Create pseudo order for SAL as a sell
+      const baseAddr = (sal.base_address || '').toLowerCase()
+      const baseDec = decMap.get(baseAddr) ?? 18
+      // sal_total_inventory is stored in human units -> convert to raw units
+      const invHuman = Number(sal.sal_total_inventory || 0)
+      const invRaw = BigInt(Math.floor(invHuman * Math.pow(10, baseDec)))
+
       const pseudoOrder = {
         ...sal,
         is_sal_order: true,
-        // SAL is always a sell: tokenIn = base, tokenOut = quote
         token_in: sal.base_address,
         token_out: sal.quote_address,
-        amount_in: sal.sal_total_inventory, // total inventory
-        remaining: sal.sal_total_inventory, // remaining to sell
-        amount_out_min: 'Adaptive', // not used
+        amount_in: invRaw.toString(),
+        remaining: invRaw.toString(),
+        amount_out_min: 'Adaptive',
         price: sal.sal_current_price,
         side: 'ask',
         signature: sal.sal_signature,
@@ -706,7 +728,7 @@ async function fetchOpenOrdersAll(network = 'bsc') {
           maker: sal.maker,
           tokenIn: sal.base_address,
           tokenOut: sal.quote_address,
-          amountIn: sal.sal_total_inventory,
+          amountIn: invRaw.toString(),
           amountOutMin: '0',
           expiration: sal.expiration,
           nonce: sal.nonce,
@@ -1022,6 +1044,7 @@ async function preflightDiagnostics(buyRow, sellRow, network = 'bsc') {
   const settlementContract = network === 'base' ? settlementBase : settlement
   const settlementAddress = network === 'base' ? SETTLEMENT_ADDRESS_BASE : SETTLEMENT_ADDRESS_BSC
   const providerForNetwork = network === 'base' ? providerBase : providerBSC
+  const salVaultAddress = network === 'base' ? SAL_VAULT_ADDRESS_BASE : SAL_VAULT_ADDRESS_BSC
 
   const [sigBuyOk, sigSellOk, availBuy, availSell] = await Promise.all([
     settlementContract.verifySignature(buy, sigBuy).catch(() => false),
@@ -1033,8 +1056,11 @@ async function preflightDiagnostics(buyRow, sellRow, network = 'bsc') {
   const buyerErc = new Contract(buy.tokenIn, ERC20_MIN_ABI, providerForNetwork)
   const sellerErc = new Contract(sell.tokenIn, ERC20_MIN_ABI, providerForNetwork)
 
+  // For SAL fills, buyer must approve SAL Vault; for regular, settlement contract
+  const spenderForBuyer = sellRow.is_sal_order ? salVaultAddress : settlementAddress
+
   const [buyerAllowance, buyerBalance, sellerAllowance, sellerBalance] = await Promise.all([
-    buyerErc.allowance(buy.maker, settlementAddress).catch(() => 0n),
+    buyerErc.allowance(buy.maker, spenderForBuyer).catch(() => 0n),
     buyerErc.balanceOf(buy.maker).catch(() => 0n),
     sellerErc.allowance(sell.maker, settlementAddress).catch(() => 0n),
     sellerErc.balanceOf(sell.maker).catch(() => 0n)
@@ -1599,6 +1625,12 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   }
 
   const quoteIn = quoteNeededBySell
+
+  // Enforce buyer allowance for SAL vault if SAL order
+  if (sellRow.is_sal_order && diag.buyerAllowance < quoteIn) {
+    console.log(`[executor] ${network}: insufficient buyer allowance to SAL Vault: allowance ${diag.buyerAllowance.toString()} < needed ${quoteIn.toString()}`)
+    return false
+  }
 
   // Preflight diagnostics (reuse diag)
   const pre = {
