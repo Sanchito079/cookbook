@@ -405,6 +405,28 @@ function ceilDiv(a, b) {
   return (a + b - 1n) / b
 }
 
+// Convert a decimal string (e.g., '1', '0.5', '1.000000000000000000') to raw BigInt using decimals
+function decimalToRawInt(value, decimals) {
+  try {
+    let s = (value ?? '').toString().trim()
+    if (!s) return 0n
+    let neg = false
+    if (s[0] === '-') { neg = true; s = s.slice(1) }
+    const [intStrRaw, fracStrRaw = ''] = s.split('.')
+    const intStr = intStrRaw.replace(/\D/g, '') || '0'
+    let fracStr = fracStrRaw.replace(/\D/g, '')
+    if (fracStr.length > decimals) fracStr = fracStr.slice(0, decimals)
+    while (fracStr.length < decimals) fracStr += '0'
+    const intPart = BigInt(intStr)
+    const fracPart = BigInt(fracStr || '0')
+    const scale = 10n ** BigInt(decimals)
+    const raw = intPart * scale + fracPart
+    return neg ? -raw : raw
+  } catch {
+    return 0n
+  }
+}
+
 // Format BigInt amount to decimal string with fixed decimals (no trimming)
 function formatUnits(amount, decimals = 18) {
   try {
@@ -709,9 +731,8 @@ async function fetchOpenOrdersAll(network = 'bsc') {
     for (const sal of salData) {
       const baseAddr = (sal.base_address || '').toLowerCase()
       const baseDec = decMap.get(baseAddr) ?? 18
-      // sal_total_inventory is stored in human units -> convert to raw units
-      const invHuman = Number(sal.sal_total_inventory || 0)
-      const invRaw = BigInt(Math.floor(invHuman * Math.pow(10, baseDec)))
+      // sal_total_inventory is stored in human units -> convert to raw units precisely
+      const invRaw = decimalToRawInt(sal.sal_total_inventory ?? '0', baseDec)
 
       const pseudoOrder = {
         ...sal,
@@ -2299,6 +2320,7 @@ async function runOnce(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
 
