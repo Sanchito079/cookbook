@@ -30,6 +30,8 @@ const EXECUTOR_RPC_URLS = (process.env.EXECUTOR_RPC_URLS || '').split(',').map(s
 const EXECUTOR_PRIVATE_KEY = process.env.EXECUTOR_PRIVATE_KEY
 const SETTLEMENT_ADDRESS_BSC = process.env.SETTLEMENT_ADDRESS_BSC || '0x7DBA6a1488356428C33cC9fB8Ef3c8462c8679d0'
 const SETTLEMENT_ADDRESS_BASE = process.env.SETTLEMENT_ADDRESS_BASE || '0xBBf7A39F053BA2B8F4991282425ca61F2D871f45'
+const SAL_VAULT_ADDRESS_BSC = '0x260836972c9aBBaDa9e217C71a05D536C1F43A01'
+const SAL_VAULT_ADDRESS_BASE = '0x9126e4868B4c403220b42E65e15277ABf2bEb961'
 const CUSTODIAL_ADDRESS = '0x70c992e6a19c565430fa0c21933395ebf1e907c3'
 
 const SUPABASE_URL = process.env.SUPABASE_URL
@@ -341,6 +343,34 @@ const SETTLEMENT_ABI = [
   }
 ];
 
+const SAL_VAULT_ABI = [
+ {"inputs":[{"internalType":"address","name":"_executor","type":"address"}],"stateMutability":"nonpayable","type":"constructor"},
+ {"inputs":[],"name":"InsufficientInventory","type":"error"},
+ {"inputs":[],"name":"InvalidAmount","type":"error"},
+ {"inputs":[],"name":"OrderNotActive","type":"error"},
+ {"inputs":[{"internalType":"address","name":"owner","type":"address"}],"name":"OwnableInvalidOwner","type":"error"},
+ {"inputs":[{"internalType":"address","name":"account","type":"address"}],"name":"OwnableUnauthorizedAccount","type":"error"},
+ {"inputs":[],"name":"PaymentRequired","type":"error"},
+ {"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"SafeERC20FailedOperation","type":"error"},
+ {"inputs":[],"name":"Unauthorized","type":"error"},
+ {"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"oldExecutor","type":"address"},{"indexed":true,"internalType":"address","name":"newExecutor","type":"address"}],"name":"ExecutorUpdated","type":"event"},
+ {"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"previousOwner","type":"address"},{"indexed":true,"internalType":"address","name":"newOwner","type":"address"}],"name":"OwnershipTransferred","type":"event"},
+ {"anonymous":false,"inputs":[{"indexed":true,"internalType":"bytes32","name":"orderId","type":"bytes32"},{"indexed":true,"internalType":"address","name":"maker","type":"address"},{"indexed":false,"internalType":"address","name":"tokenIn","type":"address"},{"indexed":false,"internalType":"uint256","name":"amountIn","type":"uint256"}],"name":"SALOrderDeposited","type":"event"},
+ {"anonymous":false,"inputs":[{"indexed":true,"internalType":"bytes32","name":"orderId","type":"bytes32"},{"indexed":true,"internalType":"address","name":"buyer","type":"address"},{"indexed":false,"internalType":"uint256","name":"amountIn","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"amountOut","type":"uint256"}],"name":"SALOrderFilled","type":"event"},
+ {"anonymous":false,"inputs":[{"indexed":true,"internalType":"bytes32","name":"orderId","type":"bytes32"},{"indexed":true,"internalType":"address","name":"maker","type":"address"},{"indexed":false,"internalType":"uint256","name":"amountIn","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"amountOut","type":"uint256"}],"name":"SALOrderWithdrawn","type":"event"},
+ {"inputs":[{"internalType":"bytes32","name":"orderId","type":"bytes32"},{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint256","name":"amountIn","type":"uint256"}],"name":"depositSAL","outputs":[],"stateMutability":"nonpayable","type":"function"},
+ {"inputs":[],"name":"executor","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},
+ {"inputs":[{"internalType":"bytes32","name":"orderId","type":"bytes32"},{"internalType":"address","name":"buyer","type":"address"},{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint256","name":"amountOut","type":"uint256"}],"name":"fillSAL","outputs":[],"stateMutability":"nonpayable","type":"function"},
+ {"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"getBalance","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+ {"inputs":[{"internalType":"bytes32","name":"orderId","type":"bytes32"}],"name":"getSALOrder","outputs":[{"internalType":"address","name":"maker","type":"address"},{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint256","name":"depositedIn","type":"uint256"},{"internalType":"uint256","name":"remainingIn","type":"uint256"},{"internalType":"uint256","name":"receivedOut","type":"uint256"},{"internalType":"bool","name":"active","type":"bool"}],"stateMutability":"view","type":"function"},
+ {"inputs":[],"name":"owner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},
+ {"inputs":[],"name":"renounceOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},
+ {"inputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"name":"salOrders","outputs":[{"internalType":"address","name":"maker","type":"address"},{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint256","name":"depositedIn","type":"uint256"},{"internalType":"uint256","name":"remainingIn","type":"uint256"},{"internalType":"uint256","name":"receivedOut","type":"uint256"},{"internalType":"bool","name":"active","type":"bool"}],"stateMutability":"view","type":"function"},
+ {"inputs":[{"internalType":"address","name":"_executor","type":"address"}],"name":"setExecutor","outputs":[],"stateMutability":"nonpayable","type":"function"},
+ {"inputs":[{"internalType":"address","name":"newOwner","type":"address"}],"name":"transferOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},
+ {"inputs":[{"internalType":"bytes32","name":"orderId","type":"bytes32"}],"name":"withdrawSAL","outputs":[],"stateMutability":"nonpayable","type":"function"}
+];
+
 function toBN(x) {
   try {
     if (typeof x === 'bigint') return x
@@ -455,6 +485,8 @@ let walletBSC = null
 let walletBase = null
 let settlement = null
 let settlementBase = null
+let salVault = null
+let salVaultBase = null
 let busyBSC = false
 let busyBase = false
 
@@ -583,6 +615,7 @@ async function init() {
     // Initialize settlement contracts for networks that connected
     if (walletBSC) {
       settlement = new Contract(SETTLEMENT_ADDRESS_BSC, SETTLEMENT_ABI, walletBSC)
+      salVault = new Contract(SAL_VAULT_ADDRESS_BSC, SAL_VAULT_ABI, walletBSC)
       try {
         settlement.on('Matched', (buyHash, sellHash, matcher, amountBase, amountQuote) => {
           console.log('[chain] BSC Matched', { buyHash, sellHash, matcher, amountBase: amountBase?.toString?.(), amountQuote: amountQuote?.toString?.() })
@@ -597,6 +630,7 @@ async function init() {
 
     if (walletBase) {
       settlementBase = new Contract(SETTLEMENT_ADDRESS_BASE, SETTLEMENT_ABI, walletBase)
+      salVaultBase = new Contract(SAL_VAULT_ADDRESS_BASE, SAL_VAULT_ABI, walletBase)
       try {
         settlementBase.on('Matched', (buyHash, sellHash, matcher, amountBase, amountQuote) => {
           console.log('[chain] Base Matched', { buyHash, sellHash, matcher, amountBase: amountBase?.toString?.(), amountQuote: amountQuote?.toString?.() })
@@ -638,7 +672,50 @@ async function fetchOpenOrdersAll(network = 'bsc') {
     .order('updated_at', { ascending: true })
     .limit(500)
   if (error) throw error
-  return data || []
+  let orders = data || []
+
+  // Add SAL orders as pseudo sell orders
+  const { data: salData, error: salError } = await supabase
+    .from('orders')
+    .select('*')
+    .eq('network', network)
+    .eq('is_sal_order', true)
+    .gt('sal_total_inventory', '0')
+    .order('updated_at', { ascending: true })
+    .limit(100)
+
+  if (!salError && salData) {
+    for (const sal of salData) {
+      // Create pseudo order for SAL as a sell
+      const pseudoOrder = {
+        ...sal,
+        is_sal_order: true,
+        // SAL is always a sell: tokenIn = base, tokenOut = quote
+        token_in: sal.base_address,
+        token_out: sal.quote_address,
+        amount_in: sal.sal_total_inventory, // total inventory
+        remaining: sal.sal_total_inventory, // remaining to sell
+        amount_out_min: 'Adaptive', // not used
+        price: sal.sal_current_price,
+        side: 'ask',
+        signature: sal.sal_signature,
+        order_json: {
+          maker: sal.maker,
+          tokenIn: sal.base_address,
+          tokenOut: sal.quote_address,
+          amountIn: sal.sal_total_inventory,
+          amountOutMin: '0',
+          expiration: sal.expiration,
+          nonce: sal.nonce,
+          receiver: sal.receiver,
+          salt: sal.salt
+        }
+      }
+      orders.push(pseudoOrder)
+    }
+  }
+
+  return orders
 }
 
 async function fetchOpenOrdersCrossChain() {
@@ -945,9 +1022,9 @@ async function preflightDiagnostics(buyRow, sellRow, network = 'bsc') {
 
   const [sigBuyOk, sigSellOk, availBuy, availSell] = await Promise.all([
     settlementContract.verifySignature(buy, sigBuy).catch(() => false),
-    settlementContract.verifySignature(sell, sigSell).catch(() => false),
+    sellRow.is_sal_order ? Promise.resolve(true) : settlementContract.verifySignature(sell, sigSell).catch(() => false),
     settlementContract.availableToFill(buy).catch(() => 0n),
-    settlementContract.availableToFill(sell).catch(() => 0n)
+    sellRow.is_sal_order ? Promise.resolve(1000000000000000000000000n) : settlementContract.availableToFill(sell).catch(() => 0n) // large number for SAL
   ])
 
   const buyerErc = new Contract(buy.tokenIn, ERC20_MIN_ABI, providerForNetwork)
@@ -1429,7 +1506,7 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
 
   console.log(`[executor] ${network}: preflight results - buySigOk: ${!!diag.sigBuyOk}, sellSigOk: ${!!diag.sigSellOk}, availBuy: ${diag.availBuy.toString()}, availSell: ${diag.availSell.toString()}`)
 
-  if (!diag.sigBuyOk || !diag.sigSellOk) {
+  if (!diag.sigBuyOk || (!sellRow.is_sal_order && !diag.sigSellOk)) {
     console.log(`[executor] ${network}: skipping ${base}/${quote} - signature invalid (buy: ${!!diag.sigBuyOk}, sell: ${!!diag.sigSellOk})`)
     return false
   }
@@ -1529,11 +1606,24 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
 
   try {
     console.log(`[executor] ${network}: attempting to match orders for ${base}/${quote}`)
-    const settlementContract = network === 'base' ? settlementBase : settlement
-    const tx = await settlementContract.matchOrders(buy, sigBuy, sell, sigSell, baseOut, quoteIn)
-    console.log(`[executor] ${network}: match tx sent: ${tx.hash}`)
-    const receipt = await tx.wait()
-    console.log(`[executor] ${network}: match tx confirmed in block ${receipt.blockNumber}`)
+
+    let receipt = null
+    if (sellRow.is_sal_order) {
+      // SAL order fill
+      console.log(`[executor] ${network}: filling SAL order ${sellRow.order_id}`)
+      const salContract = network === 'base' ? salVaultBase : salVault
+      const tx = await salContract.fillSAL(sellRow.order_id, buy.maker, baseOut, quoteIn)
+      console.log(`[executor] ${network}: SAL fill tx sent: ${tx.hash}`)
+      receipt = await tx.wait()
+      console.log(`[executor] ${network}: SAL fill tx confirmed in block ${receipt.blockNumber}`)
+    } else {
+      // Regular order match
+      const settlementContract = network === 'base' ? settlementBase : settlement
+      const tx = await settlementContract.matchOrders(buy, sigBuy, sell, sigSell, baseOut, quoteIn)
+      console.log(`[executor] ${network}: match tx sent: ${tx.hash}`)
+      receipt = await tx.wait()
+      console.log(`[executor] ${network}: match tx confirmed in block ${receipt.blockNumber}`)
+    }
     // Persist fill record for UI consumption
     try {
       // Insert into fills table
@@ -1544,10 +1634,24 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
         sell_order_id: sellRow.order_id,
         amount_base: baseOut.toString(),
         amount_quote: quoteIn.toString(),
-        tx_hash: receipt.hash || tx.hash,
+        tx_hash: receipt.hash,
         block_number: receipt.blockNumber,
         created_at: new Date().toISOString()
       })
+
+      // Update SAL order if applicable
+      if (sellRow.is_sal_order) {
+        const newSold = Number(sellRow.sal_sold_amount || 0) + Number(baseOut)
+        const newRemaining = Number(sellRow.sal_total_inventory) - newSold
+        await supabase
+          .from('orders')
+          .update({
+            remaining: newRemaining.toString(),
+            sal_sold_amount: newSold.toString(),
+            updated_at: new Date().toISOString()
+          })
+          .eq('order_id', sellRow.order_id)
+      }
 
       // Also insert enriched trade data for market stats
       const baseAddr = (buyRow.base_address || sellRow.base_address || '').toLowerCase()
@@ -2116,3 +2220,4 @@ async function runOnce(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
