@@ -4,7 +4,7 @@ import { fileURLToPath } from 'url'
 import crypto from 'crypto'
 import fetch from 'node-fetch'
 import { createClient } from '@supabase/supabase-js'
-import { Contract, JsonRpcProvider, Wallet, FetchRequest } from 'ethers'
+import { Contract, JsonRpcProvider, Wallet, FetchRequest, keccak256, toUtf8Bytes } from 'ethers'
 
 // Import SAL Order utilities
 import {
@@ -1648,7 +1648,9 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
       // SAL order fill
       console.log(`[executor] ${network}: filling SAL order ${sellRow.order_id}`)
       const salContract = network === 'base' ? salVaultBase : salVault
-      const tx = await salContract.fillSAL(sellRow.order_id, buy.maker, baseOut, quoteIn)
+      // Derive on-chain bytes32 order id from DB order_id deterministically
+      const onchainOrderId = sellRow.sal_order_id_bytes32 || keccak256(toUtf8Bytes(String(sellRow.order_id)))
+      const tx = await salContract.fillSAL(onchainOrderId, buy.maker, baseOut, quoteIn)
       console.log(`[executor] ${network}: SAL fill tx sent: ${tx.hash}`)
       receipt = await tx.wait()
       console.log(`[executor] ${network}: SAL fill tx confirmed in block ${receipt.blockNumber}`)
