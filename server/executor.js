@@ -426,18 +426,12 @@ function getNetworkForToken(address) {
 async function priceAsk(r) {
   // Check if this is a SAL order
   if (r.is_sal_order) {
-    try {
-      const salPriceData = await getSALOrderPrice(r.order_id, r.network || 'bsc')
-      if (salPriceData.currentPrice && !salPriceData.error) {
-        // Convert to 1e18 scaled format
-        return BigInt(Math.floor(parseFloat(salPriceData.currentPrice) * 1e18))
-      }
-    } catch (error) {
-      console.warn(`[executor] Failed to get SAL ask price for ${r.order_id}:`, error.message)
-    }
+    // Use the stored current price
+    const currentPrice = parseFloat(r.sal_current_price || r.sal_initial_price || 0)
+    return BigInt(Math.floor(currentPrice * 1e18))
   }
 
-  // Fallback to regular price calculation
+  // Regular price calculation
   // quote per base in integer math scaled by 1e18
   const ain = toBN(r.amount_in || r.amountIn || 0n) // base in
   const aout = toBN(r.amount_out_min || r.amountOutMin || 0n) // quote min out
@@ -2220,4 +2214,5 @@ async function runOnce(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
