@@ -424,10 +424,12 @@ function getNetworkForToken(address) {
 }
 
 async function priceAsk(r) {
-  // Check if this is a SAL order
+  // SAL ask price: use stored current or initial price (quote per base)
   if (r.is_sal_order) {
-    // Use the stored current price
-    const currentPrice = parseFloat(r.sal_current_price || r.sal_initial_price || 0)
+    const p = r.sal_current_price ?? r.sal_initial_price
+    if (p == null) return null
+    const currentPrice = parseFloat(p)
+    if (!isFinite(currentPrice) || currentPrice <= 0) return null
     return BigInt(Math.floor(currentPrice * 1e18))
   }
 
@@ -440,21 +442,12 @@ async function priceAsk(r) {
 }
 
 async function priceBid(r) {
-  // Check if this is a SAL order
+  // SAL orders are asks (sell base for quote), not bids. If encountered as a bid, treat as no price.
   if (r.is_sal_order) {
-    try {
-      const salPriceData = await getSALOrderPrice(r.order_id, r.network || 'bsc')
-      if (salPriceData.currentPrice && !salPriceData.error) {
-        // Convert to 1e18 scaled format
-        return BigInt(Math.floor(parseFloat(salPriceData.currentPrice) * 1e18))
-      }
-    } catch (error) {
-      console.warn(`[executor] Failed to get SAL bid price for ${r.order_id}:`, error.message)
-    }
+    return null
   }
 
-  // Fallback to regular price calculation
-  // quote per base in integer math scaled by 1e18
+  // Regular bid price calculation: quote per base
   const ain = toBN(r.amount_in || r.amountIn || 0n) // quote in
   const aout = toBN(r.amount_out_min || r.amountOutMin || 0n) // base min out
   if (aout <= 0n) return null
@@ -1103,8 +1096,8 @@ async function tryMatchPairCrossChain(base, quote, bids, asks) {
     return 0
   }) // lowest ask first
 
-  const bestBid = bidsWithPrices[0]
-  const bestAsk = asksWithPrices[0]
+  const bestBid = bids[0]
+  const bestAsk = asks[0]
 
   if (!bestBid || !bestAsk) {
     console.log(`[executor] cross-chain: no best bid or ask available for ${base}/${quote}`)
@@ -1444,8 +1437,8 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
     return new Date(a.created_at || a.updated_at) - new Date(b.created_at || b.updated_at)
   }) // lowest ask first, then earliest time
 
-  const bestBid = bids[0]
-  const bestAsk = asks[0]
+  const bestBid = bidsWithPrices[0]
+  const bestAsk = asksWithPrices[0]
 
   if (!bestBid || !bestAsk) {
     console.log(`[executor] ${network}: no best bid or ask available for ${base}/${quote}`)
@@ -1458,14 +1451,14 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
     return false
   }
 
-  const pBid = bestBid.price
-  const pAsk = bestAsk.price
+  const pBid = bestBid?.price ?? null
+  const pAsk = bestAsk?.price ?? null
 
-  console.log(`[executor] ${network}: best bid price: ${pBid ? Number(pBid) / 1e18 : 'null'}, best ask price: ${pAsk ? Number(pAsk) / 1e18 : 'null'}`)
-  console.log(`[executor] ${network}: order sources - bid: ${bestBid?.source || 'regular'} (${bestBid?.order_id}), ask: ${bestAsk?.source || 'regular'} (${bestAsk?.order_id})`)
+  console.log(`[executor] ${network}: best bid price: ${pBid != null ? Number(pBid) / 1e18 : 'null'}, best ask price: ${pAsk != null ? Number(pAsk) / 1e18 : 'null'}`)
+  console.log(`[executor] ${network}: order sources - bid: ${bestBid?.is_sal_order ? 'sal' : (bestBid?.source || 'regular')} (${bestBid?.order_id}), ask: ${bestAsk?.is_sal_order ? 'sal' : (bestAsk?.source || 'regular')} (${bestAsk?.order_id})`)
 
-  if (pBid === null || pAsk === null) {
-    console.log(`[executor] ${network}: null prices detected for ${base}/${quote}`)
+  if (pBid == null || pAsk == null) {
+    console.log(`[executor] ${network}: null prices detected for ${base}/${quote}${bestAsk?.is_sal_order ? ', this is SAL order' : ''}`)
     return false
   }
 
@@ -2214,5 +2207,6 @@ async function runOnce(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
