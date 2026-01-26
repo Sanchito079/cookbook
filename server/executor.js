@@ -1703,7 +1703,10 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
       const salContract = network === 'base' ? salVaultBase : salVault
       // Derive on-chain bytes32 order id from DB order_id deterministically
       const onchainOrderId = sellRow.sal_order_id_bytes32 || keccak256(toUtf8Bytes(String(sellRow.order_id)))
-      const tx = await salContract.fillSAL(onchainOrderId, buy.maker, baseOut, quoteIn)
+      // Convert amounts to raw units for SAL vault
+      const baseOutRaw = baseOut * 10n ** BigInt(baseDec)
+      const quoteInRaw = quoteIn * 10n ** BigInt(quoteDec)
+      const tx = await salContract.fillSAL(onchainOrderId, buy.maker, baseOutRaw, quoteInRaw)
       console.log(`[executor] ${network}: SAL fill tx sent: ${tx.hash}`)
       receipt = await tx.wait()
       console.log(`[executor] ${network}: SAL fill tx confirmed in block ${receipt.blockNumber}`)
@@ -2320,6 +2323,7 @@ async function runOnce(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
 
