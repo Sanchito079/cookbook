@@ -405,6 +405,22 @@ function ceilDiv(a, b) {
   return (a + b - 1n) / b
 }
 
+// Format BigInt amount to decimal string with fixed decimals (no trimming)
+function formatUnits(amount, decimals = 18) {
+  try {
+    const neg = amount < 0n
+    const s = (neg ? -amount : amount).toString()
+    if (decimals === 0) return (neg ? '-' : '') + s
+    const padded = s.padStart(decimals + 1, '0')
+    const i = padded.length - decimals
+    const whole = padded.slice(0, i)
+    const frac = padded.slice(i)
+    return (neg ? '-' : '') + whole + '.' + frac
+  } catch {
+    return '0'
+  }
+}
+
 function classifyRowSide(base, quote, r) {
   const ti = (r.token_in || '').toLowerCase()
   const to = (r.token_out || '').toLowerCase()
@@ -1519,19 +1535,39 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   if (baseOut > baseFromBuyAvail) baseOut = baseFromBuyAvail
   if (baseOut <= 0n) return false
 
-  // Seller requires at least this much quote for that base, use ceil to avoid underpayment
-  let quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
+  // Compute seller-required quote based on order type (SAL vs regular)
+  let quoteNeededBySell
+  if (sellRow.is_sal_order) {
+    const SCALE = 10n ** 18n
+    // Use SAL ask price pAsk (quote per base, 1e18 scaled)
+    quoteNeededBySell = ceilDiv(baseOut * pAsk, SCALE)
 
-  // If buyer can't cover, reduce baseOut using seller ratio inverted (floor), then recompute ceil quote
-  if (quoteNeededBySell > buyRemQuote) {
-    baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin // floor
-    if (baseOut <= 0n) return false
-    if (baseOut > sellRemBase) baseOut = sellRemBase
-    if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
-    if (baseOut > baseFromBuyAvail) baseOut = baseFromBuyAvail
-    if (baseOut <= 0n) return false
+    // If buyer can't cover, reduce baseOut using SAL price inversion (floor)
+    if (quoteNeededBySell > buyRemQuote) {
+      baseOut = (buyRemQuote * SCALE) / pAsk // floor
+      if (baseOut <= 0n) return false
+      if (baseOut > sellRemBase) baseOut = sellRemBase
+      if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
+      if (baseOut > baseFromBuyAvail) baseOut = baseFromBuyAvail
+      if (baseOut <= 0n) return false
+      quoteNeededBySell = ceilDiv(baseOut * pAsk, SCALE)
+      if (quoteNeededBySell > buyRemQuote) return false
+    }
+  } else {
+    // Regular seller ratio
     quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-    if (quoteNeededBySell > buyRemQuote) return false
+
+    // If buyer can't cover, reduce baseOut using seller ratio inverted (floor), then recompute ceil quote
+    if (quoteNeededBySell > buyRemQuote) {
+      baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin // floor
+      if (baseOut <= 0n) return false
+      if (baseOut > sellRemBase) baseOut = sellRemBase
+      if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
+      if (baseOut > baseFromBuyAvail) baseOut = baseFromBuyAvail
+      if (baseOut <= 0n) return false
+      quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
+      if (quoteNeededBySell > buyRemQuote) return false
+    }
   }
 
   // Enforce buyer's min base for the chosen quote (floor)
@@ -1539,13 +1575,26 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   if (buyerMinBaseForQuoteIn < baseOut) {
     baseOut = buyerMinBaseForQuoteIn
     if (baseOut <= 0n) return false
-    quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-    if (quoteNeededBySell > buyRemQuote) {
-      // Final shrink to satisfy seller given buyer budget
-      baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin // floor
-      if (baseOut <= 0n) return false
+
+    if (sellRow.is_sal_order) {
+      const SCALE = 10n ** 18n
+      quoteNeededBySell = ceilDiv(baseOut * pAsk, SCALE)
+      if (quoteNeededBySell > buyRemQuote) {
+        // Final shrink to satisfy seller given buyer budget using SAL price
+        baseOut = (buyRemQuote * SCALE) / pAsk // floor
+        if (baseOut <= 0n) return false
+        quoteNeededBySell = ceilDiv(baseOut * pAsk, SCALE)
+        if (quoteNeededBySell > buyRemQuote) return false
+      }
+    } else {
       quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-      if (quoteNeededBySell > buyRemQuote) return false
+      if (quoteNeededBySell > buyRemQuote) {
+        // Final shrink to satisfy seller given buyer budget
+        baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin // floor
+        if (baseOut <= 0n) return false
+        quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
+        if (quoteNeededBySell > buyRemQuote) return false
+      }
     }
   }
 
@@ -1626,19 +1675,7 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
         created_at: new Date().toISOString()
       })
 
-      // Update SAL order if applicable
-      if (sellRow.is_sal_order) {
-        const newSold = Number(sellRow.sal_sold_amount || 0) + Number(baseOut)
-        const newRemaining = Number(sellRow.sal_total_inventory) - newSold
-        await supabase
-          .from('orders')
-          .update({
-            remaining: newRemaining.toString(),
-            sal_sold_amount: newSold.toString(),
-            updated_at: new Date().toISOString()
-          })
-          .eq('order_id', sellRow.order_id)
-      }
+      // SAL order inventory update moved below after decimals are determined
 
       // Also insert enriched trade data for market stats
       const baseAddr = (buyRow.base_address || sellRow.base_address || '').toLowerCase()
@@ -1682,6 +1719,27 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
       const qFloat = Number(quoteIn)
       const bFloat = Number(baseOut)
       const priceHuman = (qFloat / Math.pow(10, quoteDec)) / (bFloat / Math.pow(10, baseDec))
+
+      // Update SAL order inventory using human-readable units
+      if (sellRow.is_sal_order) {
+        // Convert baseOut (BigInt) to human units based on baseDec
+        const baseOutHumanStr = formatUnits(baseOut, baseDec) // e.g., '1.000000000000000000'
+        // sal_total_inventory and sal_sold_amount are numeric strings in human units
+        const currentSold = parseFloat(String(sellRow.sal_sold_amount || '0'))
+        const justSold = parseFloat(baseOutHumanStr)
+        const totalInventory = parseFloat(String(sellRow.sal_total_inventory || '0'))
+        const newSold = currentSold + justSold
+        const newRemaining = Math.max(0, totalInventory - newSold)
+        await supabase
+          .from('orders')
+          .update({
+            remaining: formatUnits(BigInt(Math.floor(newRemaining * Math.pow(10, baseDec))), baseDec),
+            sal_sold_amount: newSold.toFixed(baseDec),
+            updated_at: new Date().toISOString()
+          })
+          .eq('order_id', sellRow.order_id)
+      }
+
       console.log('[executor] inserting trade', {
         network,
         pair,
