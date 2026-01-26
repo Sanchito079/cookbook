@@ -1701,8 +1701,8 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
       // SAL order fill
       console.log(`[executor] ${network}: filling SAL order ${sellRow.order_id}`)
       const salContract = network === 'base' ? salVaultBase : salVault
-      // Derive on-chain bytes32 order id from DB order_id deterministically
-      const onchainOrderId = sellRow.sal_order_id_bytes32 || keccak256(toUtf8Bytes(String(sellRow.order_id)))
+      // On-chain orderId is the hex string as bytes32
+      const onchainOrderId = '0x' + sellRow.order_id
       // Convert amounts to raw units for SAL vault
       const baseOutRaw = baseOut * 10n ** BigInt(baseDec)
       const quoteInRaw = quoteIn * 10n ** BigInt(quoteDec)
