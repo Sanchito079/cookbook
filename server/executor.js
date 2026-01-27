@@ -2089,13 +2089,12 @@ async function checkCustodialDeposits(network = 'bsc') {
       const balance = await tokenContract.balanceOf(custodialAddr).catch(() => 0n)
       const balanceStr = balance.toString()
 
-      // Get sum of remaining amounts in provisions
+      // Get sum of remaining amounts in provisions (including pending_claim to prevent duplicates)
       const { data: provisions } = await supabase
         .from('liquidity_provisions')
         .select('remaining_amount')
         .eq('network', network)
         .eq('token_address', tokenAddr)
-        .neq('depositor', 'pending_claim') // Exclude unclaimed for now
 
       const totalRemaining = provisions?.reduce((sum, p) => sum + toBN(p.remaining_amount), 0n) || 0n
 
@@ -2106,17 +2105,34 @@ async function checkCustodialDeposits(network = 'bsc') {
         // Create pending provision
         const pairKey = `${tokenAddr}/${network === 'base' ? '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913' : '0x55d398326f99059ff775485246999027b3197955'}`.toLowerCase()
 
-        await supabase.from('liquidity_provisions').insert({
-          network,
-          depositor: 'pending_claim',
-          token_address: tokenAddr,
-          amount_deposited: excess.toString(),
-          min_price_per_token: '0', // Will be set on claim
-          remaining_amount: excess.toString(),
-          pair_key: pairKey
-        })
+        // Check if provision already exists for this token/network/depositor
+        const { data: existingProvision } = await supabase
+          .from('liquidity_provisions')
+          .select('id')
+          .eq('network', network)
+          .eq('token_address', tokenAddr)
+          .eq('depositor', 'pending_claim')
+          .single()
 
-        console.log(`[executor] ${network}: created pending provision for ${excess.toString()} ${tokenAddr}`)
+        if (existingProvision) {
+          console.log(`[executor] ${network}: pending provision already exists for ${tokenAddr}, skipping`)
+        } else {
+          const { error: insertError } = await supabase.from('liquidity_provisions').insert({
+            network,
+            depositor: 'pending_claim',
+            token_address: tokenAddr,
+            amount_deposited: excess.toString(),
+            min_price_per_token: '0', // Will be set on claim
+            remaining_amount: excess.toString(),
+            pair_key: pairKey
+          })
+
+          if (insertError) {
+            console.warn(`[executor] ${network}: error creating provision:`, insertError.message)
+          } else {
+            console.log(`[executor] ${network}: created pending provision for ${excess.toString()} ${tokenAddr}`)
+          }
+        }
       }
     }
   } catch (e) {
@@ -2125,20 +2141,25 @@ async function checkCustodialDeposits(network = 'bsc') {
 }
 
 async function createOrdersFromProvisions(network = 'bsc') {
-  if (!supabase || !walletBSC) return
+  const wallet = network === 'base' ? walletBase : walletBSC
+  if (!supabase || !wallet) return
 
   console.log(`[executor] ${network}: creating orders from liquidity provisions...`)
 
   try {
-    // Get provisions with remaining amount
+    // Get provisions with remaining amount (including pending_claim)
     const { data: provisions } = await supabase
       .from('liquidity_provisions')
       .select('*')
       .eq('network', network)
       .gt('remaining_amount', '0')
-      .neq('depositor', 'pending_claim')
 
-    if (!provisions || provisions.length === 0) return
+    if (!provisions || provisions.length === 0) {
+      console.log(`[executor] ${network}: no provisions with remaining amount found`)
+      return
+    }
+
+    console.log(`[executor] ${network}: found ${provisions.length} provisions to process`)
 
     // Get recent prices for pairs
     const pairPrices = new Map()
@@ -2166,6 +2187,8 @@ async function createOrdersFromProvisions(network = 'bsc') {
       const remaining = toBN(provision.remaining_amount)
       const minPrice = toBN(provision.min_price_per_token)
 
+      console.log(`[executor] ${network}: processing provision ${provision.id}, token=${tokenAddr}, remaining=${remaining.toString()}, minPrice=${minPrice.toString()}`)
+
       // Use pair_key to determine quote token
       const [baseAddr, quoteAddr] = provision.pair_key.split('/')
       if (baseAddr.toLowerCase() !== tokenAddr.toLowerCase()) {
@@ -2174,9 +2197,19 @@ async function createOrdersFromProvisions(network = 'bsc') {
       }
 
       // Get current market price
-      const currentPrice = pairPrices.get(provision.pair_key) || 0
+      let currentPrice = pairPrices.get(provision.pair_key) || 0
 
-      // Skip if no price data
+      // For pending_claim provisions with no price data, use a default price of 1 for stablecoins
+      if (currentPrice === 0 && provision.depositor === 'pending_claim') {
+        // Check if this is a stablecoin pair (USDT or USDC as quote)
+        const stablecoinQuotes = ['0x55d398326f99059ff775485246999027b3197955', '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d', '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913']
+        if (stablecoinQuotes.includes(quoteAddr.toLowerCase())) {
+          currentPrice = 1 // Default to 1:1 for stablecoin pairs
+          console.log(`[executor] ${network}: using default price of 1 for stablecoin pair ${provision.pair_key}`)
+        }
+      }
+
+      // Skip if no price data and not a stablecoin pair
       if (currentPrice <= Number(minPrice)) {
         console.log(`[executor] ${network}: skipping provision ${provision.id} - price ${currentPrice} <= min ${minPrice}`)
         continue
@@ -2204,7 +2237,6 @@ async function createOrdersFromProvisions(network = 'bsc') {
       }
 
       // Sign order
-      const wallet = network === 'base' ? walletBase : walletBSC
       const signature = await signOrder(order, wallet, network)
 
       // Insert order
@@ -2218,7 +2250,9 @@ async function createOrdersFromProvisions(network = 'bsc') {
         salt: order.salt
       })).digest('hex')
 
-      await supabase.from('orders').insert({
+      console.log(`[executor] ${network}: inserting order ${orderId} for provision ${provision.id}, amountIn=${order.amountIn}, amountOutMin=${order.amountOutMin}`)
+
+      const { error: insertError } = await supabase.from('orders').insert({
         network,
         order_id: orderId,
         order_hash: orderHash,
@@ -2249,7 +2283,11 @@ async function createOrdersFromProvisions(network = 'bsc') {
         updated_at: new Date().toISOString()
       })
 
-      console.log(`[executor] ${network}: created custodial order ${orderId} for provision ${provision.id}`)
+      if (insertError) {
+        console.warn(`[executor] ${network}: error inserting order ${orderId}:`, insertError.message)
+      } else {
+        console.log(`[executor] ${network}: created custodial order ${orderId} for provision ${provision.id}`)
+      }
     }
   } catch (e) {
     console.warn(`[executor] ${network}: error creating orders from provisions:`, e?.message || e)
