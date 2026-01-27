@@ -1481,68 +1481,6 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, time: Date.now() })
 })
 
-// Claim a pending custodial deposit by attributing it to a depositor and setting min price
-app.post('/api/claim-deposit', async (req, res) => {
-  try {
-    if (!SUPABASE_ENABLED || !supabase) return res.status(503).json({ error: 'database disabled' })
-    let { tx_hash, depositor_address, token_address, pair_key, network = 'bsc', min_price_per_token = '0' } = req.body || {}
-
-    if (!tx_hash || !depositor_address || !token_address || !pair_key) {
-      return res.status(400).json({ error: 'tx_hash, depositor_address, token_address, and pair_key required' })
-    }
-
-    // Normalize inputs
-    network = String(network || 'bsc').toLowerCase()
-    token_address = String(token_address || '').toLowerCase()
-    pair_key = String(pair_key || '').toLowerCase().replace(/_/g, '/').trim()
-
-    const parts = pair_key.split('/')
-    if (parts.length !== 2 || !parts[0] || !parts[1]) {
-      return res.status(400).json({ error: 'pair_key must be in base/quote format' })
-    }
-
-    // TODO: Optionally verify tx_hash on-chain; skipping here for speed
-
-    // Find a pending provision matching token/network/pair_key
-    const { data: pending, error: selErr } = await supabase
-      .from('liquidity_provisions')
-      .select('*')
-      .eq('network', network)
-      .eq('token_address', token_address)
-      .eq('depositor', 'pending_claim')
-      .eq('pair_key', pair_key)
-      .gt('remaining_amount', '0')
-      .limit(1)
-
-    if (selErr) return res.status(500).json({ error: selErr.message || String(selErr) })
-    if (!pending || pending.length === 0) {
-      return res.status(404).json({ error: 'No pending provision found for this token and pair_key' })
-    }
-
-    const prov = pending[0]
-    const nowIso = new Date().toISOString()
-    const patch = {
-      depositor: depositor_address,
-      min_price_per_token: String(min_price_per_token ?? '0'),
-      updated_at: nowIso
-    }
-
-    const { data: updated, error: updErr } = await supabase
-      .from('liquidity_provisions')
-      .update(patch)
-      .eq('id', prov.id)
-      .select('*')
-      .limit(1)
-
-    if (updErr) return res.status(500).json({ error: updErr.message || String(updErr) })
-
-    return res.json({ success: true, provision: (updated && updated[0]) || prov })
-  } catch (e) {
-    console.error('[api] claim-deposit error:', e?.message || e)
-    return res.status(500).json({ error: 'Internal server error' })
-  }
-})
-
 // Return token pairs strictly using markets search criteria
 app.get('/api/token-pairs', async (req, res) => {
   try {
@@ -3297,14 +3235,13 @@ app.post('/api/claim-deposit', async (req, res) => {
       return res.status(400).json({ error: 'tx_hash, depositor_address, token_address, and pair_key required' })
     }
 
-    // Find pending provision for this token and depositor (or create if doesn't exist)
+    // Find pending provision for this token (without pair_key filter since it's set on claim)
     let { data: provisions } = await supabase
       .from('liquidity_provisions')
       .select('*')
       .eq('network', network)
       .eq('token_address', token_address.toLowerCase())
       .eq('depositor', 'pending_claim')
-      .eq('pair_key', pair_key)
       .limit(1)
 
     let provision
@@ -3321,7 +3258,7 @@ app.post('/api/claim-deposit', async (req, res) => {
           amount_deposited: '0', // Will be updated when deposit detected
           min_price_per_token: min_price_per_token,
           remaining_amount: '0',
-          pair_key
+          pair_key: null // Will be set on claim
         })
         .select()
         .single()
@@ -3330,11 +3267,12 @@ app.post('/api/claim-deposit', async (req, res) => {
       provision = newProvision
     }
 
-    // Update provision with depositor and min price
+    // Update provision with depositor, pair_key, and min price
     await supabase
       .from('liquidity_provisions')
       .update({
         depositor: depositor_address.toLowerCase(),
+        pair_key: pair_key,
         min_price_per_token: min_price_per_token,
         updated_at: new Date().toISOString()
       })
@@ -3345,7 +3283,8 @@ app.post('/api/claim-deposit', async (req, res) => {
       provision_id: provision.id,
       amount: provision.amount_deposited,
       token: provision.token_address,
-      pair_key: provision.pair_key
+      pair_key: pair_key,
+      min_price_per_token: min_price_per_token
     })
 
   } catch (e) {
