@@ -3168,6 +3168,265 @@ app.post('/api/broadcast', (req, res) => {
   res.json({ success: true })
 })
 
+// ===== Liquidity Provisions =====
+
+// Claim a deposit by providing transaction hash
+app.post('/api/claim-deposit', async (req, res) => {
+  try {
+    const { tx_hash, depositor_address, token_address, pair_key, network = 'bsc', min_price_per_token = '0' } = req.body
+    if (!tx_hash || !depositor_address || !token_address || !pair_key) {
+      return res.status(400).json({ error: 'tx_hash, depositor_address, token_address, and pair_key required' })
+    }
+
+    // Find pending provision for this token and depositor (or create if doesn't exist)
+    let { data: provisions } = await supabase
+      .from('liquidity_provisions')
+      .select('*')
+      .eq('network', network)
+      .eq('token_address', token_address.toLowerCase())
+      .eq('depositor', 'pending_claim')
+      .eq('pair_key', pair_key)
+      .limit(1)
+
+    let provision
+    if (provisions && provisions.length > 0) {
+      provision = provisions[0]
+    } else {
+      // Create new provision if none exists
+      const { data: newProvision, error: insertError } = await supabase
+        .from('liquidity_provisions')
+        .insert({
+          network,
+          depositor: 'pending_claim',
+          token_address: token_address.toLowerCase(),
+          amount_deposited: '0', // Will be updated when deposit detected
+          min_price_per_token: min_price_per_token,
+          remaining_amount: '0',
+          pair_key
+        })
+        .select()
+        .single()
+
+      if (insertError) throw insertError
+      provision = newProvision
+    }
+
+    // Update provision with depositor and min price
+    await supabase
+      .from('liquidity_provisions')
+      .update({
+        depositor: depositor_address.toLowerCase(),
+        min_price_per_token: min_price_per_token,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', provision.id)
+
+    res.json({
+      success: true,
+      provision_id: provision.id,
+      amount: provision.amount_deposited,
+      token: provision.token_address,
+      pair_key: provision.pair_key
+    })
+
+  } catch (e) {
+    console.error('[api] claim-deposit error:', e?.message || e)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// Withdraw proceeds from liquidity provision
+app.post('/api/withdraw-liquidity', async (req, res) => {
+  try {
+    const { provision_id, amount, network = 'bsc' } = req.body
+    if (!provision_id) {
+      return res.status(400).json({ error: 'provision_id required' })
+    }
+
+    // Get provision
+    const { data: provision } = await supabase
+      .from('liquidity_provisions')
+      .select('*')
+      .eq('id', provision_id)
+      .single()
+
+    if (!provision) {
+      return res.status(404).json({ error: 'Provision not found' })
+    }
+
+    // Calculate available proceeds
+    const earned = toBN(provision.proceeds_earned)
+    const withdrawn = toBN(provision.withdrawn_amount)
+    const available = earned - withdrawn
+
+    if (available <= 0n) {
+      return res.status(400).json({ error: 'No proceeds available for withdrawal' })
+    }
+
+    const withdrawAmount = amount ? toBN(amount) : available
+    if (withdrawAmount > available) {
+      return res.status(400).json({ error: 'Requested amount exceeds available proceeds' })
+    }
+
+    // Get wallet for network
+    const wallet = network === 'base' ? walletBase : walletBSC
+    const provider = network === 'base' ? providerBase : providerBSC
+
+    if (!wallet || !provider) {
+      return res.status(500).json({ error: 'Network not available' })
+    }
+
+    // Transfer proceeds
+    const tokenContract = new Contract(provision.proceeds_token, ERC20_MIN_ABI, wallet)
+    const tx = await tokenContract.transfer(provision.depositor, withdrawAmount)
+    await tx.wait()
+
+    // Update withdrawn amount
+    await supabase
+      .from('liquidity_provisions')
+      .update({
+        withdrawn_amount: (withdrawn + withdrawAmount).toString(),
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', provision_id)
+
+    res.json({
+      success: true,
+      tx_hash: tx.hash,
+      amount: withdrawAmount.toString(),
+      token: provision.proceeds_token
+    })
+
+  } catch (e) {
+    console.error('[api] withdraw-liquidity error:', e?.message || e)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// Get available trading pairs for a token
+app.get('/api/token-pairs', async (req, res) => {
+  try {
+    const { token_address, network = 'bsc' } = req.query
+    if (!token_address) {
+      return res.status(400).json({ error: 'token_address required' })
+    }
+
+    const addr = token_address.toLowerCase()
+
+    // Get pairs where this token is either base or quote
+    const { data: pairs } = await supabase
+      .from('markets')
+      .select('*')
+      .eq('network', network)
+      .or(`base_address.eq.${addr},quote_address.eq.${addr}`)
+      .order('volume_24h', { ascending: false })
+      .limit(20)
+
+    // Also check for pairs in recent trades if no markets found
+    let tradePairs = []
+    if (!pairs || pairs.length === 0) {
+      const { data: trades } = await supabase
+        .from('trades')
+        .select('base_address, quote_address, pair')
+        .eq('network', network)
+        .or(`base_address.eq.${addr},quote_address.eq.${addr}`)
+        .order('created_at', { ascending: false })
+        .limit(50)
+
+      // Deduplicate
+      const seen = new Set()
+      tradePairs = (trades || []).filter(t => {
+        const key = `${t.base_address}/${t.quote_address}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      }).slice(0, 10)
+    }
+
+    // Format response
+    const availablePairs = (pairs || []).map(p => ({
+      pair_key: `${p.base_address}/${p.quote_address}`,
+      base_address: p.base_address,
+      quote_address: p.quote_address,
+      base_symbol: p.base_symbol || 'UNKNOWN',
+      quote_symbol: p.quote_symbol || 'UNKNOWN',
+      volume_24h: p.volume_24h || '0',
+      price: p.price || '0',
+      network
+    }))
+
+    // Add trade-based pairs if needed
+    if (availablePairs.length === 0 && tradePairs.length > 0) {
+      tradePairs.forEach(t => {
+        availablePairs.push({
+          pair_key: `${t.base_address}/${t.quote_address}`,
+          base_address: t.base_address,
+          quote_address: t.quote_address,
+          base_symbol: 'UNKNOWN',
+          quote_symbol: 'UNKNOWN',
+          volume_24h: '0',
+          price: '0',
+          network
+        })
+      })
+    }
+
+    // If still no pairs, provide default pairs with common quote tokens
+    if (availablePairs.length === 0) {
+      const defaultQuotes = network === 'base' ?
+        ['0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'] : // USDC base
+        ['0x55d398326f99059ff775485246999027b3197955', '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d'] // USDT, USDC bsc
+
+      defaultQuotes.forEach(quoteAddr => {
+        if (quoteAddr !== addr) {
+          availablePairs.push({
+            pair_key: `${addr}/${quoteAddr}`,
+            base_address: addr,
+            quote_address: quoteAddr,
+            base_symbol: 'UNKNOWN',
+            quote_symbol: quoteAddr === '0x55d398326f99059ff775485246999027b3197955' ? 'USDT' :
+                        quoteAddr === '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d' ? 'USDC' :
+                        quoteAddr === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913' ? 'USDC' : 'UNKNOWN',
+            volume_24h: '0',
+            price: '0',
+            network
+          })
+        }
+      })
+    }
+
+    res.json({ data: availablePairs })
+
+  } catch (e) {
+    console.error('[api] token-pairs error:', e?.message || e)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// Get user's liquidity provisions
+app.get('/api/my-provisions', async (req, res) => {
+  try {
+    const { depositor, network = 'bsc' } = req.query
+    if (!depositor) {
+      return res.status(400).json({ error: 'depositor address required' })
+    }
+
+    const { data: provisions } = await supabase
+      .from('liquidity_provisions')
+      .select('*')
+      .eq('network', network)
+      .eq('depositor', depositor.toLowerCase())
+      .neq('depositor', 'pending_claim')
+      .order('created_at', { ascending: false })
+
+    res.json({ data: provisions || [] })
+
+  } catch (e) {
+    console.error('[api] my-provisions error:', e?.message || e)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
 // Start on-chain executor in background
 try {
   await import('./executor.js')
@@ -3175,7 +3434,6 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
-
 
 
 
