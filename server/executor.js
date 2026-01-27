@@ -894,8 +894,67 @@ const ERC20_MIN_ABI = [
   { inputs: [{ name: 'owner', type: 'address' }, { name: 'spender', type: 'address' }], name: 'allowance', outputs: [{ type: 'uint256' }], stateMutability: 'view', type: 'function' },
   { inputs: [{ name: 'account', type: 'address' }], name: 'balanceOf', outputs: [{ type: 'uint256' }], stateMutability: 'view', type: 'function' },
   { inputs: [{ name: 'from', type: 'address' }, { name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }], name: 'transferFrom', outputs: [{ type: 'bool' }], stateMutability: 'nonpayable', type: 'function' },
-  { inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }], name: 'transfer', outputs: [{ type: 'bool' }], stateMutability: 'nonpayable', type: 'function' }
+  { inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }], name: 'transfer', outputs: [{ type: 'bool' }], stateMutability: 'nonpayable', type: 'function' },
+  { inputs: [], name: 'decimals', outputs: [{ type: 'uint8' }], stateMutability: 'view', type: 'function' }
 ]
+
+// Cache for token decimals
+const decimalsCache = new Map()
+
+// Function to fetch decimals from contract
+async function fetchTokenDecimals(tokenAddr, network = 'bsc') {
+  if (!tokenAddr) return 18
+  const addr = tokenAddr.toString().toLowerCase()
+  const cacheKey = `${network}:${addr}`
+
+  // Check cache
+  if (decimalsCache.has(cacheKey)) {
+    return decimalsCache.get(cacheKey)
+  }
+
+  try {
+    const provider = network === 'base' ? providerBase : providerBSC
+    if (!provider) return 18
+
+    const contract = new Contract(addr, [
+      { inputs: [], name: 'decimals', outputs: [{ type: 'uint8' }], stateMutability: 'view', type: 'function' }
+    ], provider)
+
+    const decimals = await contract.decimals()
+    const decimalsNum = Number(decimals)
+
+    // Cache result
+    decimalsCache.set(cacheKey, decimalsNum)
+    console.log(`[executor] Fetched decimals for ${addr} on ${network}: ${decimalsNum}`)
+    return decimalsNum
+  } catch (error) {
+    console.warn(`[executor] Failed to fetch decimals for ${addr} on ${network}:`, error.message)
+    // Fallback to DB or hardcoded
+    try {
+      if (supabase) {
+        const { data } = await supabase
+          .from('tokens')
+          .select('decimals')
+          .eq('address', addr)
+          .eq('network', network)
+          .single()
+        if (data?.decimals) {
+          decimalsCache.set(cacheKey, data.decimals)
+          return data.decimals
+        }
+      }
+    } catch {}
+
+    // Hardcoded fallbacks
+    if (addr === '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c') return 18 // WBNB
+    if (addr === '0x55d398326f99059ff775485246999027b3197955') return 18 // USDT BSC
+    if (addr === '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d') return 18 // USDC BSC
+    if (addr === '0x4200000000000000000000000000000000000006') return 18 // WETH Base
+    if (addr === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913') return 6 // USDC Base
+
+    return 18 // Default
+  }
+}
 
 async function preflightDiagnostics(buyRow, sellRow, network = 'bsc') {
   const buy = normalizeOrderJson(buyRow.order_json || buyRow.order || {})
@@ -2102,13 +2161,10 @@ async function checkCustodialDeposits(network = 'bsc') {
         const excess = toBN(balanceStr) - totalRemaining
         console.log(`[executor] ${network}: detected deposit of ${excess.toString()} ${tokenAddr} to custodial`)
 
-        // Create pending provision
-        const pairKey = `${tokenAddr}/${network === 'base' ? '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913' : '0x55d398326f99059ff775485246999027b3197955'}`.toLowerCase()
-
-        // Check if provision already exists for this token/network/depositor
+        // Check if provision already exists for this token/network/depositor (without pair_key filter)
         const { data: existingProvision } = await supabase
           .from('liquidity_provisions')
-          .select('id')
+          .select('id, pair_key')
           .eq('network', network)
           .eq('token_address', tokenAddr)
           .eq('depositor', 'pending_claim')
@@ -2117,6 +2173,7 @@ async function checkCustodialDeposits(network = 'bsc') {
         if (existingProvision) {
           console.log(`[executor] ${network}: pending provision already exists for ${tokenAddr}, skipping`)
         } else {
+          // Create pending provision without pair_key - user will provide it when claiming
           const { error: insertError } = await supabase.from('liquidity_provisions').insert({
             network,
             depositor: 'pending_claim',
@@ -2124,7 +2181,7 @@ async function checkCustodialDeposits(network = 'bsc') {
             amount_deposited: excess.toString(),
             min_price_per_token: '0', // Will be set on claim
             remaining_amount: excess.toString(),
-            pair_key: pairKey
+            pair_key: null // Will be set on claim
           })
 
           if (insertError) {
@@ -2164,6 +2221,12 @@ async function createOrdersFromProvisions(network = 'bsc') {
     // Get recent prices for pairs
     const pairPrices = new Map()
     for (const p of provisions) {
+      // Skip provisions without pair_key (not yet claimed)
+      if (!p.pair_key) {
+        console.log(`[executor] ${network}: skipping provision ${p.id} - no pair_key set`)
+        continue
+      }
+
       if (pairPrices.has(p.pair_key)) continue
 
       const [base, quote] = p.pair_key.split('/')
@@ -2183,6 +2246,12 @@ async function createOrdersFromProvisions(network = 'bsc') {
     }
 
     for (const provision of provisions) {
+      // Skip provisions without pair_key (not yet claimed)
+      if (!provision.pair_key) {
+        console.log(`[executor] ${network}: skipping provision ${provision.id} - no pair_key set`)
+        continue
+      }
+
       const tokenAddr = provision.token_address
       const remaining = toBN(provision.remaining_amount)
       const minPrice = toBN(provision.min_price_per_token)
@@ -2500,6 +2569,7 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
 
