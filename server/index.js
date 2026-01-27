@@ -3303,7 +3303,7 @@ app.post('/api/withdraw-liquidity', async (req, res) => {
   }
 })
 
-// Get available trading pairs for a token
+// Get available trading pairs for a token - query markets table directly
 app.get('/api/token-pairs', async (req, res) => {
   try {
     const { token_address, network = 'bsc' } = req.query
@@ -3313,35 +3313,16 @@ app.get('/api/token-pairs', async (req, res) => {
 
     const addr = token_address.toLowerCase()
 
-    // Get pairs where this token is either base or quote
+    // Get pairs where this token is either base or quote - directly from markets table
     const { data: pairs } = await supabase
       .from('markets')
       .select('*')
       .eq('network', network)
       .or(`base_address.eq.${addr},quote_address.eq.${addr}`)
       .order('volume_24h', { ascending: false })
-      .limit(20)
+      .limit(50)
 
-    console.log('[DEBUG token-pairs] Searching for token:', addr, 'network:', network)
-    console.log('[DEBUG token-pairs] Raw DB pairs count:', pairs?.length || 0)
-    if (pairs && pairs.length > 0) {
-      // Log ALL pairs to check if searched address matches
-      pairs.forEach((p, i) => {
-        const isBase = p.base_address?.toLowerCase() === addr
-        const isQuote = p.quote_address?.toLowerCase() === addr
-        console.log(`[DEBUG token-pairs] Pair ${i}:`, {
-          pair_key: p.pair_key,
-          isBase,
-          isQuote,
-          base_symbol: p.base_symbol,
-          base_address: p.base_address,
-          quote_symbol: p.quote_symbol,
-          quote_address: p.quote_address
-        })
-      })
-    }
-
-    // Also check for pairs in recent trades if no markets found
+    // If no pairs in markets, check trades table
     let tradePairs = []
     if (!pairs || pairs.length === 0) {
       const { data: trades } = await supabase
@@ -3362,27 +3343,37 @@ app.get('/api/token-pairs', async (req, res) => {
       }).slice(0, 10)
     }
 
-    // Format response - use markets table data directly
+    // Return market pairs directly - using data as-is from markets table
     const availablePairs = (pairs || []).map(p => ({
-      pair_key: `${p.base_address}/${p.quote_address}`,
+      pair_key: p.pair_key || `${p.base_address}/${p.quote_address}`,
       base_address: p.base_address,
       quote_address: p.quote_address,
-      base_symbol: p.base_symbol || 'UNKNOWN',
-      quote_symbol: p.quote_symbol || 'UNKNOWN',
+      base_symbol: p.base_symbol,
+      quote_symbol: p.quote_symbol,
+      base_name: p.base_name,
+      quote_name: p.quote_name,
+      base_decimals: p.base_decimals,
+      quote_decimals: p.quote_decimals,
+      base_logo_url: p.base_logo_url,
+      quote_logo_url: p.quote_logo_url,
+      pair: p.pair,
       volume_24h: p.volume_24h || '0',
       price: p.price || '0',
+      pool_address: p.pool_address,
+      gecko_pool_id: p.gecko_pool_id,
       network
     }))
 
-    // Add trade-based pairs if needed
+    // Add trade-based pairs if no market pairs found
     if (availablePairs.length === 0 && tradePairs.length > 0) {
       tradePairs.forEach(t => {
         availablePairs.push({
           pair_key: `${t.base_address}/${t.quote_address}`,
           base_address: t.base_address,
           quote_address: t.quote_address,
-          base_symbol: 'UNKNOWN',
-          quote_symbol: 'UNKNOWN',
+          base_symbol: null,
+          quote_symbol: null,
+          pair: t.pair,
           volume_24h: '0',
           price: '0',
           network
@@ -3390,31 +3381,7 @@ app.get('/api/token-pairs', async (req, res) => {
       })
     }
 
-    // If still no pairs, provide default pairs with common quote tokens
-    if (availablePairs.length === 0) {
-      const defaultQuotes = network === 'base' ?
-        ['0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'] : // USDC base
-        ['0x55d398326f99059ff775485246999027b3197955', '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d'] // USDT, USDC bsc
-
-      defaultQuotes.forEach(quoteAddr => {
-        if (quoteAddr !== addr) {
-          availablePairs.push({
-            pair_key: `${addr}/${quoteAddr}`,
-            base_address: addr,
-            quote_address: quoteAddr,
-            base_symbol: 'UNKNOWN',
-            quote_symbol: quoteAddr === '0x55d398326f99059ff775485246999027b3197955' ? 'USDT' :
-                        quoteAddr === '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d' ? 'USDC' :
-                        quoteAddr === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913' ? 'USDC' : 'UNKNOWN',
-            volume_24h: '0',
-            price: '0',
-            network
-          })
-        }
-      })
-    }
-
-    console.log('[DEBUG token-pairs] Final response - total pairs:', availablePairs.length, 'with UNKNOWN symbols:', availablePairs.filter(p => p.base_symbol === 'UNKNOWN' || p.quote_symbol === 'UNKNOWN').length)
+    // If still no pairs, return empty array (user can create new pair)
     res.json({ data: availablePairs })
 
   } catch (e) {
