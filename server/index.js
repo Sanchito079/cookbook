@@ -3340,105 +3340,6 @@ app.post('/api/withdraw-liquidity', async (req, res) => {
   }
 })
 
-// Get available trading pairs for a token
-app.get('/api/token-pairs', async (req, res) => {
-  try {
-    const { token_address, network = 'bsc' } = req.query
-    if (!token_address) {
-      return res.status(400).json({ error: 'token_address required' })
-    }
-
-    const addr = token_address.toLowerCase()
-
-    // Get pairs where this token is either base or quote
-    const { data: pairs } = await supabase
-      .from('markets')
-      .select('*')
-      .eq('network', network)
-      .or(`base_address.eq.${addr},quote_address.eq.${addr}`)
-      .order('volume_24h', { ascending: false })
-      .limit(20)
-
-    // Also check for pairs in recent trades if no markets found
-    let tradePairs = []
-    if (!pairs || pairs.length === 0) {
-      const { data: trades } = await supabase
-        .from('trades')
-        .select('base_address, quote_address, pair')
-        .eq('network', network)
-        .or(`base_address.eq.${addr},quote_address.eq.${addr}`)
-        .order('created_at', { ascending: false })
-        .limit(50)
-
-      // Deduplicate
-      const seen = new Set()
-      tradePairs = (trades || []).filter(t => {
-        const key = `${t.base_address}/${t.quote_address}`
-        if (seen.has(key)) return false
-        seen.add(key)
-        return true
-      }).slice(0, 10)
-    }
-
-    // Format response
-    const availablePairs = (pairs || []).map(p => ({
-      pair_key: `${p.base_address}/${p.quote_address}`,
-      base_address: p.base_address,
-      quote_address: p.quote_address,
-      base_symbol: p.base_symbol || 'UNKNOWN',
-      quote_symbol: p.quote_symbol || 'UNKNOWN',
-      volume_24h: p.volume_24h || '0',
-      price: p.price || '0',
-      network
-    }))
-
-    // Add trade-based pairs if needed
-    if (availablePairs.length === 0 && tradePairs.length > 0) {
-      tradePairs.forEach(t => {
-        availablePairs.push({
-          pair_key: `${t.base_address}/${t.quote_address}`,
-          base_address: t.base_address,
-          quote_address: t.quote_address,
-          base_symbol: 'UNKNOWN',
-          quote_symbol: 'UNKNOWN',
-          volume_24h: '0',
-          price: '0',
-          network
-        })
-      })
-    }
-
-    // If still no pairs, provide default pairs with common quote tokens
-    if (availablePairs.length === 0) {
-      const defaultQuotes = network === 'base' ?
-        ['0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'] : // USDC base
-        ['0x55d398326f99059ff775485246999027b3197955', '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d'] // USDT, USDC bsc
-
-      defaultQuotes.forEach(quoteAddr => {
-        if (quoteAddr !== addr) {
-          availablePairs.push({
-            pair_key: `${addr}/${quoteAddr}`,
-            base_address: addr,
-            quote_address: quoteAddr,
-            base_symbol: 'UNKNOWN',
-            quote_symbol: quoteAddr === '0x55d398326f99059ff775485246999027b3197955' ? 'USDT' :
-                        quoteAddr === '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d' ? 'USDC' :
-                        quoteAddr === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913' ? 'USDC' : 'UNKNOWN',
-            volume_24h: '0',
-            price: '0',
-            network
-          })
-        }
-      })
-    }
-
-    res.json({ data: availablePairs })
-
-  } catch (e) {
-    console.error('[api] token-pairs error:', e?.message || e)
-    res.status(500).json({ error: 'Internal server error' })
-  }
-})
 
 // Get user's liquidity provisions
 app.get('/api/my-provisions', async (req, res) => {
@@ -3471,6 +3372,8 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
+
 
 
 
