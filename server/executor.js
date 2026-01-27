@@ -1744,6 +1744,103 @@ async function processOrders(rows, network = 'bsc') {
   return matchesThisCycle
 }
 
+// Compute default quote token by network for liquidity provisions
+function getDefaultQuoteForNetwork(network) {
+  const n = (network || 'bsc').toLowerCase()
+  if (n === 'base') return '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913' // USDC on Base
+  return '0x55d398326f99059ff775485246999027b3197955' // USDT on BSC
+}
+
+// Normalize pair_key to "base/quote" lowercase
+function normalizePairKey(pairKey) {
+  if (!pairKey) return null
+  const s = String(pairKey).toLowerCase().replace(/_/g, '/').trim()
+  const parts = s.split('/')
+  if (parts.length !== 2) return null
+  const [b, q] = parts
+  if (!b || !q) return null
+  return `${b}/${q}`
+}
+
+// Detect deposits into custodial address and record liquidity provisions
+async function checkCustodialDeposits(network = 'bsc') {
+  if (!supabase) return
+  try {
+    console.log(`[executor] ${network}: checking custodial deposits...`)
+
+    // Get custodial address
+    const custodialAddr = CUSTODIAL_ADDRESS.toLowerCase()
+
+    // Fetch tokens we monitor on this network
+    const { data: tokens, error: tokenErr } = await supabase
+      .from('tokens')
+      .select('address')
+      .eq('network', network)
+      .limit(2000)
+    if (tokenErr) throw tokenErr
+
+    const provider = network === 'base' ? providerBase : providerBSC
+    if (!provider) {
+      console.warn(`[executor] ${network}: provider not initialized, skipping deposit check`)
+      return
+    }
+
+    // Load existing provisions to compute remaining sums per token
+    const { data: provisions } = await supabase
+      .from('liquidity_provisions')
+      .select('token_address, remaining_amount')
+      .eq('network', network)
+
+    const remainingByToken = new Map()
+    for (const p of provisions || []) {
+      const t = (p.token_address || '').toLowerCase()
+      const amt = BigInt(p.remaining_amount || '0')
+      remainingByToken.set(t, (remainingByToken.get(t) || 0n) + amt)
+    }
+
+    // For each token, read balance at custodial and detect excess
+    for (const row of tokens || []) {
+      const tokenAddr = (row.address || '').toLowerCase()
+      if (!tokenAddr) continue
+      try {
+        const erc = new Contract(tokenAddr, ERC20_MIN_ABI, provider)
+        const bal = BigInt(await erc.balanceOf(custodialAddr).catch(() => 0n))
+        const expected = remainingByToken.get(tokenAddr) || 0n
+        if (bal > expected) {
+          const excess = bal - expected
+          console.log(`[executor] ${network}: detected deposit of ${excess.toString()} ${tokenAddr} to custodial`)
+
+          const defaultQuote = getDefaultQuoteForNetwork(network)
+          const pairKey = normalizePairKey(`${tokenAddr}/${defaultQuote}`)
+
+          const nowIso = new Date().toISOString()
+          // Create a pending provision attributed to pending_claim
+          const { error: insErr } = await supabase.from('liquidity_provisions').insert({
+            network,
+            depositor: 'pending_claim',
+            token_address: tokenAddr,
+            remaining_amount: excess.toString(),
+            min_price_per_token: '0',
+            proceeds_earned: '0',
+            withdrawn_amount: '0',
+            proceeds_token: null,
+            pair_key: pairKey,
+            created_at: nowIso,
+            updated_at: nowIso
+          })
+          if (insErr) {
+            console.error(`[executor] ${network}: failed to insert provision:`, insErr?.message || insErr)
+          }
+        }
+      } catch (e) {
+        console.warn(`[executor] ${network}: failed balance check for token ${tokenAddr}:`, e?.message || e)
+      }
+    }
+  } catch (e) {
+    console.error(`[executor] ${network}: error checking custodial deposits:`, e?.message || e)
+  }
+}
+
 async function runSolana() {
   if (!EXECUTOR_ENABLED) {
     console.log(`[executor] solana: executor disabled`)
@@ -2125,7 +2222,9 @@ async function checkCustodialDeposits(network = 'bsc') {
 }
 
 async function createOrdersFromProvisions(network = 'bsc') {
-  if (!supabase || !walletBSC) return
+  if (!supabase) return
+  const wallet = network === 'base' ? walletBase : walletBSC
+  if (!wallet) return
 
   console.log(`[executor] ${network}: creating orders from liquidity provisions...`)
 
@@ -2145,7 +2244,9 @@ async function createOrdersFromProvisions(network = 'bsc') {
     for (const p of provisions) {
       if (pairPrices.has(p.pair_key)) continue
 
-      const [base, quote] = p.pair_key.split('/')
+      const keyNorm = normalizePairKey(p.pair_key)
+      if (!keyNorm) continue
+      const [base, quote] = keyNorm.split('/')
       const { data: trades } = await supabase
         .from('trades')
         .select('price')
@@ -2167,7 +2268,12 @@ async function createOrdersFromProvisions(network = 'bsc') {
       const minPrice = toBN(provision.min_price_per_token)
 
       // Use pair_key to determine quote token
-      const [baseAddr, quoteAddr] = provision.pair_key.split('/')
+      const keyNorm2 = normalizePairKey(provision.pair_key)
+      if (!keyNorm2) {
+        console.log(`[executor] ${network}: provision missing/invalid pair_key for ${provision.id}`)
+        continue
+      }
+      const [baseAddr, quoteAddr] = keyNorm2.split('/')
       if (baseAddr.toLowerCase() !== tokenAddr.toLowerCase()) {
         console.log(`[executor] ${network}: provision pair_key mismatch for ${provision.id}`)
         continue
