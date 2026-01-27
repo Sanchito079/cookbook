@@ -1763,83 +1763,7 @@ function normalizePairKey(pairKey) {
 }
 
 // Detect deposits into custodial address and record liquidity provisions
-async function checkCustodialDeposits(network = 'bsc') {
-  if (!supabase) return
-  try {
-    console.log(`[executor] ${network}: checking custodial deposits...`)
-
-    // Get custodial address
-    const custodialAddr = CUSTODIAL_ADDRESS.toLowerCase()
-
-    // Fetch tokens we monitor on this network
-    const { data: tokens, error: tokenErr } = await supabase
-      .from('tokens')
-      .select('address')
-      .eq('network', network)
-      .limit(2000)
-    if (tokenErr) throw tokenErr
-
-    const provider = network === 'base' ? providerBase : providerBSC
-    if (!provider) {
-      console.warn(`[executor] ${network}: provider not initialized, skipping deposit check`)
-      return
-    }
-
-    // Load existing provisions to compute remaining sums per token
-    const { data: provisions } = await supabase
-      .from('liquidity_provisions')
-      .select('token_address, remaining_amount')
-      .eq('network', network)
-
-    const remainingByToken = new Map()
-    for (const p of provisions || []) {
-      const t = (p.token_address || '').toLowerCase()
-      const amt = BigInt(p.remaining_amount || '0')
-      remainingByToken.set(t, (remainingByToken.get(t) || 0n) + amt)
-    }
-
-    // For each token, read balance at custodial and detect excess
-    for (const row of tokens || []) {
-      const tokenAddr = (row.address || '').toLowerCase()
-      if (!tokenAddr) continue
-      try {
-        const erc = new Contract(tokenAddr, ERC20_MIN_ABI, provider)
-        const bal = BigInt(await erc.balanceOf(custodialAddr).catch(() => 0n))
-        const expected = remainingByToken.get(tokenAddr) || 0n
-        if (bal > expected) {
-          const excess = bal - expected
-          console.log(`[executor] ${network}: detected deposit of ${excess.toString()} ${tokenAddr} to custodial`)
-
-          const defaultQuote = getDefaultQuoteForNetwork(network)
-          const pairKey = normalizePairKey(`${tokenAddr}/${defaultQuote}`)
-
-          const nowIso = new Date().toISOString()
-          // Create a pending provision attributed to pending_claim
-          const { error: insErr } = await supabase.from('liquidity_provisions').insert({
-            network,
-            depositor: 'pending_claim',
-            token_address: tokenAddr,
-            remaining_amount: excess.toString(),
-            min_price_per_token: '0',
-            proceeds_earned: '0',
-            withdrawn_amount: '0',
-            proceeds_token: null,
-            pair_key: pairKey,
-            created_at: nowIso,
-            updated_at: nowIso
-          })
-          if (insErr) {
-            console.error(`[executor] ${network}: failed to insert provision:`, insErr?.message || insErr)
-          }
-        }
-      } catch (e) {
-        console.warn(`[executor] ${network}: failed balance check for token ${tokenAddr}:`, e?.message || e)
-      }
-    }
-  } catch (e) {
-    console.error(`[executor] ${network}: error checking custodial deposits:`, e?.message || e)
-  }
-}
+// (duplicate removed)
 
 async function runSolana() {
   if (!EXECUTOR_ENABLED) {
@@ -2568,6 +2492,7 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
 
