@@ -4,7 +4,7 @@ import { fileURLToPath } from 'url'
 import crypto from 'crypto'
 import fetch from 'node-fetch'
 import { createClient } from '@supabase/supabase-js'
-import { Contract, JsonRpcProvider, Wallet, FetchRequest, keccak256, toUtf8Bytes } from 'ethers'
+import { Contract, JsonRpcProvider, Wallet, FetchRequest } from 'ethers'
 
 // Import SAL Order utilities
 import {
@@ -30,9 +30,7 @@ const EXECUTOR_RPC_URLS = (process.env.EXECUTOR_RPC_URLS || '').split(',').map(s
 const EXECUTOR_PRIVATE_KEY = process.env.EXECUTOR_PRIVATE_KEY
 const SETTLEMENT_ADDRESS_BSC = process.env.SETTLEMENT_ADDRESS_BSC || '0x7DBA6a1488356428C33cC9fB8Ef3c8462c8679d0'
 const SETTLEMENT_ADDRESS_BASE = process.env.SETTLEMENT_ADDRESS_BASE || '0xBBf7A39F053BA2B8F4991282425ca61F2D871f45'
-const SAL_VAULT_ADDRESS_BSC = '0x260836972c9aBBaDa9e217C71a05D536C1F43A01'
-const SAL_VAULT_ADDRESS_BASE = '0x9126e4868B4c403220b42E65e15277ABf2bEb961'
-const CUSTODIAL_ADDRESS = '0x70c992e6a19c565430fa0c21933395ebf1e907c3'
+const CUSTODIAL_ADDRESS = '0x6E11b5c17258C3F3ea684881Da4bB591C4C7bE05'
 
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE
@@ -343,34 +341,6 @@ const SETTLEMENT_ABI = [
   }
 ];
 
-const SAL_VAULT_ABI = [
- {"inputs":[{"internalType":"address","name":"_executor","type":"address"}],"stateMutability":"nonpayable","type":"constructor"},
- {"inputs":[],"name":"InsufficientInventory","type":"error"},
- {"inputs":[],"name":"InvalidAmount","type":"error"},
- {"inputs":[],"name":"OrderNotActive","type":"error"},
- {"inputs":[{"internalType":"address","name":"owner","type":"address"}],"name":"OwnableInvalidOwner","type":"error"},
- {"inputs":[{"internalType":"address","name":"account","type":"address"}],"name":"OwnableUnauthorizedAccount","type":"error"},
- {"inputs":[],"name":"PaymentRequired","type":"error"},
- {"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"SafeERC20FailedOperation","type":"error"},
- {"inputs":[],"name":"Unauthorized","type":"error"},
- {"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"oldExecutor","type":"address"},{"indexed":true,"internalType":"address","name":"newExecutor","type":"address"}],"name":"ExecutorUpdated","type":"event"},
- {"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"previousOwner","type":"address"},{"indexed":true,"internalType":"address","name":"newOwner","type":"address"}],"name":"OwnershipTransferred","type":"event"},
- {"anonymous":false,"inputs":[{"indexed":true,"internalType":"bytes32","name":"orderId","type":"bytes32"},{"indexed":true,"internalType":"address","name":"maker","type":"address"},{"indexed":false,"internalType":"address","name":"tokenIn","type":"address"},{"indexed":false,"internalType":"uint256","name":"amountIn","type":"uint256"}],"name":"SALOrderDeposited","type":"event"},
- {"anonymous":false,"inputs":[{"indexed":true,"internalType":"bytes32","name":"orderId","type":"bytes32"},{"indexed":true,"internalType":"address","name":"buyer","type":"address"},{"indexed":false,"internalType":"uint256","name":"amountIn","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"amountOut","type":"uint256"}],"name":"SALOrderFilled","type":"event"},
- {"anonymous":false,"inputs":[{"indexed":true,"internalType":"bytes32","name":"orderId","type":"bytes32"},{"indexed":true,"internalType":"address","name":"maker","type":"address"},{"indexed":false,"internalType":"uint256","name":"amountIn","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"amountOut","type":"uint256"}],"name":"SALOrderWithdrawn","type":"event"},
- {"inputs":[{"internalType":"bytes32","name":"orderId","type":"bytes32"},{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint256","name":"amountIn","type":"uint256"}],"name":"depositSAL","outputs":[],"stateMutability":"nonpayable","type":"function"},
- {"inputs":[],"name":"executor","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},
- {"inputs":[{"internalType":"bytes32","name":"orderId","type":"bytes32"},{"internalType":"address","name":"buyer","type":"address"},{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint256","name":"amountOut","type":"uint256"}],"name":"fillSAL","outputs":[],"stateMutability":"nonpayable","type":"function"},
- {"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"getBalance","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
- {"inputs":[{"internalType":"bytes32","name":"orderId","type":"bytes32"}],"name":"getSALOrder","outputs":[{"internalType":"address","name":"maker","type":"address"},{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint256","name":"depositedIn","type":"uint256"},{"internalType":"uint256","name":"remainingIn","type":"uint256"},{"internalType":"uint256","name":"receivedOut","type":"uint256"},{"internalType":"bool","name":"active","type":"bool"}],"stateMutability":"view","type":"function"},
- {"inputs":[],"name":"owner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},
- {"inputs":[],"name":"renounceOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},
- {"inputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"name":"salOrders","outputs":[{"internalType":"address","name":"maker","type":"address"},{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint256","name":"depositedIn","type":"uint256"},{"internalType":"uint256","name":"remainingIn","type":"uint256"},{"internalType":"uint256","name":"receivedOut","type":"uint256"},{"internalType":"bool","name":"active","type":"bool"}],"stateMutability":"view","type":"function"},
- {"inputs":[{"internalType":"address","name":"_executor","type":"address"}],"name":"setExecutor","outputs":[],"stateMutability":"nonpayable","type":"function"},
- {"inputs":[{"internalType":"address","name":"newOwner","type":"address"}],"name":"transferOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},
- {"inputs":[{"internalType":"bytes32","name":"orderId","type":"bytes32"}],"name":"withdrawSAL","outputs":[],"stateMutability":"nonpayable","type":"function"}
-];
-
 function toBN(x) {
   try {
     if (typeof x === 'bigint') return x
@@ -405,44 +375,6 @@ function ceilDiv(a, b) {
   return (a + b - 1n) / b
 }
 
-// Convert a decimal string (e.g., '1', '0.5', '1.000000000000000000') to raw BigInt using decimals
-function decimalToRawInt(value, decimals) {
-  try {
-    let s = (value ?? '').toString().trim()
-    if (!s) return 0n
-    let neg = false
-    if (s[0] === '-') { neg = true; s = s.slice(1) }
-    const [intStrRaw, fracStrRaw = ''] = s.split('.')
-    const intStr = intStrRaw.replace(/\D/g, '') || '0'
-    let fracStr = fracStrRaw.replace(/\D/g, '')
-    if (fracStr.length > decimals) fracStr = fracStr.slice(0, decimals)
-    while (fracStr.length < decimals) fracStr += '0'
-    const intPart = BigInt(intStr)
-    const fracPart = BigInt(fracStr || '0')
-    const scale = 10n ** BigInt(decimals)
-    const raw = intPart * scale + fracPart
-    return neg ? -raw : raw
-  } catch {
-    return 0n
-  }
-}
-
-// Format BigInt amount to decimal string with fixed decimals (no trimming)
-function formatUnits(amount, decimals = 18) {
-  try {
-    const neg = amount < 0n
-    const s = (neg ? -amount : amount).toString()
-    if (decimals === 0) return (neg ? '-' : '') + s
-    const padded = s.padStart(decimals + 1, '0')
-    const i = padded.length - decimals
-    const whole = padded.slice(0, i)
-    const frac = padded.slice(i)
-    return (neg ? '-' : '') + whole + '.' + frac
-  } catch {
-    return '0'
-  }
-}
-
 function classifyRowSide(base, quote, r) {
   const ti = (r.token_in || '').toLowerCase()
   const to = (r.token_out || '').toLowerCase()
@@ -462,16 +394,20 @@ function getNetworkForToken(address) {
 }
 
 async function priceAsk(r) {
-  // SAL ask price: use stored current or initial price (quote per base)
+  // Check if this is a SAL order
   if (r.is_sal_order) {
-    const p = r.sal_current_price ?? r.sal_initial_price
-    if (p == null) return null
-    const currentPrice = parseFloat(p)
-    if (!isFinite(currentPrice) || currentPrice <= 0) return null
-    return BigInt(Math.floor(currentPrice * 1e18))
+    try {
+      const salPriceData = await getSALOrderPrice(r.order_id, r.network || 'bsc')
+      if (salPriceData.currentPrice && !salPriceData.error) {
+        // Convert to 1e18 scaled format
+        return BigInt(Math.floor(parseFloat(salPriceData.currentPrice) * 1e18))
+      }
+    } catch (error) {
+      console.warn(`[executor] Failed to get SAL ask price for ${r.order_id}:`, error.message)
+    }
   }
 
-  // Regular price calculation
+  // Fallback to regular price calculation
   // quote per base in integer math scaled by 1e18
   const ain = toBN(r.amount_in || r.amountIn || 0n) // base in
   const aout = toBN(r.amount_out_min || r.amountOutMin || 0n) // quote min out
@@ -480,12 +416,21 @@ async function priceAsk(r) {
 }
 
 async function priceBid(r) {
-  // SAL orders are asks (sell base for quote), not bids. If encountered as a bid, treat as no price.
+  // Check if this is a SAL order
   if (r.is_sal_order) {
-    return null
+    try {
+      const salPriceData = await getSALOrderPrice(r.order_id, r.network || 'bsc')
+      if (salPriceData.currentPrice && !salPriceData.error) {
+        // Convert to 1e18 scaled format
+        return BigInt(Math.floor(parseFloat(salPriceData.currentPrice) * 1e18))
+      }
+    } catch (error) {
+      console.warn(`[executor] Failed to get SAL bid price for ${r.order_id}:`, error.message)
+    }
   }
 
-  // Regular bid price calculation: quote per base
+  // Fallback to regular price calculation
+  // quote per base in integer math scaled by 1e18
   const ain = toBN(r.amount_in || r.amountIn || 0n) // quote in
   const aout = toBN(r.amount_out_min || r.amountOutMin || 0n) // base min out
   if (aout <= 0n) return null
@@ -510,8 +455,6 @@ let walletBSC = null
 let walletBase = null
 let settlement = null
 let settlementBase = null
-let salVault = null
-let salVaultBase = null
 let busyBSC = false
 let busyBase = false
 
@@ -640,7 +583,6 @@ async function init() {
     // Initialize settlement contracts for networks that connected
     if (walletBSC) {
       settlement = new Contract(SETTLEMENT_ADDRESS_BSC, SETTLEMENT_ABI, walletBSC)
-      salVault = new Contract(SAL_VAULT_ADDRESS_BSC, SAL_VAULT_ABI, walletBSC)
       try {
         settlement.on('Matched', (buyHash, sellHash, matcher, amountBase, amountQuote) => {
           console.log('[chain] BSC Matched', { buyHash, sellHash, matcher, amountBase: amountBase?.toString?.(), amountQuote: amountQuote?.toString?.() })
@@ -655,7 +597,6 @@ async function init() {
 
     if (walletBase) {
       settlementBase = new Contract(SETTLEMENT_ADDRESS_BASE, SETTLEMENT_ABI, walletBase)
-      salVaultBase = new Contract(SAL_VAULT_ADDRESS_BASE, SAL_VAULT_ABI, walletBase)
       try {
         settlementBase.on('Matched', (buyHash, sellHash, matcher, amountBase, amountQuote) => {
           console.log('[chain] Base Matched', { buyHash, sellHash, matcher, amountBase: amountBase?.toString?.(), amountQuote: amountQuote?.toString?.() })
@@ -697,71 +638,7 @@ async function fetchOpenOrdersAll(network = 'bsc') {
     .order('updated_at', { ascending: true })
     .limit(500)
   if (error) throw error
-  let orders = data || []
-
-  // Add SAL orders as pseudo sell orders (convert human inventory to raw units)
-  const { data: salData, error: salError } = await supabase
-    .from('orders')
-    .select('*')
-    .eq('network', network)
-    .eq('is_sal_order', true)
-    .gt('sal_total_inventory', '0')
-    .order('updated_at', { ascending: true })
-    .limit(100)
-
-  if (!salError && salData && salData.length) {
-    // fetch decimals for all involved base tokens in one query
-    const baseAddrs = Array.from(new Set(salData.map(s => (s.base_address || '').toLowerCase()).filter(Boolean)))
-    let decMap = new Map()
-    try {
-      if (baseAddrs.length) {
-        const { data: trows } = await supabase
-          .from('tokens')
-          .select('address,decimals')
-          .eq('network', network)
-          .in('address', baseAddrs)
-        if (Array.isArray(trows)) {
-          for (const r of trows) {
-            decMap.set((r.address || '').toLowerCase(), Number(r.decimals) || 18)
-          }
-        }
-      }
-    } catch {}
-
-    for (const sal of salData) {
-      const baseAddr = (sal.base_address || '').toLowerCase()
-      const baseDec = decMap.get(baseAddr) ?? 18
-      // sal_total_inventory is stored in human units -> convert to raw units precisely
-      const invRaw = decimalToRawInt(sal.sal_total_inventory ?? '0', baseDec)
-
-      const pseudoOrder = {
-        ...sal,
-        is_sal_order: true,
-        token_in: sal.base_address,
-        token_out: sal.quote_address,
-        amount_in: invRaw.toString(),
-        remaining: invRaw.toString(),
-        amount_out_min: 'Adaptive',
-        price: sal.sal_current_price,
-        side: 'ask',
-        signature: sal.sal_signature,
-        order_json: {
-          maker: sal.maker,
-          tokenIn: sal.base_address,
-          tokenOut: sal.quote_address,
-          amountIn: invRaw.toString(),
-          amountOutMin: '0',
-          expiration: sal.expiration,
-          nonce: sal.nonce,
-          receiver: sal.receiver,
-          salt: sal.salt
-        }
-      }
-      orders.push(pseudoOrder)
-    }
-  }
-
-  return orders
+  return data || []
 }
 
 async function fetchOpenOrdersCrossChain() {
@@ -1065,23 +942,19 @@ async function preflightDiagnostics(buyRow, sellRow, network = 'bsc') {
   const settlementContract = network === 'base' ? settlementBase : settlement
   const settlementAddress = network === 'base' ? SETTLEMENT_ADDRESS_BASE : SETTLEMENT_ADDRESS_BSC
   const providerForNetwork = network === 'base' ? providerBase : providerBSC
-  const salVaultAddress = network === 'base' ? SAL_VAULT_ADDRESS_BASE : SAL_VAULT_ADDRESS_BSC
 
   const [sigBuyOk, sigSellOk, availBuy, availSell] = await Promise.all([
     settlementContract.verifySignature(buy, sigBuy).catch(() => false),
-    sellRow.is_sal_order ? Promise.resolve(true) : settlementContract.verifySignature(sell, sigSell).catch(() => false),
+    settlementContract.verifySignature(sell, sigSell).catch(() => false),
     settlementContract.availableToFill(buy).catch(() => 0n),
-    sellRow.is_sal_order ? Promise.resolve(1000000000000000000000000n) : settlementContract.availableToFill(sell).catch(() => 0n) // large number for SAL
+    settlementContract.availableToFill(sell).catch(() => 0n)
   ])
 
   const buyerErc = new Contract(buy.tokenIn, ERC20_MIN_ABI, providerForNetwork)
   const sellerErc = new Contract(sell.tokenIn, ERC20_MIN_ABI, providerForNetwork)
 
-  // For SAL fills, buyer must approve SAL Vault; for regular, settlement contract
-  const spenderForBuyer = sellRow.is_sal_order ? salVaultAddress : settlementAddress
-
   const [buyerAllowance, buyerBalance, sellerAllowance, sellerBalance] = await Promise.all([
-    buyerErc.allowance(buy.maker, spenderForBuyer).catch(() => 0n),
+    buyerErc.allowance(buy.maker, settlementAddress).catch(() => 0n),
     buyerErc.balanceOf(buy.maker).catch(() => 0n),
     sellerErc.allowance(sell.maker, settlementAddress).catch(() => 0n),
     sellerErc.balanceOf(sell.maker).catch(() => 0n)
@@ -1159,8 +1032,8 @@ async function tryMatchPairCrossChain(base, quote, bids, asks) {
     return 0
   }) // lowest ask first
 
-  const bestBid = bids[0]
-  const bestAsk = asks[0]
+  const bestBid = bidsWithPrices[0]
+  const bestAsk = asksWithPrices[0]
 
   if (!bestBid || !bestAsk) {
     console.log(`[executor] cross-chain: no best bid or ask available for ${base}/${quote}`)
@@ -1500,8 +1373,8 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
     return new Date(a.created_at || a.updated_at) - new Date(b.created_at || b.updated_at)
   }) // lowest ask first, then earliest time
 
-  const bestBid = bidsWithPrices[0]
-  const bestAsk = asksWithPrices[0]
+  const bestBid = bids[0]
+  const bestAsk = asks[0]
 
   if (!bestBid || !bestAsk) {
     console.log(`[executor] ${network}: no best bid or ask available for ${base}/${quote}`)
@@ -1514,14 +1387,14 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
     return false
   }
 
-  const pBid = bestBid?.price ?? null
-  const pAsk = bestAsk?.price ?? null
+  const pBid = bestBid.price
+  const pAsk = bestAsk.price
 
-  console.log(`[executor] ${network}: best bid price: ${pBid != null ? Number(pBid) / 1e18 : 'null'}, best ask price: ${pAsk != null ? Number(pAsk) / 1e18 : 'null'}`)
-  console.log(`[executor] ${network}: order sources - bid: ${bestBid?.is_sal_order ? 'sal' : (bestBid?.source || 'regular')} (${bestBid?.order_id}), ask: ${bestAsk?.is_sal_order ? 'sal' : (bestAsk?.source || 'regular')} (${bestAsk?.order_id})`)
+  console.log(`[executor] ${network}: best bid price: ${pBid ? Number(pBid) / 1e18 : 'null'}, best ask price: ${pAsk ? Number(pAsk) / 1e18 : 'null'}`)
+  console.log(`[executor] ${network}: order sources - bid: ${bestBid?.source || 'regular'} (${bestBid?.order_id}), ask: ${bestAsk?.source || 'regular'} (${bestAsk?.order_id})`)
 
-  if (pBid == null || pAsk == null) {
-    console.log(`[executor] ${network}: null prices detected for ${base}/${quote}${bestAsk?.is_sal_order ? ', this is SAL order' : ''}`)
+  if (pBid === null || pAsk === null) {
+    console.log(`[executor] ${network}: null prices detected for ${base}/${quote}`)
     return false
   }
 
@@ -1556,7 +1429,7 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
 
   console.log(`[executor] ${network}: preflight results - buySigOk: ${!!diag.sigBuyOk}, sellSigOk: ${!!diag.sigSellOk}, availBuy: ${diag.availBuy.toString()}, availSell: ${diag.availSell.toString()}`)
 
-  if (!diag.sigBuyOk || (!sellRow.is_sal_order && !diag.sigSellOk)) {
+  if (!diag.sigBuyOk || !diag.sigSellOk) {
     console.log(`[executor] ${network}: skipping ${base}/${quote} - signature invalid (buy: ${!!diag.sigBuyOk}, sell: ${!!diag.sigSellOk})`)
     return false
   }
@@ -1582,39 +1455,19 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   if (baseOut > baseFromBuyAvail) baseOut = baseFromBuyAvail
   if (baseOut <= 0n) return false
 
-  // Compute seller-required quote based on order type (SAL vs regular)
-  let quoteNeededBySell
-  if (sellRow.is_sal_order) {
-    const SCALE = 10n ** 18n
-    // Use SAL ask price pAsk (quote per base, 1e18 scaled)
-    quoteNeededBySell = ceilDiv(baseOut * pAsk, SCALE)
+  // Seller requires at least this much quote for that base, use ceil to avoid underpayment
+  let quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
 
-    // If buyer can't cover, reduce baseOut using SAL price inversion (floor)
-    if (quoteNeededBySell > buyRemQuote) {
-      baseOut = (buyRemQuote * SCALE) / pAsk // floor
-      if (baseOut <= 0n) return false
-      if (baseOut > sellRemBase) baseOut = sellRemBase
-      if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
-      if (baseOut > baseFromBuyAvail) baseOut = baseFromBuyAvail
-      if (baseOut <= 0n) return false
-      quoteNeededBySell = ceilDiv(baseOut * pAsk, SCALE)
-      if (quoteNeededBySell > buyRemQuote) return false
-    }
-  } else {
-    // Regular seller ratio
+  // If buyer can't cover, reduce baseOut using seller ratio inverted (floor), then recompute ceil quote
+  if (quoteNeededBySell > buyRemQuote) {
+    baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin // floor
+    if (baseOut <= 0n) return false
+    if (baseOut > sellRemBase) baseOut = sellRemBase
+    if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
+    if (baseOut > baseFromBuyAvail) baseOut = baseFromBuyAvail
+    if (baseOut <= 0n) return false
     quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-
-    // If buyer can't cover, reduce baseOut using seller ratio inverted (floor), then recompute ceil quote
-    if (quoteNeededBySell > buyRemQuote) {
-      baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin // floor
-      if (baseOut <= 0n) return false
-      if (baseOut > sellRemBase) baseOut = sellRemBase
-      if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
-      if (baseOut > baseFromBuyAvail) baseOut = baseFromBuyAvail
-      if (baseOut <= 0n) return false
-      quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-      if (quoteNeededBySell > buyRemQuote) return false
-    }
+    if (quoteNeededBySell > buyRemQuote) return false
   }
 
   // Enforce buyer's min base for the chosen quote (floor)
@@ -1622,36 +1475,17 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   if (buyerMinBaseForQuoteIn < baseOut) {
     baseOut = buyerMinBaseForQuoteIn
     if (baseOut <= 0n) return false
-
-    if (sellRow.is_sal_order) {
-      const SCALE = 10n ** 18n
-      quoteNeededBySell = ceilDiv(baseOut * pAsk, SCALE)
-      if (quoteNeededBySell > buyRemQuote) {
-        // Final shrink to satisfy seller given buyer budget using SAL price
-        baseOut = (buyRemQuote * SCALE) / pAsk // floor
-        if (baseOut <= 0n) return false
-        quoteNeededBySell = ceilDiv(baseOut * pAsk, SCALE)
-        if (quoteNeededBySell > buyRemQuote) return false
-      }
-    } else {
+    quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
+    if (quoteNeededBySell > buyRemQuote) {
+      // Final shrink to satisfy seller given buyer budget
+      baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin // floor
+      if (baseOut <= 0n) return false
       quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-      if (quoteNeededBySell > buyRemQuote) {
-        // Final shrink to satisfy seller given buyer budget
-        baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin // floor
-        if (baseOut <= 0n) return false
-        quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-        if (quoteNeededBySell > buyRemQuote) return false
-      }
+      if (quoteNeededBySell > buyRemQuote) return false
     }
   }
 
   const quoteIn = quoteNeededBySell
-
-  // Enforce buyer allowance for SAL vault if SAL order
-  if (sellRow.is_sal_order && diag.buyerAllowance < quoteIn) {
-    console.log(`[executor] ${network}: insufficient buyer allowance to SAL Vault: allowance ${diag.buyerAllowance.toString()} < needed ${quoteIn.toString()}`)
-    return false
-  }
 
   // Preflight diagnostics (reuse diag)
   const pre = {
@@ -1695,29 +1529,11 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
 
   try {
     console.log(`[executor] ${network}: attempting to match orders for ${base}/${quote}`)
-
-    let receipt = null
-    if (sellRow.is_sal_order) {
-      // SAL order fill
-      console.log(`[executor] ${network}: filling SAL order ${sellRow.order_id}`)
-      const salContract = network === 'base' ? salVaultBase : salVault
-      // On-chain orderId is the hex string as bytes32
-      const onchainOrderId = '0x' + sellRow.order_id
-      // Convert amounts to raw units for SAL vault
-      const baseOutRaw = baseOut * 10n ** BigInt(baseDec)
-      const quoteInRaw = quoteIn * 10n ** BigInt(quoteDec)
-      const tx = await salContract.fillSAL(onchainOrderId, buy.maker, baseOutRaw, quoteInRaw)
-      console.log(`[executor] ${network}: SAL fill tx sent: ${tx.hash}`)
-      receipt = await tx.wait()
-      console.log(`[executor] ${network}: SAL fill tx confirmed in block ${receipt.blockNumber}`)
-    } else {
-      // Regular order match
-      const settlementContract = network === 'base' ? settlementBase : settlement
-      const tx = await settlementContract.matchOrders(buy, sigBuy, sell, sigSell, baseOut, quoteIn)
-      console.log(`[executor] ${network}: match tx sent: ${tx.hash}`)
-      receipt = await tx.wait()
-      console.log(`[executor] ${network}: match tx confirmed in block ${receipt.blockNumber}`)
-    }
+    const settlementContract = network === 'base' ? settlementBase : settlement
+    const tx = await settlementContract.matchOrders(buy, sigBuy, sell, sigSell, baseOut, quoteIn)
+    console.log(`[executor] ${network}: match tx sent: ${tx.hash}`)
+    const receipt = await tx.wait()
+    console.log(`[executor] ${network}: match tx confirmed in block ${receipt.blockNumber}`)
     // Persist fill record for UI consumption
     try {
       // Insert into fills table
@@ -1728,12 +1544,10 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
         sell_order_id: sellRow.order_id,
         amount_base: baseOut.toString(),
         amount_quote: quoteIn.toString(),
-        tx_hash: receipt.hash,
+        tx_hash: receipt.hash || tx.hash,
         block_number: receipt.blockNumber,
         created_at: new Date().toISOString()
       })
-
-      // SAL order inventory update moved below after decimals are determined
 
       // Also insert enriched trade data for market stats
       const baseAddr = (buyRow.base_address || sellRow.base_address || '').toLowerCase()
@@ -1777,27 +1591,6 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
       const qFloat = Number(quoteIn)
       const bFloat = Number(baseOut)
       const priceHuman = (qFloat / Math.pow(10, quoteDec)) / (bFloat / Math.pow(10, baseDec))
-
-      // Update SAL order inventory using human-readable units
-      if (sellRow.is_sal_order) {
-        // Convert baseOut (BigInt) to human units based on baseDec
-        const baseOutHumanStr = formatUnits(baseOut, baseDec) // e.g., '1.000000000000000000'
-        // sal_total_inventory and sal_sold_amount are numeric strings in human units
-        const currentSold = parseFloat(String(sellRow.sal_sold_amount || '0'))
-        const justSold = parseFloat(baseOutHumanStr)
-        const totalInventory = parseFloat(String(sellRow.sal_total_inventory || '0'))
-        const newSold = currentSold + justSold
-        const newRemaining = Math.max(0, totalInventory - newSold)
-        await supabase
-          .from('orders')
-          .update({
-            remaining: formatUnits(BigInt(Math.floor(newRemaining * Math.pow(10, baseDec))), baseDec),
-            sal_sold_amount: newSold.toFixed(baseDec),
-            updated_at: new Date().toISOString()
-          })
-          .eq('order_id', sellRow.order_id)
-      }
-
       console.log('[executor] inserting trade', {
         network,
         pair,
@@ -2237,6 +2030,190 @@ async function tryMatchPairSolana(base, quote, bids, asks) {
   return true
 }
 
+// Liquidity Provision Functions
+async function createLiquidityOrders(network = 'bsc') {
+ console.log(`[executor] ${network}: creating liquidity orders...`)
+
+ try {
+   // Get active liquidity provisions
+   const { data: provisions, error } = await supabase
+     .from('liquidity_provisions')
+     .select('*')
+     .eq('network', network)
+     .gt('remaining_amount', '0')
+
+   if (error) throw error
+   if (!provisions || provisions.length === 0) {
+     console.log(`[executor] ${network}: no active liquidity provisions`)
+     return
+   }
+
+   console.log(`[executor] ${network}: found ${provisions.length} active provisions`)
+
+   // Get current platform prices from recent trades
+   const { data: recentTrades, error: tradeError } = await supabase
+     .from('trades')
+     .select('base_address, quote_address, price')
+     .eq('network', network)
+     .order('created_at', { ascending: false })
+     .limit(100)
+
+   if (tradeError) {
+     console.warn(`[executor] ${network}: failed to fetch recent trades:`, tradeError.message)
+   }
+
+   // Group latest prices by pair
+   const platformPrices = new Map()
+   if (recentTrades) {
+     for (const trade of recentTrades) {
+       const pairKey = `${trade.base_address}_${trade.quote_address}`.toLowerCase()
+       if (!platformPrices.has(pairKey)) {
+         platformPrices.set(pairKey, Number(trade.price))
+       }
+     }
+   }
+
+   // Process each provision
+   for (const provision of provisions) {
+     const tokenAddress = provision.token_address.toLowerCase()
+     const minPrice = toBN(provision.min_price_per_token)
+
+     // Determine quote token (assume WBNB for BSC, WETH for Base)
+     const quoteAddress = network === 'base' ? '0x4200000000000000000000000000000000000006' : '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c'
+     const pairKey = `${tokenAddress}_${quoteAddress}`
+
+     // Get platform price for this pair
+     const platformPrice = platformPrices.get(pairKey)
+
+     if (!platformPrice) {
+       console.log(`[executor] ${network}: no platform price for ${pairKey}, skipping`)
+       continue
+     }
+
+     // Use max of owner's min price and platform price
+     const orderPrice = Math.max(platformPrice, Number(minPrice) / 1e18)
+
+     // Check custodial balance
+     const provider = network === 'base' ? providerBase : providerBSC
+     const erc20 = new Contract(tokenAddress, ERC20_MIN_ABI, provider)
+     const balance = await erc20.balanceOf(CUSTODIAL_ADDRESS).catch(() => 0n)
+
+     if (balance <= 0n) {
+       console.log(`[executor] ${network}: no balance for ${tokenAddress} in custodial`)
+       continue
+     }
+
+     // Check if we already have an active liquidity order for this provision
+     const { data: existingOrders, error: orderError } = await supabase
+       .from('orders')
+       .select('order_id, remaining')
+       .eq('liquidity_provision_id', provision.id)
+       .eq('status', 'open')
+       .gt('remaining', '0')
+
+     if (orderError) {
+       console.warn(`[executor] ${network}: failed to check existing orders:`, orderError.message)
+       continue
+     }
+
+     if (existingOrders && existingOrders.length > 0) {
+       // Update existing order price if needed
+       const existingOrder = existingOrders[0]
+       const currentOrderPrice = Number(toBN(existingOrder.price || '0')) / 1e18
+
+       if (Math.abs(currentOrderPrice - orderPrice) > orderPrice * 0.01) { // 1% change
+         console.log(`[executor] ${network}: updating liquidity order ${existingOrder.order_id} price from ${currentOrderPrice} to ${orderPrice}`)
+
+         // Calculate new amount_out_min
+         const remaining = toBN(existingOrder.remaining)
+         const newAmountOutMin = (remaining * BigInt(Math.floor(orderPrice * 1e18))) / 10n ** 18n
+
+         await supabase
+           .from('orders')
+           .update({
+             price: orderPrice.toString(),
+             amount_out_min: newAmountOutMin.toString(),
+             updated_at: new Date().toISOString()
+           })
+           .eq('order_id', existingOrder.order_id)
+       }
+       continue
+     }
+
+     // Create new liquidity order
+     const orderId = crypto.randomUUID()
+     const salt = BigInt(Math.floor(Math.random() * 1e18))
+     const nonce = Date.now() // Simple nonce
+
+     const order = {
+       maker: CUSTODIAL_ADDRESS,
+       tokenIn: tokenAddress,
+       tokenOut: quoteAddress,
+       amountIn: balance.toString(),
+       amountOutMin: ((balance * BigInt(Math.floor(orderPrice * 1e18))) / 10n ** 18n).toString(),
+       expiration: Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60, // 1 year
+       nonce: nonce.toString(),
+       receiver: '0x0000000000000000000000000000000000000000',
+       salt: salt.toString()
+     }
+
+     // Hash and sign the order
+     const orderHash = crypto.createHash('sha1').update(JSON.stringify({
+       network,
+       maker: toLower(order.maker),
+       nonce: order.nonce,
+       tokenIn: toLower(order.tokenIn),
+       tokenOut: toLower(order.tokenOut),
+       salt: order.salt
+     })).digest('hex')
+
+     const wallet = network === 'base' ? walletBase : walletBSC
+     const signature = await wallet.signMessage(orderHash)
+
+     // Insert order
+     const orderRow = {
+       network,
+       order_id: orderId,
+       order_hash: orderHash,
+       maker: CUSTODIAL_ADDRESS,
+       token_in: tokenAddress,
+       token_out: quoteAddress,
+       amount_in: balance.toString(),
+       amount_out_min: order.amountOutMin,
+       remaining: balance.toString(),
+       price: orderPrice.toString(),
+       side: 'ask',
+       base: tokenAddress,
+       quote: quoteAddress,
+       base_address: tokenAddress,
+       quote_address: quoteAddress,
+       pair: `${tokenAddress}/${quoteAddress}`,
+       nonce: order.nonce,
+       receiver: order.receiver,
+       salt: order.salt,
+       signature,
+       order_json: order,
+       expiration: new Date(order.expiration * 1000).toISOString(),
+       status: 'open',
+       liquidity_provision_id: provision.id,
+       owner_min_price: provision.min_price_per_token,
+       created_at: new Date().toISOString(),
+       updated_at: new Date().toISOString()
+     }
+
+     const { error: insertError } = await supabase.from('orders').insert(orderRow)
+     if (insertError) {
+       console.warn(`[executor] ${network}: failed to insert liquidity order:`, insertError.message)
+     } else {
+       console.log(`[executor] ${network}: created liquidity order ${orderId} for ${balance.toString()} ${tokenAddress} at price ${orderPrice}`)
+     }
+   }
+
+ } catch (e) {
+   console.error(`[executor] ${network}: liquidity order creation failed:`, e?.message || e)
+ }
+}
+
 async function runOnce(network = 'bsc') {
   if (network === 'solana') {
     await runSolana()
@@ -2274,7 +2251,11 @@ async function runOnce(network = 'bsc') {
   }
 
   try {
-    // First check conditional orders (using current market prices)
+    // First create/update liquidity orders
+    console.log(`[executor] ${network}: creating liquidity orders...`)
+    await createLiquidityOrders(network)
+
+    // Then check conditional orders (using current market prices)
     console.log(`[executor] ${network}: checking conditional orders...`)
     const triggeredOrderIds = await checkAndTriggerConditionalOrders(network)
 
