@@ -1936,49 +1936,6 @@ app.post('/api/markets/wbnb/refresh', async (req, res) => {
   }
 })
 
-// Get markets for a specific token address (for SAL order creation)
-app.get('/api/markets/for-token', async (req, res) => {
-  try {
-    if (!SUPABASE_ENABLED) return res.status(503).json({ error: 'database disabled' })
-    const network = (req.query.network || 'bsc').toString()
-    const tokenAddress = (req.query.tokenAddress || '').toString().toLowerCase()
-    if (!tokenAddress) return res.status(400).json({ error: 'tokenAddress is required' })
-
-    // Find all markets where the token is either base or quote
-    const { data, error } = await supabase
-      .from('markets')
-      .select('*')
-      .eq('network', network)
-      .or(`base_address.eq.${tokenAddress},quote_address.eq.${tokenAddress}`)
-      .order('updated_at', { ascending: false })
-
-    if (error) throw error
-
-    // Map to frontend format
-    const markets = (data || []).map(row => ({
-      base: { symbol: row.base_symbol, address: row.base_address, decimals: row.base_decimals, name: row.base_name, logoUrl: row.base_logo_url },
-      quote: { symbol: row.quote_symbol, address: row.quote_address, decimals: row.quote_decimals, name: row.quote_name, logoUrl: row.quote_logo_url },
-      pair: row.pair,
-      price: row.price,
-      change: row.change,
-      volume: row.volume,
-      poolAddress: row.pool_address,
-      geckoPoolId: row.gecko_pool_id,
-      pairKey: row.pair_key,
-      updatedAt: row.updated_at,
-      network: row.network
-    }))
-
-    // Enrich with trading stats
-    const enrichedMarkets = await enrichMarketsWithTradingStats(network, markets)
-    const withLogos = await ensureLogos(network, enrichedMarkets)
-
-    return res.json({ network, tokenAddress, data: withLogos })
-  } catch (e) {
-    return res.status(500).json({ error: e?.message || String(e) })
-  }
-})
-
 // Markets search endpoint: returns ALL pairs matching query across DB for a network
 app.get('/api/markets/search', async (req, res) => {
   try {
@@ -3016,8 +2973,6 @@ app.get('/api/orders', async (req, res) => {
       fetchTokenDecimals(quote, network)
     ])
 
-    console.log('[SERVER ORDERS] Base decimals:', baseDec, 'Quote decimals:', quoteDec)
-
     const nowIso = new Date().toISOString()
     const tableName = network === 'crosschain' ? 'cross_chain_orders' : 'orders'
     let rows = []
@@ -3049,60 +3004,22 @@ app.get('/api/orders', async (req, res) => {
     const asks = []
     const bids = []
     for (const r of rows) {
-      let side = null
+      const tokenInComp = network === 'solana' ? r.token_in : toLower(r.token_in)
+      const tokenOutComp = network === 'solana' ? r.token_out : toLower(r.token_out)
+      const side = (tokenInComp === base && tokenOutComp === quote) ? 'ask' : (tokenInComp === quote && tokenOutComp === base ? 'bid' : null)
       let price = null
-      let amountIn = null
-
-      if (r.is_sal_order) {
-        // SAL order handling
-        const tokenInComp = network === 'solana' ? r.token_in : toLower(r.token_in)
-        const tokenOutComp = network === 'solana' ? r.token_out : toLower(r.token_out)
-
-        // SAL orders are always asks (selling base for quote)
-        if (tokenInComp === base && tokenOutComp === quote) {
-          side = 'ask'
-          price = Number(r.sal_current_price || r.sal_initial_price || 0)
-          // Available inventory = total - sold
-          const totalInventory = Number(r.sal_total_inventory || 0)
-          const soldAmount = Number(r.sal_sold_amount || 0)
-          amountIn = Math.max(0, totalInventory - soldAmount)
-
-          // Skip if no inventory left
-          if (amountIn <= 0) continue
-        }
-      } else {
-        // Regular order handling
-        const tokenInComp = network === 'solana' ? r.token_in : toLower(r.token_in)
-        const tokenOutComp = network === 'solana' ? r.token_out : toLower(r.token_out)
-        side = (tokenInComp === base && tokenOutComp === quote) ? 'ask' : (tokenInComp === quote && tokenOutComp === base ? 'bid' : null)
-
-        if (r.price != null) {
-          price = Number(r.price)
-        } else if (side === 'ask') {
-          // ask: selling base for quote, price = amountOutMin / 10^quoteDec / (amountIn / 10^baseDec)
-          price = Number(r.amount_out_min) / 10**quoteDec / (Number(r.amount_in) / 10**baseDec)
-        } else if (side === 'bid') {
-          // bid: selling quote for base, price = amountIn / 10^baseDec / (amountOutMin / 10^quoteDec)
-          price = Number(r.amount_in) / 10**baseDec / (Number(r.amount_out_min) / 10**quoteDec)
-        }
-        amountIn = Number(r.remaining)
+      if (r.price != null) {
+        price = Number(r.price)
+      } else if (side === 'ask') {
+        // ask: selling base for quote, price = amountOutMin / 10^quoteDec / (amountIn / 10^baseDec)
+        price = Number(r.amount_out_min) / 10**quoteDec / (Number(r.amount_in) / 10**baseDec)
+      } else if (side === 'bid') {
+        // bid: selling quote for base, price = amountIn / 10^baseDec / (amountOutMin / 10^quoteDec)
+        price = Number(r.amount_in) / 10**baseDec / (Number(r.amount_out_min) / 10**quoteDec)
       }
-
-      if (side && price != null && amountIn > 0) {
-        const rec = {
-          id: r.order_id,
-          maker: r.maker,
-          price,
-          amountIn,
-          remaining: amountIn,
-          amountOutMin: r.is_sal_order ? 'Adaptive' : r.amount_out_min,
-          tokenIn: r.token_in,
-          tokenOut: r.token_out,
-          isSalOrder: r.is_sal_order || false
-        }
-        if (side === 'ask') asks.push(rec)
-        else if (side === 'bid') bids.push(rec)
-      }
+      const rec = { id: r.order_id, maker: r.maker, price, amountIn: r.remaining, amountOutMin: r.amount_out_min, tokenIn: r.token_in, tokenOut: r.token_out }
+      if (side === 'ask') asks.push(rec)
+      else if (side === 'bid') bids.push(rec)
     }
 
     console.log('[SERVER ORDERS] Asks found:', asks.length, 'Bids found:', bids.length)
@@ -3198,11 +3115,7 @@ app.post('/api/sal-orders', async (req, res) => {
       minPrice,
       expiration,
       receiver,
-      salt,
-      signature,
-      baseAddress,
-      quoteAddress,
-      pair
+      salt
     } = req.body
 
     // Validate required fields
@@ -3221,18 +3134,6 @@ app.post('/api/sal-orders', async (req, res) => {
 
     if (!validation.isValid) {
       return res.status(400).json({ error: 'Invalid parameters', details: validation.errors })
-    }
-
-    // Validate that tokenIn is an indexed token
-    const { data: tokenData, error: tokenError } = await supabase
-      .from('tokens')
-      .select('address')
-      .eq('network', network)
-      .eq('address', tokenIn.toLowerCase())
-      .single()
-
-    if (tokenError || !tokenData) {
-      return res.status(400).json({ error: 'Token not indexed. Only indexed tokens can be used for SAL orders.' })
     }
 
     // Generate order ID and hash
@@ -3274,13 +3175,7 @@ app.post('/api/sal-orders', async (req, res) => {
         sal_max_price: maxPrice?.toString(),
         sal_min_price: minPrice?.toString(),
         sal_total_inventory: totalAmount.toString(),
-        sal_signature: signature,
-        order_json: orderData,
-        base: baseAddress,
-        quote: quoteAddress,
-        base_address: baseAddress,
-        quote_address: quoteAddress,
-        pair: pair
+        order_json: orderData
       })
 
     if (error) throw error
@@ -3471,91 +3366,6 @@ app.get('/api/sal-orders/:orderId/analytics', async (req, res) => {
   }
 })
 
-// Check if token exists in database and get market info
-app.get('/api/tokens/validate', async (req, res) => {
-  try {
-    if (!SUPABASE_ENABLED) return res.status(503).json({ error: 'database disabled' })
-
-    const { address, network = 'bsc' } = req.query
-
-    if (!address) {
-      return res.status(400).json({ error: 'Token address required' })
-    }
-
-    const tokenAddr = network === 'solana' ? address : address.toLowerCase()
-
-    // Check if token exists in tokens table
-    const { data: tokenData, error: tokenError } = await supabase
-      .from('tokens')
-      .select('*')
-      .eq('network', network)
-      .eq('address', tokenAddr)
-      .single()
-
-    // Check if token has existing markets
-    const { data: marketData, error: marketError } = await supabase
-      .from('markets')
-      .select('base_address, quote_address, base_symbol, quote_symbol')
-      .eq('network', network)
-      .or(`base_address.eq.${tokenAddr},quote_address.eq.${tokenAddr}`)
-      .limit(10)
-
-    // Find suggested quote token
-    let suggestedQuote = null
-    if (marketData && marketData.length > 0) {
-      const market = marketData.find(m => m.base_address.toLowerCase() === tokenAddr.toLowerCase())
-      if (market) {
-        suggestedQuote = {
-          address: market.quote_address,
-          symbol: market.quote_symbol
-        }
-      } else {
-        // If not found as base, use the first market's quote as default
-        suggestedQuote = {
-          address: marketData[0].quote_address,
-          symbol: marketData[0].quote_symbol
-        }
-      }
-    } else {
-      // No markets, use default quote
-      suggestedQuote = network === 'bsc' ? {
-        address: '0x55d398326f99059ff775485246999027b3197955',
-        symbol: 'USDT'
-      } : {
-        address: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
-        symbol: 'USDC'
-      }
-    }
-
-    const result = {
-      address: tokenAddr,
-      network,
-      existsInTokens: !tokenError && tokenData,
-      tokenInfo: tokenData || null,
-      existingMarkets: marketError ? [] : (marketData || []),
-      suggestedQuote,
-      canCreateSAL: !tokenError && tokenData // Allow SAL for all indexed tokens
-    }
-
-    // Add helpful messages
-    if (result.existingMarkets.length > 0) {
-      result.message = `Token found in ${result.existingMarkets.length} existing market(s). You can add SAL liquidity to these markets!`
-      result.marketPairs = result.existingMarkets.map(m => `${m.base_symbol || 'UNKNOWN'}/${m.quote_symbol || 'UNKNOWN'}`)
-    } else if (result.existsInTokens) {
-      const tokenSymbol = result.tokenInfo?.symbol || 'TOKEN'
-      const quoteSymbol = result.suggestedQuote?.symbol || 'QUOTE'
-      result.message = `Token found in database. SAL order will use ${tokenSymbol}/${quoteSymbol} pairing.`
-    } else {
-      result.message = 'Token not indexed. SAL orders are only available for indexed tokens to ensure quality and security.'
-    }
-
-    res.json(result)
-  } catch (error) {
-    console.error('Error validating token:', error)
-    res.status(500).json({ error: error.message })
-  }
-})
-
 // Start HTTP server
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Indexer server listening on http://0.0.0.0:${PORT}`)
@@ -3624,6 +3434,49 @@ wss.on('connection', (ws) => {
   })
 })
 
+// Endpoint for liquidity provision deposits
+app.post('/api/deposit-liquidity', async (req, res) => {
+  try {
+    const { network, depositor, tokenAddress, amount, minPricePerToken } = req.body
+
+    if (!network || !depositor || !tokenAddress || !amount || !minPricePerToken) {
+      return res.status(400).json({ error: 'Missing required fields' })
+    }
+
+    // Validate network
+    if (!['bsc', 'base'].includes(network)) {
+      return res.status(400).json({ error: 'Invalid network' })
+    }
+
+    // Insert liquidity provision
+    const { data, error } = await supabase
+      .from('liquidity_provisions')
+      .insert({
+        network,
+        depositor: depositor.toLowerCase(),
+        token_address: tokenAddress.toLowerCase(),
+        amount_deposited: amount.toString(),
+        min_price_per_token: minPricePerToken.toString(),
+        remaining_amount: amount.toString(),
+        pair_key: `${tokenAddress.toLowerCase()}_${network === 'base' ? '0x4200000000000000000000000000000000000006' : '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c'}`
+      })
+      .select()
+      .single()
+
+    if (error) {
+      console.error('[API] Failed to insert liquidity provision:', error)
+      return res.status(500).json({ error: 'Database error' })
+    }
+
+    console.log(`[API] Recorded liquidity deposit: ${amount} ${tokenAddress} on ${network} by ${depositor}`)
+    res.json({ success: true, provision: data })
+
+  } catch (e) {
+    console.error('[API] Deposit liquidity error:', e)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
 // Endpoint for broadcasting updates (called by executor)
 app.post('/api/broadcast', (req, res) => {
   const { network, base, quote, type, data } = req.body
@@ -3641,6 +3494,7 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
 
 
 
