@@ -23,7 +23,7 @@ const EXECUTOR_RPC_URLS = (process.env.EXECUTOR_RPC_URLS || '').split(',').map(s
 const EXECUTOR_PRIVATE_KEY = process.env.EXECUTOR_PRIVATE_KEY
 const SETTLEMENT_ADDRESS_BSC = process.env.SETTLEMENT_ADDRESS_BSC || '0x7DBA6a1488356428C33cC9fB8Ef3c8462c8679d0'
 const SETTLEMENT_ADDRESS_BASE = process.env.SETTLEMENT_ADDRESS_BASE || '0xBBf7A39F053BA2B8F4991282425ca61F2D871f45'
-const CUSTODIAL_ADDRESS = '0x70c992e6a19c565430fa0c21933395ebf1e907c3'
+const CUSTODIAL_ADDRESS = '0x6E11b5c17258C3F3ea684881Da4bB591C4C7bE05'
 
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE
@@ -2012,6 +2012,15 @@ async function runOnce(network = 'bsc') {
   }
 
   try {
+    // Check for new custodial deposits
+    await checkCustodialDeposits(network)
+
+    // Create orders from liquidity provisions
+    await createOrdersFromProvisions(network)
+
+    // Update prices for existing custodial orders
+    await updateCustodialOrderPrices(network)
+
     // First check conditional orders (using current market prices)
     console.log(`[executor] ${network}: checking conditional orders...`)
     const triggeredOrderIds = await checkAndTriggerConditionalOrders(network)
@@ -2028,6 +2037,9 @@ async function runOnce(network = 'bsc') {
       console.log(`[executor] ${network}: no open orders found`)
     }
 
+    // Attribute fills to provisions
+    await attributeFillsToProvisions(network)
+
     console.log(`[executor] ${network}: execution cycle completed`)
 
   } catch (e) {
@@ -2038,6 +2050,395 @@ async function runOnce(network = 'bsc') {
     } else {
       busyBSC = false
     }
+  }
+}
+
+// =============================
+// LIQUIDITY PROVISION FUNCTIONS
+// =============================
+
+async function checkCustodialDeposits(network = 'bsc') {
+  if (!supabase) return
+
+  console.log(`[executor] ${network}: checking custodial deposits...`)
+
+  try {
+    // Get custodial address
+    const custodialAddr = CUSTODIAL_ADDRESS.toLowerCase()
+
+    // Get provider for network
+    const provider = network === 'base' ? providerBase : providerBSC
+    if (!provider) return
+
+    // Known tokens to check (can be expanded)
+    const tokensToCheck = [
+      '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c', // WBNB
+      '0x55d398326f99059ff775485246999027b3197955', // USDT
+      '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d', // USDC
+      '0x4200000000000000000000000000000000000006' // WETH (base)
+    ].filter(addr => {
+      // Filter by network
+      if (network === 'bsc' && addr === '0x4200000000000000000000000000000000000006') return false
+      if (network === 'base' && addr !== '0x4200000000000000000000000000000000000006' && addr !== '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913') return false
+      return true
+    })
+
+    for (const tokenAddr of tokensToCheck) {
+      // Get current balance
+      const tokenContract = new Contract(tokenAddr, ERC20_MIN_ABI, provider)
+      const balance = await tokenContract.balanceOf(custodialAddr).catch(() => 0n)
+      const balanceStr = balance.toString()
+
+      // Get sum of remaining amounts in provisions
+      const { data: provisions } = await supabase
+        .from('liquidity_provisions')
+        .select('remaining_amount')
+        .eq('network', network)
+        .eq('token_address', tokenAddr)
+        .neq('depositor', 'pending_claim') // Exclude unclaimed for now
+
+      const totalRemaining = provisions?.reduce((sum, p) => sum + toBN(p.remaining_amount), 0n) || 0n
+
+      if (toBN(balanceStr) > totalRemaining) {
+        const excess = toBN(balanceStr) - totalRemaining
+        console.log(`[executor] ${network}: detected deposit of ${excess.toString()} ${tokenAddr} to custodial`)
+
+        // Create pending provision
+        const pairKey = `${tokenAddr}/${network === 'base' ? '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913' : '0x55d398326f99059ff775485246999027b3197955'}`.toLowerCase()
+
+        await supabase.from('liquidity_provisions').insert({
+          network,
+          depositor: 'pending_claim',
+          token_address: tokenAddr,
+          amount_deposited: excess.toString(),
+          min_price_per_token: '0', // Will be set on claim
+          remaining_amount: excess.toString(),
+          pair_key
+        })
+
+        console.log(`[executor] ${network}: created pending provision for ${excess.toString()} ${tokenAddr}`)
+      }
+    }
+  } catch (e) {
+    console.warn(`[executor] ${network}: error checking custodial deposits:`, e?.message || e)
+  }
+}
+
+async function createOrdersFromProvisions(network = 'bsc') {
+  if (!supabase || !walletBSC) return
+
+  console.log(`[executor] ${network}: creating orders from liquidity provisions...`)
+
+  try {
+    // Get provisions with remaining amount
+    const { data: provisions } = await supabase
+      .from('liquidity_provisions')
+      .select('*')
+      .eq('network', network)
+      .gt('remaining_amount', '0')
+      .neq('depositor', 'pending_claim')
+
+    if (!provisions || provisions.length === 0) return
+
+    // Get recent prices for pairs
+    const pairPrices = new Map()
+    for (const p of provisions) {
+      if (pairPrices.has(p.pair_key)) continue
+
+      const [base, quote] = p.pair_key.split('/')
+      const { data: trades } = await supabase
+        .from('trades')
+        .select('price')
+        .eq('network', network)
+        .eq('base_address', base)
+        .eq('quote_address', quote)
+        .order('created_at', { ascending: false })
+        .limit(10)
+
+      if (trades && trades.length > 0) {
+        const avgPrice = trades.reduce((sum, t) => sum + Number(t.price), 0) / trades.length
+        pairPrices.set(p.pair_key, avgPrice)
+      }
+    }
+
+    for (const provision of provisions) {
+      const tokenAddr = provision.token_address
+      const remaining = toBN(provision.remaining_amount)
+      const minPrice = toBN(provision.min_price_per_token)
+
+      // Use pair_key to determine quote token
+      const [baseAddr, quoteAddr] = provision.pair_key.split('/')
+      if (baseAddr.toLowerCase() !== tokenAddr.toLowerCase()) {
+        console.log(`[executor] ${network}: provision pair_key mismatch for ${provision.id}`)
+        continue
+      }
+
+      // Get current market price
+      const currentPrice = pairPrices.get(provision.pair_key) || 0
+
+      // Skip if no price data
+      if (currentPrice <= Number(minPrice)) {
+        console.log(`[executor] ${network}: skipping provision ${provision.id} - price ${currentPrice} <= min ${minPrice}`)
+        continue
+      }
+
+      // Get decimals
+      const inDecimals = await fetchTokenDecimals(tokenAddr, network)
+      const outDecimals = await fetchTokenDecimals(quoteAddr, network)
+
+      // Calculate amount to sell (up to remaining, but reasonable chunk)
+      const amountIn = remaining > 10n ** BigInt(inDecimals) ? 10n ** BigInt(inDecimals) : remaining
+      const amountOutMin = (amountIn * toBN(Math.floor(currentPrice * 10 ** (outDecimals + 18)).toString())) / (10n ** BigInt(inDecimals + 18))
+
+      // Create order
+      const order = {
+        maker: CUSTODIAL_ADDRESS,
+        tokenIn: tokenAddr,
+        tokenOut: quoteAddr,
+        amountIn: amountIn.toString(),
+        amountOutMin: amountOutMin.toString(),
+        expiration: (Math.floor(Date.now() / 1000) + 86400 * 7).toString(), // 7 days
+        nonce: Date.now().toString(),
+        receiver: '0x0000000000000000000000000000000000000000',
+        salt: Math.floor(Math.random() * 1000000).toString()
+      }
+
+      // Sign order
+      const wallet = network === 'base' ? walletBase : walletBSC
+      const signature = await signOrder(order, wallet, network)
+
+      // Insert order
+      const orderId = crypto.randomUUID()
+      const orderHash = crypto.createHash('sha1').update(JSON.stringify({
+        network,
+        maker: order.maker.toLowerCase(),
+        nonce: order.nonce,
+        tokenIn: order.tokenIn.toLowerCase(),
+        tokenOut: order.tokenOut.toLowerCase(),
+        salt: order.salt
+      })).digest('hex')
+
+      await supabase.from('orders').insert({
+        network,
+        order_id: orderId,
+        order_hash: orderHash,
+        maker: order.maker,
+        token_in: order.tokenIn,
+        token_out: order.tokenOut,
+        amount_in: order.amountIn,
+        amount_out_min: order.amountOutMin,
+        remaining: order.amountIn,
+        price: currentPrice.toString(),
+        side: 'ask',
+        base: tokenAddr,
+        quote: quoteAddr,
+        base_address: tokenAddr,
+        quote_address: quoteAddr,
+        pair: `${tokenAddr}/${quoteAddr}`,
+        nonce: order.nonce,
+        receiver: order.receiver,
+        salt: order.salt,
+        signature,
+        order_json: order,
+        expiration: new Date(Number(order.expiration) * 1000).toISOString(),
+        status: 'open',
+        source: 'custodial',
+        liquidity_provision_id: provision.id,
+        owner_min_price: provision.min_price_per_token,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      })
+
+      console.log(`[executor] ${network}: created custodial order ${orderId} for provision ${provision.id}`)
+    }
+  } catch (e) {
+    console.warn(`[executor] ${network}: error creating orders from provisions:`, e?.message || e)
+  }
+}
+
+async function signOrder(order, wallet, network) {
+  const settlementContract = network === 'base' ? settlementBase : settlement
+  if (!settlementContract) throw new Error('Settlement contract not available')
+
+  // Get domain separator from contract
+  const domainSeparator = await settlementContract.DOMAIN_SEPARATOR().catch(() => null)
+  const orderTypehash = await settlementContract.ORDER_TYPEHASH().catch(() => null)
+
+  if (!domainSeparator || !orderTypehash) {
+    throw new Error('Could not get domain/order typehash from contract')
+  }
+
+  // Use contract's domain for signing
+  const domain = {
+    name: 'OrderBook',
+    version: '1',
+    chainId: network === 'base' ? 8453 : 56,
+    verifyingContract: network === 'base' ? SETTLEMENT_ADDRESS_BASE : SETTLEMENT_ADDRESS_BSC
+  }
+
+  const types = {
+    Order: [
+      { name: 'maker', type: 'address' },
+      { name: 'tokenIn', type: 'address' },
+      { name: 'tokenOut', type: 'address' },
+      { name: 'amountIn', type: 'uint256' },
+      { name: 'amountOutMin', type: 'uint256' },
+      { name: 'expiration', type: 'uint256' },
+      { name: 'nonce', type: 'uint256' },
+      { name: 'receiver', type: 'address' },
+      { name: 'salt', type: 'uint256' }
+    ]
+  }
+
+  const signature = await wallet.signTypedData(domain, types, order)
+  return signature
+}
+
+async function updateCustodialOrderPrices(network = 'bsc') {
+  if (!supabase) return
+
+  console.log(`[executor] ${network}: updating custodial order prices...`)
+
+  try {
+    // Get custodial orders
+    const { data: orders } = await supabase
+      .from('orders')
+      .select('*, liquidity_provisions!inner(min_price_per_token)')
+      .eq('network', network)
+      .eq('source', 'custodial')
+      .eq('status', 'open')
+
+    if (!orders || orders.length === 0) return
+
+    // Group by pair
+    const pairs = new Map()
+    for (const order of orders) {
+      const pair = `${order.token_in}/${order.token_out}`.toLowerCase()
+      if (!pairs.has(pair)) pairs.set(pair, [])
+      pairs.get(pair).push(order)
+    }
+
+    // Get latest prices
+    for (const [pair, pairOrders] of pairs.entries()) {
+      const [base, quote] = pair.split('/')
+      const { data: trades } = await supabase
+        .from('trades')
+        .select('price')
+        .eq('network', network)
+        .eq('base_address', base)
+        .eq('quote_address', quote)
+        .order('created_at', { ascending: false })
+        .limit(20)
+
+      if (!trades || trades.length === 0) continue
+
+      const latestPrice = Number(trades[0].price)
+      const avgPrice = trades.reduce((sum, t) => sum + Number(t.price), 0) / trades.length
+
+      // Use weighted average towards recent
+      const newPrice = (latestPrice * 0.7) + (avgPrice * 0.3)
+
+      for (const order of pairOrders) {
+        const minPrice = Number(order.liquidity_provisions.min_price_per_token)
+        if (newPrice <= minPrice) continue
+
+        // Cancel old order
+        await supabase
+          .from('orders')
+          .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+          .eq('order_id', order.order_id)
+
+        // Create new order with updated price
+        const inDecimals = await fetchTokenDecimals(order.token_in, network)
+        const outDecimals = await fetchTokenDecimals(order.token_out, network)
+        const amountIn = toBN(order.amount_in)
+        const newAmountOutMin = (amountIn * toBN(Math.floor(newPrice * 10 ** (outDecimals + 18)).toString())) / (10n ** BigInt(inDecimals + 18))
+
+        const newOrder = { ...order.order_json }
+        newOrder.amountOutMin = newAmountOutMin.toString()
+        newOrder.nonce = (Number(order.nonce) + 1).toString()
+
+        const wallet = network === 'base' ? walletBase : walletBSC
+        const signature = await signOrder(newOrder, wallet, network)
+
+        const orderId = crypto.randomUUID()
+        const orderHash = crypto.createHash('sha1').update(JSON.stringify({
+          network,
+          maker: newOrder.maker.toLowerCase(),
+          nonce: newOrder.nonce,
+          tokenIn: newOrder.tokenIn.toLowerCase(),
+          tokenOut: newOrder.tokenOut.toLowerCase(),
+          salt: newOrder.salt
+        })).digest('hex')
+
+        await supabase.from('orders').insert({
+          ...order,
+          order_id: orderId,
+          order_hash: orderHash,
+          amount_out_min: newAmountOutMin.toString(),
+          price: newPrice.toString(),
+          nonce: newOrder.nonce,
+          signature,
+          order_json: newOrder,
+          updated_at: new Date().toISOString()
+        })
+
+        console.log(`[executor] ${network}: updated price for custodial order ${orderId} from ${order.price} to ${newPrice}`)
+      }
+    }
+  } catch (e) {
+    console.warn(`[executor] ${network}: error updating custodial prices:`, e?.message || e)
+  }
+}
+
+async function attributeFillsToProvisions(network = 'bsc') {
+  if (!supabase) return
+
+  console.log(`[executor] ${network}: attributing fills to provisions...`)
+
+  try {
+    // Get recent fills for custodial orders
+    const { data: fills } = await supabase
+      .from('fills')
+      .select('*, orders!inner(liquidity_provision_id)')
+      .eq('network', network)
+      .gte('created_at', new Date(Date.now() - 60000).toISOString()) // Last minute
+
+    if (!fills || fills.length === 0) return
+
+    for (const fill of fills) {
+      const provisionId = fill.orders.liquidity_provision_id
+      if (!provisionId) continue
+
+      const filledAmount = toBN(fill.amount_base)
+      const proceeds = toBN(fill.amount_quote)
+
+      // Update provision
+      const { data: provision } = await supabase
+        .from('liquidity_provisions')
+        .select('remaining_amount, proceeds_earned, proceeds_token')
+        .eq('id', provisionId)
+        .single()
+
+      if (provision) {
+        const newRemaining = toBN(provision.remaining_amount) - filledAmount
+        const newProceeds = toBN(provision.proceeds_earned) + proceeds
+
+        await supabase
+          .from('liquidity_provisions')
+          .update({
+            remaining_amount: newRemaining.toString(),
+            proceeds_earned: newProceeds.toString(),
+            proceeds_token: provision.proceeds_token || fill.orders.token_out,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', provisionId)
+
+        console.log(`[executor] ${network}: attributed fill ${filledAmount.toString()} to provision ${provisionId}`)
+      }
+    }
+  } catch (e) {
+    console.warn(`[executor] ${network}: error attributing fills:`, e?.message || e)
   }
 }
 
@@ -2061,7 +2462,6 @@ async function runOnce(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
-
 
 
 
