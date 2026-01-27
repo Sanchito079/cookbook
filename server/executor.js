@@ -6,13 +6,6 @@ import fetch from 'node-fetch'
 import { createClient } from '@supabase/supabase-js'
 import { Contract, JsonRpcProvider, Wallet, FetchRequest } from 'ethers'
 
-// Import SAL Order utilities
-import {
-  getSALOrderPrice,
-  updateSALOrderPrice,
-  calculateSALOrderPrice
-} from './sal_order_utils.js'
-
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const envPath = path.join(__dirname, '..', '.env')
@@ -30,7 +23,7 @@ const EXECUTOR_RPC_URLS = (process.env.EXECUTOR_RPC_URLS || '').split(',').map(s
 const EXECUTOR_PRIVATE_KEY = process.env.EXECUTOR_PRIVATE_KEY
 const SETTLEMENT_ADDRESS_BSC = process.env.SETTLEMENT_ADDRESS_BSC || '0x7DBA6a1488356428C33cC9fB8Ef3c8462c8679d0'
 const SETTLEMENT_ADDRESS_BASE = process.env.SETTLEMENT_ADDRESS_BASE || '0xBBf7A39F053BA2B8F4991282425ca61F2D871f45'
-const CUSTODIAL_ADDRESS = '0x6E11b5c17258C3F3ea684881Da4bB591C4C7bE05'
+const CUSTODIAL_ADDRESS = '0x70c992e6a19c565430fa0c21933395ebf1e907c3'
 
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE
@@ -393,43 +386,14 @@ function getNetworkForToken(address) {
   return 'bsc' // default
 }
 
-async function priceAsk(r) {
-  // Check if this is a SAL order
-  if (r.is_sal_order) {
-    try {
-      const salPriceData = await getSALOrderPrice(r.order_id, r.network || 'bsc')
-      if (salPriceData.currentPrice && !salPriceData.error) {
-        // Convert to 1e18 scaled format
-        return BigInt(Math.floor(parseFloat(salPriceData.currentPrice) * 1e18))
-      }
-    } catch (error) {
-      console.warn(`[executor] Failed to get SAL ask price for ${r.order_id}:`, error.message)
-    }
-  }
-
-  // Fallback to regular price calculation
+function priceAsk(r) {
   // quote per base in integer math scaled by 1e18
   const ain = toBN(r.amount_in || r.amountIn || 0n) // base in
   const aout = toBN(r.amount_out_min || r.amountOutMin || 0n) // quote min out
   if (ain <= 0n) return null
   return (aout * 10n ** 18n) / ain
 }
-
-async function priceBid(r) {
-  // Check if this is a SAL order
-  if (r.is_sal_order) {
-    try {
-      const salPriceData = await getSALOrderPrice(r.order_id, r.network || 'bsc')
-      if (salPriceData.currentPrice && !salPriceData.error) {
-        // Convert to 1e18 scaled format
-        return BigInt(Math.floor(parseFloat(salPriceData.currentPrice) * 1e18))
-      }
-    } catch (error) {
-      console.warn(`[executor] Failed to get SAL bid price for ${r.order_id}:`, error.message)
-    }
-  }
-
-  // Fallback to regular price calculation
+function priceBid(r) {
   // quote per base in integer math scaled by 1e18
   const ain = toBN(r.amount_in || r.amountIn || 0n) // quote in
   const aout = toBN(r.amount_out_min || r.amountOutMin || 0n) // base min out
@@ -1032,8 +996,8 @@ async function tryMatchPairCrossChain(base, quote, bids, asks) {
     return 0
   }) // lowest ask first
 
-  const bestBid = bidsWithPrices[0]
-  const bestAsk = asksWithPrices[0]
+  const bestBid = bids[0]
+  const bestAsk = asks[0]
 
   if (!bestBid || !bestAsk) {
     console.log(`[executor] cross-chain: no best bid or ask available for ${base}/${quote}`)
@@ -1287,14 +1251,6 @@ async function tryMatchPairCrossChain(base, quote, bids, asks) {
     await updateOrderRemaining(buyRow.order_id, newBuyRem, newBuyRem === 0n ? 'filled' : 'open', buyRow.network)
     await updateOrderRemaining(sellRow.order_id, newSellRem, newSellRem === 0n ? 'filled' : 'open', sellRow.network)
 
-    // Update SAL Order prices if applicable
-    if (buyRow.is_sal_order) {
-      await updateSALOrderPrice(buyRow.order_id, buyRow.network, buyRow.sal_current_price, quoteIn.toString())
-    }
-    if (sellRow.is_sal_order) {
-      await updateSALOrderPrice(sellRow.order_id, sellRow.network, sellRow.sal_current_price, baseOut.toString())
-    }
-
     return true
 
   } catch (e) {
@@ -1341,19 +1297,9 @@ async function tryMatchPairCrossChain(base, quote, bids, asks) {
 async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   console.log(`[executor] ${network}: sorting ${bids.length} bids and ${asks.length} asks for ${base}/${quote}`)
 
-  // Sort bids and asks with async price fetching for SAL orders
-  const bidsWithPrices = await Promise.all(bids.map(async (bid) => ({
-    ...bid,
-    price: await priceBid(bid)
-  })))
-  const asksWithPrices = await Promise.all(asks.map(async (ask) => ({
-    ...ask,
-    price: await priceAsk(ask)
-  })))
-
-  bidsWithPrices.sort((a, b) => {
-    const pb = b.price
-    const pa = a.price
+  bids.sort((a, b) => {
+    const pb = priceBid(b)
+    const pa = priceBid(a)
     if (pb === null && pa === null) return 0
     if (pb === null) return 1
     if (pa === null) return -1
@@ -1361,10 +1307,9 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
     // same price, earlier time first
     return new Date(a.created_at || a.updated_at) - new Date(b.created_at || b.updated_at)
   }) // highest bid first, then earliest time
-
-  asksWithPrices.sort((a, b) => {
-    const pa = a.price
-    const pb = b.price
+  asks.sort((a, b) => {
+    const pa = priceAsk(a)
+    const pb = priceAsk(b)
     if (pa === null && pb === null) return 0
     if (pa === null) return 1
     if (pb === null) return -1
@@ -1387,8 +1332,8 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
     return false
   }
 
-  const pBid = bestBid.price
-  const pAsk = bestAsk.price
+  const pBid = priceBid(bestBid)
+  const pAsk = priceAsk(bestAsk)
 
   console.log(`[executor] ${network}: best bid price: ${pBid ? Number(pBid) / 1e18 : 'null'}, best ask price: ${pAsk ? Number(pAsk) / 1e18 : 'null'}`)
   console.log(`[executor] ${network}: order sources - bid: ${bestBid?.source || 'regular'} (${bestBid?.order_id}), ask: ${bestAsk?.source || 'regular'} (${bestAsk?.order_id})`)
@@ -2030,190 +1975,6 @@ async function tryMatchPairSolana(base, quote, bids, asks) {
   return true
 }
 
-// Liquidity Provision Functions
-async function createLiquidityOrders(network = 'bsc') {
- console.log(`[executor] ${network}: creating liquidity orders...`)
-
- try {
-   // Get active liquidity provisions
-   const { data: provisions, error } = await supabase
-     .from('liquidity_provisions')
-     .select('*')
-     .eq('network', network)
-     .gt('remaining_amount', '0')
-
-   if (error) throw error
-   if (!provisions || provisions.length === 0) {
-     console.log(`[executor] ${network}: no active liquidity provisions`)
-     return
-   }
-
-   console.log(`[executor] ${network}: found ${provisions.length} active provisions`)
-
-   // Get current platform prices from recent trades
-   const { data: recentTrades, error: tradeError } = await supabase
-     .from('trades')
-     .select('base_address, quote_address, price')
-     .eq('network', network)
-     .order('created_at', { ascending: false })
-     .limit(100)
-
-   if (tradeError) {
-     console.warn(`[executor] ${network}: failed to fetch recent trades:`, tradeError.message)
-   }
-
-   // Group latest prices by pair
-   const platformPrices = new Map()
-   if (recentTrades) {
-     for (const trade of recentTrades) {
-       const pairKey = `${trade.base_address}_${trade.quote_address}`.toLowerCase()
-       if (!platformPrices.has(pairKey)) {
-         platformPrices.set(pairKey, Number(trade.price))
-       }
-     }
-   }
-
-   // Process each provision
-   for (const provision of provisions) {
-     const tokenAddress = provision.token_address.toLowerCase()
-     const minPrice = toBN(provision.min_price_per_token)
-
-     // Determine quote token (assume WBNB for BSC, WETH for Base)
-     const quoteAddress = network === 'base' ? '0x4200000000000000000000000000000000000006' : '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c'
-     const pairKey = `${tokenAddress}_${quoteAddress}`
-
-     // Get platform price for this pair
-     const platformPrice = platformPrices.get(pairKey)
-
-     if (!platformPrice) {
-       console.log(`[executor] ${network}: no platform price for ${pairKey}, skipping`)
-       continue
-     }
-
-     // Use max of owner's min price and platform price
-     const orderPrice = Math.max(platformPrice, Number(minPrice) / 1e18)
-
-     // Check custodial balance
-     const provider = network === 'base' ? providerBase : providerBSC
-     const erc20 = new Contract(tokenAddress, ERC20_MIN_ABI, provider)
-     const balance = await erc20.balanceOf(CUSTODIAL_ADDRESS).catch(() => 0n)
-
-     if (balance <= 0n) {
-       console.log(`[executor] ${network}: no balance for ${tokenAddress} in custodial`)
-       continue
-     }
-
-     // Check if we already have an active liquidity order for this provision
-     const { data: existingOrders, error: orderError } = await supabase
-       .from('orders')
-       .select('order_id, remaining')
-       .eq('liquidity_provision_id', provision.id)
-       .eq('status', 'open')
-       .gt('remaining', '0')
-
-     if (orderError) {
-       console.warn(`[executor] ${network}: failed to check existing orders:`, orderError.message)
-       continue
-     }
-
-     if (existingOrders && existingOrders.length > 0) {
-       // Update existing order price if needed
-       const existingOrder = existingOrders[0]
-       const currentOrderPrice = Number(toBN(existingOrder.price || '0')) / 1e18
-
-       if (Math.abs(currentOrderPrice - orderPrice) > orderPrice * 0.01) { // 1% change
-         console.log(`[executor] ${network}: updating liquidity order ${existingOrder.order_id} price from ${currentOrderPrice} to ${orderPrice}`)
-
-         // Calculate new amount_out_min
-         const remaining = toBN(existingOrder.remaining)
-         const newAmountOutMin = (remaining * BigInt(Math.floor(orderPrice * 1e18))) / 10n ** 18n
-
-         await supabase
-           .from('orders')
-           .update({
-             price: orderPrice.toString(),
-             amount_out_min: newAmountOutMin.toString(),
-             updated_at: new Date().toISOString()
-           })
-           .eq('order_id', existingOrder.order_id)
-       }
-       continue
-     }
-
-     // Create new liquidity order
-     const orderId = crypto.randomUUID()
-     const salt = BigInt(Math.floor(Math.random() * 1e18))
-     const nonce = Date.now() // Simple nonce
-
-     const order = {
-       maker: CUSTODIAL_ADDRESS,
-       tokenIn: tokenAddress,
-       tokenOut: quoteAddress,
-       amountIn: balance.toString(),
-       amountOutMin: ((balance * BigInt(Math.floor(orderPrice * 1e18))) / 10n ** 18n).toString(),
-       expiration: Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60, // 1 year
-       nonce: nonce.toString(),
-       receiver: '0x0000000000000000000000000000000000000000',
-       salt: salt.toString()
-     }
-
-     // Hash and sign the order
-     const orderHash = crypto.createHash('sha1').update(JSON.stringify({
-       network,
-       maker: toLower(order.maker),
-       nonce: order.nonce,
-       tokenIn: toLower(order.tokenIn),
-       tokenOut: toLower(order.tokenOut),
-       salt: order.salt
-     })).digest('hex')
-
-     const wallet = network === 'base' ? walletBase : walletBSC
-     const signature = await wallet.signMessage(orderHash)
-
-     // Insert order
-     const orderRow = {
-       network,
-       order_id: orderId,
-       order_hash: orderHash,
-       maker: CUSTODIAL_ADDRESS,
-       token_in: tokenAddress,
-       token_out: quoteAddress,
-       amount_in: balance.toString(),
-       amount_out_min: order.amountOutMin,
-       remaining: balance.toString(),
-       price: orderPrice.toString(),
-       side: 'ask',
-       base: tokenAddress,
-       quote: quoteAddress,
-       base_address: tokenAddress,
-       quote_address: quoteAddress,
-       pair: `${tokenAddress}/${quoteAddress}`,
-       nonce: order.nonce,
-       receiver: order.receiver,
-       salt: order.salt,
-       signature,
-       order_json: order,
-       expiration: new Date(order.expiration * 1000).toISOString(),
-       status: 'open',
-       liquidity_provision_id: provision.id,
-       owner_min_price: provision.min_price_per_token,
-       created_at: new Date().toISOString(),
-       updated_at: new Date().toISOString()
-     }
-
-     const { error: insertError } = await supabase.from('orders').insert(orderRow)
-     if (insertError) {
-       console.warn(`[executor] ${network}: failed to insert liquidity order:`, insertError.message)
-     } else {
-       console.log(`[executor] ${network}: created liquidity order ${orderId} for ${balance.toString()} ${tokenAddress} at price ${orderPrice}`)
-     }
-   }
-
- } catch (e) {
-   console.error(`[executor] ${network}: liquidity order creation failed:`, e?.message || e)
- }
-}
-
 async function runOnce(network = 'bsc') {
   if (network === 'solana') {
     await runSolana()
@@ -2251,11 +2012,7 @@ async function runOnce(network = 'bsc') {
   }
 
   try {
-    // First create/update liquidity orders
-    console.log(`[executor] ${network}: creating liquidity orders...`)
-    await createLiquidityOrders(network)
-
-    // Then check conditional orders (using current market prices)
+    // First check conditional orders (using current market prices)
     console.log(`[executor] ${network}: checking conditional orders...`)
     const triggeredOrderIds = await checkAndTriggerConditionalOrders(network)
 
