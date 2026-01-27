@@ -1481,6 +1481,43 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, time: Date.now() })
 })
 
+// Get available trading pairs for a token
+app.get('/api/token-pairs', async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) return res.status(503).json({ error: 'database disabled' })
+    const network = (req.query.network || 'bsc').toString()
+    const tokenRaw = (req.query.token_address || '').toString()
+    if (!tokenRaw) return res.json({ data: [] })
+
+    // Normalize address casing for EVM networks; preserve for Solana
+    const token = network === 'solana' ? tokenRaw : tokenRaw.toLowerCase()
+
+    const selectCols = [
+      'network',
+      'pool_address',
+      'pair_key',
+      'base_symbol', 'base_address', 'base_decimals', 'base_name', 'base_logo_url',
+      'quote_symbol', 'quote_address', 'quote_decimals', 'quote_name', 'quote_logo_url',
+      'pair', 'price', 'change', 'volume', 'gecko_pool_id', 'updated_at'
+    ].join(',')
+
+    const { data, error } = await supabase
+      .from('markets')
+      .select(selectCols)
+      .eq('network', network)
+      .or(`base_address.eq.${token},quote_address.eq.${token}`)
+      .order('updated_at', { ascending: false })
+
+    if (error) throw error
+
+    // Return rows as-is for the UI
+    return res.json({ data: data || [] })
+  } catch (e) {
+    console.error('[api] token-pairs error:', e?.message || e)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
 // Debug endpoint to test crosschain trades query
 app.get('/debug/crosschain-trades', async (req, res) => {
   try {
