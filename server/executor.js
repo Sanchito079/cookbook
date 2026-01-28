@@ -2372,7 +2372,7 @@ async function createOrdersFromProvisions(network = 'bsc') {
         token_out: order.tokenOut,
         amount_in: order.amountIn,
         amount_out_min: order.amountOutMin,
-        remaining: order.amountIn,
+        remaining: order.amountOutMin,
         price: currentPrice.toString(),
         side: 'ask',
         base: tokenAddr,
