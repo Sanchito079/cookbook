@@ -2526,7 +2526,20 @@ async function signOrder(order, wallet, network) {
     ]
   }
 
-  const signature = await wallet.signTypedData(domain, types, order)
+  // IMPORTANT: Convert order values to BigInts before signing to match uint256 types
+  const orderForSigning = {
+    maker: order.maker,
+    tokenIn: order.tokenIn,
+    tokenOut: order.tokenOut,
+    amountIn: BigInt(order.amountIn),
+    amountOutMin: BigInt(order.amountOutMin),
+    expiration: BigInt(order.expiration),
+    nonce: BigInt(order.nonce),
+    receiver: order.receiver,
+    salt: BigInt(order.salt)
+  }
+
+  const signature = await wallet.signTypedData(domain, types, orderForSigning)
   return signature
 }
 
@@ -2745,6 +2758,7 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
 
