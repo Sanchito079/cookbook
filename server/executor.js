@@ -2174,13 +2174,12 @@ async function checkCustodialDeposits(network = 'bsc') {
         const excess = toBN(balanceStr) - totalRemaining
         console.log(`[executor] ${network}: detected deposit of ${excess.toString()} ${tokenAddr} to custodial`)
 
-        // Check if provision already exists for this token/network/depositor (without pair_key filter)
+        // Check if provision already exists for this token/network (any depositor)
         const { data: existingProvision } = await supabase
           .from('liquidity_provisions')
           .select('id, pair_key, amount_deposited, remaining_amount')
           .eq('network', network)
           .eq('token_address', tokenAddr)
-          .eq('depositor', 'pending_claim')
           .single()
 
         if (existingProvision) {
@@ -2618,7 +2617,6 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
-
 
 
 
