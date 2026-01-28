@@ -21,6 +21,7 @@ const EXECUTOR_RPC_URL = process.env.EXECUTOR_RPC_URL
 const EXECUTOR_RPC_URL_BASE = process.env.EXECUTOR_RPC_URL_BASE
 const EXECUTOR_RPC_URLS = (process.env.EXECUTOR_RPC_URLS || '').split(',').map(s => s.trim()).filter(Boolean)
 const EXECUTOR_PRIVATE_KEY = process.env.EXECUTOR_PRIVATE_KEY
+const CUSTODIAL_PRIVATE_KEY = process.env.CUSTODIAL_PRIVATE_KEY
 const SETTLEMENT_ADDRESS_BSC = process.env.SETTLEMENT_ADDRESS_BSC || '0x7DBA6a1488356428C33cC9fB8Ef3c8462c8679d0'
 const SETTLEMENT_ADDRESS_BASE = process.env.SETTLEMENT_ADDRESS_BASE || '0xBBf7A39F053BA2B8F4991282425ca61F2D871f45'
 const CUSTODIAL_ADDRESS = '0x6E11b5c17258C3F3ea684881Da4bB591C4C7bE05'
@@ -417,6 +418,8 @@ let providerBSC = null
 let providerBase = null
 let walletBSC = null
 let walletBase = null
+let custodialWalletBSC = null
+let custodialWalletBase = null
 let settlement = null
 let settlementBase = null
 let busyBSC = false
@@ -483,13 +486,22 @@ async function initProvidersAndWallets() {
 
         const w = new Wallet(EXECUTOR_PRIVATE_KEY, prov)
 
+        // Create custodial wallet if private key is provided
+        let custodialW = null
+        if (CUSTODIAL_PRIVATE_KEY) {
+          custodialW = new Wallet(CUSTODIAL_PRIVATE_KEY, prov)
+          console.log(`[executor] ${network.name} custodial wallet: ${custodialW.address}`)
+        }
+
         // Assign to global variables
         if (network.name === 'BSC') {
           providerBSC = prov
           walletBSC = w
+          custodialWalletBSC = custodialW
         } else if (network.name === 'Base') {
           providerBase = prov
           walletBase = w
+          custodialWalletBase = custodialW
         }
 
         console.log(`[executor] ${network.name} connected successfully. wallet: ${w.address}, chainId: ${chainId}`)
@@ -2215,6 +2227,7 @@ async function checkCustodialDeposits(network = 'bsc') {
 
 async function createOrdersFromProvisions(network = 'bsc') {
   const wallet = network === 'base' ? walletBase : walletBSC
+  const custodialWallet = network === 'base' ? custodialWalletBase : custodialWalletBSC
   if (!supabase || !wallet) return
 
   console.log(`[executor] ${network}: creating orders from liquidity provisions...`)
@@ -2334,9 +2347,51 @@ async function createOrdersFromProvisions(network = 'bsc') {
       // amountOutMin should be in quote token units (e.g., 0.5 USDT = 0.5 * 10^18)
       const amountOutMin = (amountIn * BigInt(Math.floor(currentPrice * 10 ** outDecimals))) / (10n ** BigInt(inDecimals))
 
+      // IMPORTANT: Transfer tokens from custodial wallet to executor wallet before creating order
+      // The order's maker is the executor wallet, so the executor wallet must have the tokens
+      // The contract will try to transfer tokens from the maker address during order execution
+      console.log(`[executor] ${network}: transferring ${amountIn.toString()} tokens from custodial to executor wallet`)
+      try {
+        if (!custodialWallet) {
+          throw new Error('Custodial wallet not available. Please set CUSTODIAL_PRIVATE_KEY in .env')
+        }
+        const tokenContract = new Contract(tokenAddr, ERC20_MIN_ABI, custodialWallet)
+        const tx = await tokenContract.transfer(wallet.address, amountIn)
+        await tx.wait()
+        console.log(`[executor] ${network}: token transfer completed, tx hash: ${tx.hash}`)
+      } catch (transferError) {
+        console.warn(`[executor] ${network}: failed to transfer tokens from custodial to executor wallet:`, transferError?.message || transferError)
+        console.warn(`[executor] ${network}: skipping order creation for provision ${provision.id}`)
+        continue
+      }
+
+      // IMPORTANT: Approve the settlement contract to transfer tokens from the executor wallet
+      // The settlement contract needs approval to transfer tokens from the maker (executor wallet)
+      const settlementAddress = network === 'base' ? SETTLEMENT_ADDRESS_BASE : SETTLEMENT_ADDRESS_BSC
+      console.log(`[executor] ${network}: approving settlement contract to transfer tokens`)
+      try {
+        const tokenContract = new Contract(tokenAddr, ERC20_MIN_ABI, wallet)
+        const allowance = await tokenContract.allowance(wallet.address, settlementAddress)
+        if (allowance < amountIn) {
+          console.log(`[executor] ${network}: current allowance ${allowance.toString()} < needed ${amountIn.toString()}, approving...`)
+          const approveTx = await tokenContract.approve(settlementAddress, amountIn)
+          await approveTx.wait()
+          console.log(`[executor] ${network}: approval completed, tx hash: ${approveTx.hash}`)
+        } else {
+          console.log(`[executor] ${network}: sufficient allowance already exists: ${allowance.toString()}`)
+        }
+      } catch (approveError) {
+        console.warn(`[executor] ${network}: failed to approve settlement contract:`, approveError?.message || approveError)
+        console.warn(`[executor] ${network}: skipping order creation for provision ${provision.id}`)
+        continue
+      }
+
       // Create order
+      // IMPORTANT: Use executor wallet address as maker, not CUSTODIAL_ADDRESS
+      // The signature is signed by the executor wallet, so the maker must match
+      // The contract's verifySignature checks that the signature was signed by the maker address
       const order = {
-        maker: CUSTODIAL_ADDRESS,
+        maker: wallet.address,
         tokenIn: tokenAddr,
         tokenOut: quoteAddr,
         amountIn: amountIn.toString(),
@@ -2611,7 +2666,6 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
-
 
 
 
