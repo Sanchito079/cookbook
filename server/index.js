@@ -3264,12 +3264,12 @@ app.post('/api/claim-deposit', async (req, res) => {
         .from('liquidity_provisions')
         .insert({
           network,
-          depositor: 'pending_claim',
+          depositor: depositor_address.toLowerCase(), // Set actual depositor, not pending_claim
           token_address: token_address.toLowerCase(),
           amount_deposited: '0', // Will be updated when deposit detected
           min_price_per_token: min_price_per_token,
           remaining_amount: '0',
-          pair_key: null // Will be set on claim
+          pair_key: pair_key // Set pair_key from request
         })
         .select()
         .single()
@@ -3512,6 +3512,7 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
 
 
 
