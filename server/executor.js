@@ -4,7 +4,7 @@ import { fileURLToPath } from 'url'
 import crypto from 'crypto'
 import fetch from 'node-fetch'
 import { createClient } from '@supabase/supabase-js'
-import { Contract, JsonRpcProvider, Wallet, FetchRequest } from 'ethers'
+import { Contract, JsonRpcProvider, Wallet, FetchRequest, verifyTypedData } from 'ethers'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -974,6 +974,14 @@ async function preflightDiagnostics(buyRow, sellRow, network = 'bsc') {
   const sell = normalizeOrderJson(sellRow.order_json || sellRow.order || {})
   const sigBuy = buyRow.signature || ''
   const sigSell = sellRow.signature || ''
+
+  // Recover signers off-chain to catch domain/field drift quickly
+  try {
+    const recBuy = await recoverOrderSigner(buy, sigBuy, network)
+    const recSell = await recoverOrderSigner(sell, sigSell, network)
+    console.log(`[executor] ${network}: recovered signers - buy: ${recBuy || 'n/a'}, sell: ${recSell || 'n/a'}`)
+    console.log(`[executor] ${network}: expected makers - buy: ${String(buy.maker).toLowerCase()}, sell: ${String(sell.maker).toLowerCase()}`)
+  } catch { /* best-effort debug */ }
 
   const settlementContract = network === 'base' ? settlementBase : settlement
   const settlementAddress = network === 'base' ? SETTLEMENT_ADDRESS_BASE : SETTLEMENT_ADDRESS_BSC
@@ -2407,6 +2415,16 @@ async function createOrdersFromProvisions(network = 'bsc') {
       // Sign order
       const signature = await signOrder(order, wallet, network)
 
+      // Validate signature recovers to executor wallet to prevent bad rows
+      try {
+        const recovered = await recoverOrderSigner(order, signature, network)
+        if (recovered !== wallet.address.toLowerCase()) {
+          console.warn(`[executor] ${network}: signature recovery mismatch for provision ${provision.id}: recovered ${recovered}, expected ${wallet.address.toLowerCase()}`)
+          console.warn(`[executor] ${network}: skipping order creation to avoid unverifiable custodial order`)
+          continue
+        }
+      } catch { /* best-effort */ }
+
       // Insert order
       const orderId = crypto.randomUUID()
       const orderHash = crypto.createHash('sha1').update(JSON.stringify({
@@ -2498,6 +2516,53 @@ async function signOrder(order, wallet, network) {
 
   const signature = await wallet.signTypedData(domain, types, order)
   return signature
+}
+
+// Helpers to reconstruct domain and recover signer for debugging/validation
+function getEip712Domain(network) {
+  return {
+    name: 'OrderBook',
+    version: '1',
+    chainId: network === 'base' ? 8453 : 56,
+    verifyingContract: network === 'base' ? SETTLEMENT_ADDRESS_BASE : SETTLEMENT_ADDRESS_BSC
+  }
+}
+
+const EIP712_ORDER_TYPES = {
+  Order: [
+    { name: 'maker', type: 'address' },
+    { name: 'tokenIn', type: 'address' },
+    { name: 'tokenOut', type: 'address' },
+    { name: 'amountIn', type: 'uint256' },
+    { name: 'amountOutMin', type: 'uint256' },
+    { name: 'expiration', type: 'uint256' },
+    { name: 'nonce', type: 'uint256' },
+    { name: 'receiver', type: 'address' },
+    { name: 'salt', type: 'uint256' }
+  ]
+}
+
+async function recoverOrderSigner(order, signature, network) {
+  try {
+    if (!signature || signature.length < 10) return ''
+    // Normalize the order fields to strings/numbers exactly like during signing
+    const norm = {
+      maker: order.maker,
+      tokenIn: order.tokenIn,
+      tokenOut: order.tokenOut,
+      amountIn: order.amountIn?.toString?.() ?? String(order.amountIn),
+      amountOutMin: order.amountOutMin?.toString?.() ?? String(order.amountOutMin),
+      expiration: order.expiration?.toString?.() ?? String(order.expiration),
+      nonce: order.nonce?.toString?.() ?? String(order.nonce),
+      receiver: order.receiver || '0x0000000000000000000000000000000000000000',
+      salt: order.salt?.toString?.() ?? String(order.salt)
+    }
+    const addr = verifyTypedData(getEip712Domain(network), EIP712_ORDER_TYPES, norm, signature)
+    return (addr || '').toLowerCase()
+  } catch (e) {
+    console.warn('[executor] recoverOrderSigner failed:', e?.message || e)
+    return ''
+  }
 }
 
 async function updateCustodialOrderPrices(network = 'bsc') {
