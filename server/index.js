@@ -1,5 +1,3 @@
-import express from 'express'
-import cors from 'cors'
 import fetch from 'node-fetch'
 import dotenv from 'dotenv'
 import { createClient } from '@supabase/supabase-js'
@@ -3247,8 +3245,19 @@ app.post('/api/claim-deposit', async (req, res) => {
     let provision
     if (provisions && provisions.length > 0) {
       provision = provisions[0]
+      // Update existing provision with depositor, pair_key, and min price
+      // Keep the detected amount_deposited and remaining_amount from checkCustodialDeposits
+      await supabase
+        .from('liquidity_provisions')
+        .update({
+          depositor: depositor_address.toLowerCase(),
+          pair_key: pair_key,
+          min_price_per_token: min_price_per_token,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', provision.id)
     } else {
-      // Create new provision if none exists
+      // Create new provision if none exists (will be updated by checkCustodialDeposits when deposit is detected)
       const { data: newProvision, error: insertError } = await supabase
         .from('liquidity_provisions')
         .insert({
@@ -3267,21 +3276,10 @@ app.post('/api/claim-deposit', async (req, res) => {
       provision = newProvision
     }
 
-    // Update provision with depositor, pair_key, and min price
-    await supabase
-      .from('liquidity_provisions')
-      .update({
-        depositor: depositor_address.toLowerCase(),
-        pair_key: pair_key,
-        min_price_per_token: min_price_per_token,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', provision.id)
-
     res.json({
       success: true,
       provision_id: provision.id,
-      amount: provision.amount_deposited,
+      amount: provision.amount_deposited || '0',
       token: provision.token_address,
       pair_key: pair_key,
       min_price_per_token: min_price_per_token
@@ -3512,6 +3510,7 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
 
 
 
