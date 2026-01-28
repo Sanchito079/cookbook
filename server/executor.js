@@ -2139,21 +2139,9 @@ async function checkCustodialDeposits(network = 'bsc') {
     // Get unique token addresses from existing provisions (already filtered by network)
     const tokensFromDb = [...new Set(existingProvisions?.map(p => p.token_address) || [])]
 
-    // Also include known tokens for backward compatibility
-    const knownTokens = [
-      '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c', // WBNB
-      '0x55d398326f99059ff775485246999027b3197955', // USDT
-      '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d', // USDC
-      '0x4200000000000000000000000000000006' // WETH (base)
-    ].filter(addr => {
-      // Filter by network - only include tokens that belong to this network
-      if (network === 'bsc' && addr === '0x4200000000000000000000000000000006') return false
-      if (network === 'base' && addr !== '0x4200000000000000000000000000000000006' && addr !== '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913') return false
-      return true
-    })
-
-    // Combine both lists - both are already network-specific
-    const tokensToCheck = [...new Set([...tokensFromDb, ...knownTokens])]
+    // Only check tokens that have provisions in the database
+    // This prevents creating provisions for tokens that happen to have a balance but weren't intentionally deposited
+    const tokensToCheck = tokensFromDb
 
     for (const tokenAddr of tokensToCheck) {
       // Get current balance
@@ -2617,7 +2605,6 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
-
 
 
 
