@@ -2335,7 +2335,11 @@ async function createOrdersFromProvisions(network = 'bsc') {
 
       // Calculate amount to sell (up to remaining, but reasonable chunk)
       const amountIn = remaining > 10n ** BigInt(inDecimals) ? 10n ** BigInt(inDecimals) : remaining
-      const amountOutMin = (amountIn * toBN(Math.floor(currentPrice * 10 ** (outDecimals + 18)).toString())) / (10n ** BigInt(inDecimals + 18))
+      // Calculate minimum output amount: amountIn * price, adjusted for decimals
+      // price is quote per base (e.g., 0.5 USDT per ASTER)
+      // amountIn is in base token units (e.g., 1 ASTER = 10^18)
+      // amountOutMin should be in quote token units (e.g., 0.5 USDT = 0.5 * 10^18)
+      const amountOutMin = (amountIn * BigInt(Math.floor(currentPrice * 10 ** outDecimals))) / (10n ** BigInt(inDecimals))
 
       // Create order
       const order = {
@@ -2614,6 +2618,7 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
 
