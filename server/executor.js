@@ -2277,9 +2277,9 @@ async function createOrdersFromProvisions(network = 'bsc') {
 
       const tokenAddr = provision.token_address
       const remaining = toBN(provision.remaining_amount)
-      const minPrice = toBN(provision.min_price_per_token)
+      const minPrice = Number(provision.min_price_per_token || '0')
 
-      console.log(`[executor] ${network}: processing provision ${provision.id}, token=${tokenAddr}, remaining=${remaining.toString()}, minPrice=${minPrice.toString()}`)
+      console.log(`[executor] ${network}: processing provision ${provision.id}, token=${tokenAddr}, remaining=${remaining.toString()}, minPrice=${minPrice}`)
 
       // Check if orders already exist for this provision to prevent duplicates
       const { data: existingOrders } = await supabase
@@ -2608,6 +2608,7 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
 
