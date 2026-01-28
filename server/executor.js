@@ -2130,11 +2130,11 @@ async function checkCustodialDeposits(network = 'bsc') {
     if (!provider) return
 
     // Get all tokens that have provisions in the database for this network
+    // Include both claimed provisions AND pending_claim provisions to detect new deposits
     const { data: existingProvisions } = await supabase
       .from('liquidity_provisions')
       .select('token_address')
       .eq('network', network)
-      .neq('depositor', 'pending_claim')
 
     // Get unique token addresses from existing provisions (already filtered by network)
     const tokensFromDb = [...new Set(existingProvisions?.map(p => p.token_address) || [])]
