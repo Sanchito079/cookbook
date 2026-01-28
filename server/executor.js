@@ -2391,6 +2391,7 @@ async function createOrdersFromProvisions(network = 'bsc') {
       // IMPORTANT: Use executor wallet address as maker, not CUSTODIAL_ADDRESS
       // The signature is signed by the executor wallet, so the maker must match
       // The contract's verifySignature checks that the signature was signed by the maker address
+      // IMPORTANT: Use strings for consistency with regular orders (frontend signs with strings)
       const order = {
         maker: wallet.address,
         tokenIn: tokenAddr,
@@ -2667,7 +2668,6 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
-
 
 
 
