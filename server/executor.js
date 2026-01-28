@@ -967,22 +967,10 @@ async function preflightDiagnostics(buyRow, sellRow, network = 'bsc') {
   const providerForNetwork = network === 'base' ? providerBase : providerBSC
 
   const [sigBuyOk, sigSellOk, availBuy, availSell] = await Promise.all([
-    settlementContract.verifySignature(buy, sigBuy).catch((e) => {
-      console.warn(`[executor] ${network}: buy signature verification failed:`, e?.message || e)
-      return false
-    }),
-    settlementContract.verifySignature(sell, sigSell).catch((e) => {
-      console.warn(`[executor] ${network}: sell signature verification failed:`, e?.message || e)
-      return false
-    }),
-    settlementContract.availableToFill(buy).catch((e) => {
-      console.warn(`[executor] ${network}: buy availableToFill failed:`, e?.message || e)
-      return 0n
-    }),
-    settlementContract.availableToFill(sell).catch((e) => {
-      console.warn(`[executor] ${network}: sell availableToFill failed:`, e?.message || e)
-      return 0n
-    })
+    settlementContract.verifySignature(buy, sigBuy).catch(() => false),
+    settlementContract.verifySignature(sell, sigSell).catch(() => false),
+    settlementContract.availableToFill(buy).catch(() => 0n),
+    settlementContract.availableToFill(sell).catch(() => 0n)
   ])
 
   const buyerErc = new Contract(buy.tokenIn, ERC20_MIN_ABI, providerForNetwork)
@@ -2384,7 +2372,7 @@ async function createOrdersFromProvisions(network = 'bsc') {
         token_out: order.tokenOut,
         amount_in: order.amountIn,
         amount_out_min: order.amountOutMin,
-        remaining: order.amountOutMin,
+        remaining: order.amountIn,
         price: currentPrice.toString(),
         side: 'ask',
         base: tokenAddr,
@@ -2623,6 +2611,17 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
+
+
+
+
+
+
+
+
+
+
 
 
 
