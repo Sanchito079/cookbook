@@ -2316,9 +2316,9 @@ async function createOrdersFromProvisions(network = 'bsc') {
         console.log(`[executor] ${network}: no market price for ${provision.pair_key}, using min_price = ${currentPrice}`)
       }
 
-      // Skip if price is too low (below or equal to min_price)
-      if (currentPrice <= Number(minPrice)) {
-        console.log(`[executor] ${network}: skipping provision ${provision.id} - price ${currentPrice} <= min ${minPrice}`)
+      // Skip if price is too low (below min_price)
+      if (currentPrice < Number(minPrice)) {
+        console.log(`[executor] ${network}: skipping provision ${provision.id} - price ${currentPrice} < min ${minPrice}`)
         continue
       }
 
@@ -2611,6 +2611,7 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
 
