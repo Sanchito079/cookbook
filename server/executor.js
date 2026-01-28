@@ -2506,7 +2506,7 @@ async function signOrder(order, wallet, network) {
 
   // Use contract's domain for signing
   const domain = {
-    name: 'OrderBook',
+    name: 'MinimalOrderBook',
     version: '1',
     chainId: network === 'base' ? 8453 : 56,
     verifyingContract: network === 'base' ? SETTLEMENT_ADDRESS_BASE : SETTLEMENT_ADDRESS_BSC
@@ -2759,6 +2759,8 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
+
 
 
 
