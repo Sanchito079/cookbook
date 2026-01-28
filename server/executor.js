@@ -1,5 +1,3 @@
-import dotenv from 'dotenv'
-import path from 'path'
 import { fileURLToPath } from 'url'
 import crypto from 'crypto'
 import fetch from 'node-fetch'
@@ -2164,14 +2162,30 @@ async function checkCustodialDeposits(network = 'bsc') {
         // Check if provision already exists for this token/network/depositor (without pair_key filter)
         const { data: existingProvision } = await supabase
           .from('liquidity_provisions')
-          .select('id, pair_key')
+          .select('id, pair_key, amount_deposited, remaining_amount')
           .eq('network', network)
           .eq('token_address', tokenAddr)
           .eq('depositor', 'pending_claim')
           .single()
 
         if (existingProvision) {
-          console.log(`[executor] ${network}: pending provision already exists for ${tokenAddr}, skipping`)
+          // Update existing provision with detected deposit amount
+          const newAmountDeposited = toBN(existingProvision.amount_deposited || '0') + excess
+          const newRemaining = toBN(existingProvision.remaining_amount || '0') + excess
+          const { error: updateError } = await supabase
+            .from('liquidity_provisions')
+            .update({
+              amount_deposited: newAmountDeposited.toString(),
+              remaining_amount: newRemaining.toString(),
+              updated_at: new Date().toISOString()
+            })
+            .eq('id', existingProvision.id)
+
+          if (updateError) {
+            console.warn(`[executor] ${network}: error updating provision:`, updateError.message)
+          } else {
+            console.log(`[executor] ${network}: updated provision ${existingProvision.id} with ${excess.toString()} ${tokenAddr}`)
+          }
         } else {
           // Create pending provision without pair_key - user will provide it when claiming
           const { error: insertError } = await supabase.from('liquidity_provisions').insert({
@@ -2204,12 +2218,13 @@ async function createOrdersFromProvisions(network = 'bsc') {
   console.log(`[executor] ${network}: creating orders from liquidity provisions...`)
 
   try {
-    // Get provisions with remaining amount (including pending_claim)
+    // Get provisions with remaining amount (excluding pending_claim - only claimed provisions)
     const { data: provisions } = await supabase
       .from('liquidity_provisions')
       .select('*')
       .eq('network', network)
       .gt('remaining_amount', '0')
+      .neq('depositor', 'pending_claim')
 
     if (!provisions || provisions.length === 0) {
       console.log(`[executor] ${network}: no provisions with remaining amount found`)
@@ -2252,11 +2267,30 @@ async function createOrdersFromProvisions(network = 'bsc') {
         continue
       }
 
+      // Skip provisions that are still pending_claim (not yet claimed by user)
+      if (provision.depositor === 'pending_claim') {
+        console.log(`[executor] ${network}: skipping provision ${provision.id} - still pending_claim`)
+        continue
+      }
+
       const tokenAddr = provision.token_address
       const remaining = toBN(provision.remaining_amount)
       const minPrice = toBN(provision.min_price_per_token)
 
       console.log(`[executor] ${network}: processing provision ${provision.id}, token=${tokenAddr}, remaining=${remaining.toString()}, minPrice=${minPrice.toString()}`)
+
+      // Check if orders already exist for this provision to prevent duplicates
+      const { data: existingOrders } = await supabase
+        .from('orders')
+        .select('order_id')
+        .eq('liquidity_provision_id', provision.id)
+        .eq('status', 'open')
+        .limit(1)
+
+      if (existingOrders && existingOrders.length > 0) {
+        console.log(`[executor] ${network}: skipping provision ${provision.id} - orders already exist`)
+        continue
+      }
 
       // Use pair_key to determine quote token
       const [baseAddr, quoteAddr] = provision.pair_key.split('/')
@@ -2569,6 +2603,7 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
 
