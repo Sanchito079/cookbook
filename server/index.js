@@ -1504,7 +1504,7 @@ app.get('/api/token-pairs', async (req, res) => {
     const mapped = (rows || []).map(row => ({
       network: row.network,
       pool_address: row.pool_address,
-      pair_key: row.pair_key || `${(row.base_address || '').toLowerCase()}_${(row.quote_address || '').toLowerCase()}`,
+      pair_key: row.pair_key || `${(row.base_address || '').toLowerCase()}/${(row.quote_address || '').toLowerCase()}`,
       base_symbol: row.base_symbol || 'UNKNOWN',
       base_address: (row.base_address || '').toLowerCase(),
       base_decimals: row.base_decimals ?? null,
@@ -1527,7 +1527,7 @@ app.get('/api/token-pairs', async (req, res) => {
     for (const p of mapped) {
       const b = p.base_address
       const q = p.quote_address
-      const key = (b && q) ? (b < q ? `${b}_${q}` : `${q}_${b}`) : p.pair_key
+      const key = (b && q) ? (b < q ? `${b}/${q}` : `${q}/${b}`) : p.pair_key
       if (!byKey.has(key)) byKey.set(key, p)
     }
 
@@ -3512,7 +3512,6 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
-
 
 
 
