@@ -2307,20 +2307,13 @@ async function createOrdersFromProvisions(network = 'bsc') {
       // Get current market price
       let currentPrice = pairPrices.get(provision.pair_key) || 0
 
-      // For provisions with no price data, use a default price of 1 for stablecoins
-      // or use min_price * 2 as a reasonable default for new tokens
+      // For provisions with no price data, use min_price as the price
+      // This respects the user's minimum price setting
       if (currentPrice === 0) {
-        // Check if this is a stablecoin pair (USDT or USDC as quote)
-        const stablecoinQuotes = ['0x55d398326f99059ff775485246999027b3197955', '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d', '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913']
-        if (stablecoinQuotes.includes(quoteAddr.toLowerCase())) {
-          currentPrice = 1 // Default to 1:1 for stablecoin pairs
-          console.log(`[executor] ${network}: using default price of 1 for stablecoin pair ${provision.pair_key}`)
-        } else {
-          // For new tokens with no price data, use min_price * 2 as a reasonable default
-          // This allows orders to be created even for new tokens with no trading history
-          currentPrice = Number(minPrice) * 2
-          console.log(`[executor] ${network}: no market price for ${provision.pair_key}, using min_price * 2 = ${currentPrice}`)
-        }
+        // Use min_price as the price when no market data exists
+        // This allows orders to be created even for new tokens with no trading history
+        currentPrice = Number(minPrice)
+        console.log(`[executor] ${network}: no market price for ${provision.pair_key}, using min_price = ${currentPrice}`)
       }
 
       // Skip if price is too low (below or equal to min_price)
@@ -2618,6 +2611,7 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
 
