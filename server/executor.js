@@ -2546,7 +2546,7 @@ async function signOrder(order, wallet, network) {
 // Helpers to reconstruct domain and recover signer for debugging/validation
 function getEip712Domain(network) {
   return {
-    name: 'OrderBook',
+    name: 'MinimalOrderBook',
     version: '1',
     chainId: network === 'base' ? 8453 : 56,
     verifyingContract: network === 'base' ? SETTLEMENT_ADDRESS_BASE : SETTLEMENT_ADDRESS_BSC
@@ -2570,17 +2570,18 @@ const EIP712_ORDER_TYPES = {
 async function recoverOrderSigner(order, signature, network) {
   try {
     if (!signature || signature.length < 10) return ''
-    // Normalize the order fields to strings/numbers exactly like during signing
+    // IMPORTANT: Convert order fields to BigInts to match uint256 types in EIP712 types
+    // This must match exactly how the frontend signs orders (with BigInt values)
     const norm = {
       maker: order.maker,
       tokenIn: order.tokenIn,
       tokenOut: order.tokenOut,
-      amountIn: order.amountIn?.toString?.() ?? String(order.amountIn),
-      amountOutMin: order.amountOutMin?.toString?.() ?? String(order.amountOutMin),
-      expiration: order.expiration?.toString?.() ?? String(order.expiration),
-      nonce: order.nonce?.toString?.() ?? String(order.nonce),
+      amountIn: BigInt(order.amountIn?.toString?.() ?? String(order.amountIn)),
+      amountOutMin: BigInt(order.amountOutMin?.toString?.() ?? String(order.amountOutMin)),
+      expiration: BigInt(order.expiration?.toString?.() ?? String(order.expiration)),
+      nonce: BigInt(order.nonce?.toString?.() ?? String(order.nonce)),
       receiver: order.receiver || '0x0000000000000000000000000000000000000000',
-      salt: order.salt?.toString?.() ?? String(order.salt)
+      salt: BigInt(order.salt?.toString?.() ?? String(order.salt))
     }
     const addr = verifyTypedData(getEip712Domain(network), EIP712_ORDER_TYPES, norm, signature)
     return (addr || '').toLowerCase()
