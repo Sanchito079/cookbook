@@ -2129,18 +2129,31 @@ async function checkCustodialDeposits(network = 'bsc') {
     const provider = network === 'base' ? providerBase : providerBSC
     if (!provider) return
 
-    // Known tokens to check (can be expanded)
-    const tokensToCheck = [
+    // Get all tokens that have provisions in the database for this network
+    const { data: existingProvisions } = await supabase
+      .from('liquidity_provisions')
+      .select('token_address')
+      .eq('network', network)
+      .neq('depositor', 'pending_claim')
+
+    // Get unique token addresses from existing provisions (already filtered by network)
+    const tokensFromDb = [...new Set(existingProvisions?.map(p => p.token_address) || [])]
+
+    // Also include known tokens for backward compatibility
+    const knownTokens = [
       '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c', // WBNB
       '0x55d398326f99059ff775485246999027b3197955', // USDT
       '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d', // USDC
-      '0x4200000000000000000000000000000000000006' // WETH (base)
+      '0x4200000000000000000000000000000006' // WETH (base)
     ].filter(addr => {
-      // Filter by network
-      if (network === 'bsc' && addr === '0x4200000000000000000000000000000000000006') return false
-      if (network === 'base' && addr !== '0x4200000000000000000000000000000000000006' && addr !== '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913') return false
+      // Filter by network - only include tokens that belong to this network
+      if (network === 'bsc' && addr === '0x4200000000000000000000000000000006') return false
+      if (network === 'base' && addr !== '0x4200000000000000000000000000000000006' && addr !== '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913') return false
       return true
     })
+
+    // Combine both lists - both are already network-specific
+    const tokensToCheck = [...new Set([...tokensFromDb, ...knownTokens])]
 
     for (const tokenAddr of tokensToCheck) {
       // Get current balance
