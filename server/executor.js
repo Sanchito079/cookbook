@@ -2295,9 +2295,12 @@ async function createOrdersFromProvisions(network = 'bsc') {
       }
 
       // Use pair_key to determine quote token
-      const [baseAddr, quoteAddr] = provision.pair_key.split('/')
+      // Handle both / and _ separators for backward compatibility
+      const separator = provision.pair_key.includes('/') ? '/' : '_'
+      const [baseAddr, quoteAddr] = provision.pair_key.split(separator)
       if (baseAddr.toLowerCase() !== tokenAddr.toLowerCase()) {
         console.log(`[executor] ${network}: provision pair_key mismatch for ${provision.id}`)
+        console.log(`[executor] ${network}: expected base=${tokenAddr}, got base=${baseAddr}, pair_key=${provision.pair_key}`)
         continue
       }
 
