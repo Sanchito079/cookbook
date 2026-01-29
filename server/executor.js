@@ -1569,8 +1569,21 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
     const settlementContract = network === 'base' ? settlementBase : settlement
     const tx = await settlementContract.matchOrders(buy, sigBuy, sell, sigSell, baseOut, quoteIn)
     console.log(`[executor] ${network}: match tx sent: ${tx.hash}`)
-    const receipt = await tx.wait()
+     const receipt = await tx.wait()
     console.log(`[executor] ${network}: match tx confirmed in block ${receipt.blockNumber}`)
+    
+    // Update order statuses to 'filled' after successful match
+    // This prevents orders from being matched multiple times
+    try {
+      await Promise.all([
+        supabase.from('orders').update({ status: 'filled', updated_at: new Date().toISOString() }).eq('order_id', buyRow.order_id),
+        supabase.from('orders').update({ status: 'filled', updated_at: new Date().toISOString() }).eq('order_id', sellRow.order_id)
+      ])
+      console.log(`[executor] ${network}: updated orders ${buyRow.order_id} and ${sellRow.order_id} to 'filled' status`)
+    } catch (updateError) {
+      console.warn(`[executor] ${network}: failed to update order statuses:`, updateError?.message || updateError)
+    }
+    
     // Persist fill record for UI consumption
     try {
       // Insert into fills table
@@ -2681,6 +2694,7 @@ async function updateCustodialOrderPrices(network = 'bsc') {
           nonce: newOrder.nonce,
           signature,
           order_json: newOrder,
+          status: 'open',  // IMPORTANT: Set status to 'open' for new order
           updated_at: new Date().toISOString()
         })
 
@@ -2763,6 +2777,7 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
 
