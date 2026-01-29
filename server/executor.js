@@ -2122,8 +2122,10 @@ async function runOnce(network = 'bsc') {
 
     // Create orders from liquidity provisions
     await createOrdersFromProvisions(network)
-
+    
     // Update prices for existing custodial orders
+    // IMPORTANT: Run AFTER createOrdersFromProvisions to avoid race condition
+    // where new orders are being cancelled immediately after creation
     await updateCustodialOrderPrices(network)
 
     // First check conditional orders (using current market prices)
