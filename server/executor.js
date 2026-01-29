@@ -2465,6 +2465,24 @@ async function createOrdersFromProvisions(network = 'bsc') {
 
       console.log(`[executor] ${network}: inserting order ${orderId} for provision ${provision.id}, amountIn=${order.amountIn}, amountOutMin=${order.amountOutMin}`)
 
+      // DEBUG: Log order details before insertion
+      console.log(`[executor] ${network}: DEBUG - Creating new order from provision:`, {
+        orderId: orderId,
+        provisionId: provision.id,
+        maker: order.maker,
+        tokenIn: order.tokenIn,
+        tokenOut: order.tokenOut,
+        amountIn: order.amountIn,
+        amountOutMin: order.amountOutMin,
+        price: currentPrice.toString(),
+        nonce: order.nonce,
+        status: 'open',
+        side: 'ask',
+        source: 'custodial',
+        liquidity_provision_id: provision.id,
+        owner_min_price: provision.min_price_per_token
+      })
+
       const { error: insertError } = await supabase.from('orders').insert({
         network,
         order_id: orderId,
@@ -2499,7 +2517,44 @@ async function createOrdersFromProvisions(network = 'bsc') {
       if (insertError) {
         console.warn(`[executor] ${network}: error inserting order ${orderId}:`, insertError.message)
       } else {
+        // DEBUG: Log order details after successful insertion
+        console.log(`[executor] ${network}: DEBUG - Order inserted successfully:`, {
+          orderId: orderId,
+          provisionId: provision.id,
+          status: 'open',
+          price: currentPrice.toString(),
+          amountIn: order.amountIn,
+          amountOutMin: order.amountOutMin
+        })
         console.log(`[executor] ${network}: created custodial order ${orderId} for provision ${provision.id}`)
+        
+        // DEBUG: Verify order status in database after insertion
+        try {
+          const { data: verifyOrder, error: verifyError } = await supabase
+            .from('orders')
+            .select('order_id, status, price, amount_in, amount_out_min')
+            .eq('order_id', orderId)
+            .single()
+          
+          if (verifyError) {
+            console.warn(`[executor] ${network}: DEBUG - Error verifying order ${orderId}:`, verifyError.message)
+          } else {
+            console.log(`[executor] ${network}: DEBUG - Verified order in database:`, {
+              orderId: verifyOrder.order_id,
+              status: verifyOrder.status,
+              price: verifyOrder.price,
+              amount_in: verifyOrder.amount_in,
+              amount_out_min: verifyOrder.amount_out_min
+            })
+            
+            // Check if status was changed after insertion
+            if (verifyOrder.status !== 'open') {
+              console.error(`[executor] ${network}: DEBUG - ERROR: Order status changed from 'open' to '${verifyOrder.status}' after insertion!`)
+            }
+          }
+        } catch (verifyErr) {
+          console.warn(`[executor] ${network}: DEBUG - Exception verifying order ${orderId}:`, verifyErr?.message || verifyErr)
+        }
       }
     }
   } catch (e) {
@@ -2684,21 +2739,6 @@ async function updateCustodialOrderPrices(network = 'bsc') {
           status: 'open',  // IMPORTANT: Set status to 'open' for new order
           updated_at: new Date().toISOString()
         }
-        
-        // DEBUG: Log order details before insertion
-        console.log(`[executor] ${network}: DEBUG - Creating new order with details:`, {
-          orderId: orderId,
-          maker: newOrder.maker,
-          tokenIn: newOrder.tokenIn,
-          tokenOut: newOrder.tokenOut,
-          amountIn: newOrder.amountIn,
-          amountOutMin: newOrder.amountOutMin,
-          price: newPrice.toString(),
-          nonce: newOrder.nonce,
-          status: newOrder.status,
-          oldOrderId: order.order_id,
-          oldStatus: order.status
-        })
 
         const wallet = network === 'base' ? walletBase : walletBSC
         const signature = await signOrder(newOrder, wallet, network)
@@ -2726,21 +2766,51 @@ async function updateCustodialOrderPrices(network = 'bsc') {
           updated_at: new Date().toISOString()
         })
 
+        // DEBUG: Log order details after insertion
+        console.log(`[executor] ${network}: DEBUG - Order inserted into database:`, {
+          orderId: orderId,
+          maker: newOrder.maker,
+          tokenIn: newOrder.tokenIn,
+          tokenOut: newOrder.tokenOut,
+          amountIn: newOrder.amountIn,
+          amountOutMin: newOrder.amountOutMin,
+          price: newPrice.toString(),
+          nonce: newOrder.nonce,
+          status: newOrder.status,
+          orderHash: orderHash,
+          oldOrderId: order.order_id,
+          oldStatus: order.status
+        })
+
         console.log(`[executor] ${network}: updated price for custodial order ${orderId} from ${order.price} to ${newPrice}`)
-      
-      // DEBUG: Log order details after insertion
-      console.log(`[executor] ${network}: DEBUG - Order inserted into database:`, {
-        orderId: orderId,
-        maker: newOrder.maker,
-        tokenIn: newOrder.tokenIn,
-        tokenOut: newOrder.tokenOut,
-        amountIn: newOrder.amountIn,
-        amountOutMin: newOrder.amountOutMin,
-        price: newPrice.toString(),
-        nonce: newOrder.nonce,
-        status: newOrder.status,
-        orderHash: orderHash
-      })
+        
+        // DEBUG: Verify order status in database after insertion
+        try {
+          const { data: verifyOrder, error: verifyError } = await supabase
+            .from('orders')
+            .select('order_id, status, price, amount_in, amount_out_min')
+            .eq('order_id', orderId)
+            .single()
+          
+          if (verifyError) {
+            console.warn(`[executor] ${network}: DEBUG - Error verifying order ${orderId}:`, verifyError.message)
+          } else {
+            console.log(`[executor] ${network}: DEBUG - Verified order in database:`, {
+              orderId: verifyOrder.order_id,
+              status: verifyOrder.status,
+              price: verifyOrder.price,
+              amount_in: verifyOrder.amount_in,
+              amount_out_min: verifyOrder.amount_out_min
+            })
+            
+            // Check if status was changed after insertion
+            if (verifyOrder.status !== 'open') {
+              console.error(`[executor] ${network}: DEBUG - ERROR: Order status changed from 'open' to '${verifyOrder.status}' after insertion!`)
+            }
+          }
+        } catch (verifyErr) {
+          console.warn(`[executor] ${network}: DEBUG - Exception verifying order ${orderId}:`, verifyErr?.message || verifyErr)
+        }
       }
     }
   } catch (e) {
@@ -2819,7 +2889,6 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
-
 
 
 
