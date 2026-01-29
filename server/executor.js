@@ -2684,6 +2684,21 @@ async function updateCustodialOrderPrices(network = 'bsc') {
           status: 'open',  // IMPORTANT: Set status to 'open' for new order
           updated_at: new Date().toISOString()
         }
+        
+        // DEBUG: Log order details before insertion
+        console.log(`[executor] ${network}: DEBUG - Creating new order with details:`, {
+          orderId: orderId,
+          maker: newOrder.maker,
+          tokenIn: newOrder.tokenIn,
+          tokenOut: newOrder.tokenOut,
+          amountIn: newOrder.amountIn,
+          amountOutMin: newOrder.amountOutMin,
+          price: newPrice.toString(),
+          nonce: newOrder.nonce,
+          status: newOrder.status,
+          oldOrderId: order.order_id,
+          oldStatus: order.status
+        })
 
         const wallet = network === 'base' ? walletBase : walletBSC
         const signature = await signOrder(newOrder, wallet, network)
@@ -2712,6 +2727,20 @@ async function updateCustodialOrderPrices(network = 'bsc') {
         })
 
         console.log(`[executor] ${network}: updated price for custodial order ${orderId} from ${order.price} to ${newPrice}`)
+      
+      // DEBUG: Log order details after insertion
+      console.log(`[executor] ${network}: DEBUG - Order inserted into database:`, {
+        orderId: orderId,
+        maker: newOrder.maker,
+        tokenIn: newOrder.tokenIn,
+        tokenOut: newOrder.tokenOut,
+        amountIn: newOrder.amountIn,
+        amountOutMin: newOrder.amountOutMin,
+        price: newPrice.toString(),
+        nonce: newOrder.nonce,
+        status: newOrder.status,
+        orderHash: orderHash
+      })
       }
     }
   } catch (e) {
