@@ -2709,6 +2709,15 @@ async function updateCustodialOrderPrices(network = 'bsc') {
         const minPrice = Number(order.liquidity_provisions.min_price_per_token)
         if (newPrice <= minPrice) continue
 
+        // Skip price updates for orders that were just created (within the last 30 seconds)
+        // This prevents orders from being cancelled immediately after creation due to minor price fluctuations
+        const orderCreatedAt = new Date(order.created_at)
+        const timeSinceCreation = Date.now() - orderCreatedAt.getTime()
+        if (timeSinceCreation < 30000) {
+          console.log(`[executor] ${network}: skipping price update for order ${order.order_id} (created ${timeSinceCreation}ms ago)`)
+          continue
+        }
+
         // Cancel old order
         await supabase
           .from('orders')
