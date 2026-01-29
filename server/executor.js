@@ -2649,7 +2649,11 @@ async function updateCustodialOrderPrices(network = 'bsc') {
         const inDecimals = await fetchTokenDecimals(order.token_in, network)
         const outDecimals = await fetchTokenDecimals(order.token_out, network)
         const amountIn = toBN(order.amount_in)
-        const newAmountOutMin = (amountIn * toBN(Math.floor(newPrice * 10 ** (outDecimals + 18)).toString())) / (10n ** BigInt(inDecimals + 18))
+        // Calculate minimum output amount: amountIn * price, adjusted for decimals
+        // price is quote per base (e.g., 0.6 USDT per ASTER)
+        // amountIn is in base token units (e.g., 1 ASTER = 10^18)
+        // amountOutMin should be in quote token units (e.g., 0.6 USDT = 0.6 * 10^18)
+        const newAmountOutMin = (amountIn * BigInt(Math.floor(newPrice * 10 ** outDecimals))) / (10n ** BigInt(inDecimals))
 
         const newOrder = { ...order.order_json }
         newOrder.amountOutMin = newAmountOutMin.toString()
@@ -2759,7 +2763,6 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
-
 
 
 
