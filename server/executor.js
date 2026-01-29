@@ -2667,10 +2667,21 @@ async function updateCustodialOrderPrices(network = 'bsc') {
         // amountIn is in base token units (e.g., 1 ASTER = 10^18)
         // amountOutMin should be in quote token units (e.g., 0.6 USDT = 0.6 * 10^18)
         const newAmountOutMin = (amountIn * BigInt(Math.floor(newPrice * 10 ** outDecimals))) / (10n ** BigInt(inDecimals))
-
-        const newOrder = { ...order.order_json }
-        newOrder.amountOutMin = newAmountOutMin.toString()
-        newOrder.nonce = (Number(order.nonce) + 1).toString()
+        
+        // Create clean new order object (don't spread old order to avoid copying cancelled status)
+        const newOrder = {
+          maker: order.order_json.maker,
+          tokenIn: order.order_json.tokenIn,
+          tokenOut: order.order_json.tokenOut,
+          amountIn: order.order_json.amountIn,
+          amountOutMin: newAmountOutMin.toString(),
+          expiration: order.order_json.expiration,
+          nonce: (Number(order.nonce) + 1).toString(),
+          receiver: order.order_json.receiver,
+          salt: order.order_json.salt,
+          status: 'open',  // IMPORTANT: Set status to 'open' for new order
+          updated_at: new Date().toISOString()
+        }
 
         const wallet = network === 'base' ? walletBase : walletBSC
         const signature = await signOrder(newOrder, wallet, network)
