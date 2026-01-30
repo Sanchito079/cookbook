@@ -2096,33 +2096,31 @@ async function tryMatchPairSolana(base, quote, bids, asks) {
     return false
   }
 
-  // Cap amounts
-  let baseOut = minOut(buyRemQuote, buy.amountIn, buy.amountOutMin)
-  if (baseOut > sellRemBase) baseOut = sellRemBase
-  if (baseOut <= 0n) return false
+      // Cap amounts
+      // PROFESSIONAL FILL ALGORITHM - SINGLE CALCULATION
+      // 1) execution price = maker price (ask price)
+      const execPrice = pAsk  // quote per base, 1e18 scaled
 
-  let quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-  if (quoteNeededBySell > buyRemQuote) {
-    baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin
-    if (baseOut <= 0n) return false
-    quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-    if (quoteNeededBySell > buyRemQuote) return false
-  }
+      // 2) max base buyer can afford
+      const maxBaseByBuyer = (buyRemQuote * BigInt(1000000000000000000)) / execPrice
 
-  const buyerMinBaseForQuoteIn = minOut(quoteNeededBySell, buy.amountIn, buy.amountOutMin)
-  if (buyerMinBaseForQuoteIn < baseOut) {
-    baseOut = buyerMinBaseForQuoteIn
-    if (baseOut <= 0n) return false
-    quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-    if (quoteNeededBySell > buyRemQuote) {
-      baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin
+      // 3) max base seller can sell
+      const maxBaseBySeller = sellRemBase
+
+      // 4) final fill - maximum possible fill
+      let baseOut = maxBaseByBuyer < maxBaseBySeller ? maxBaseByBuyer : maxBaseBySeller
+
       if (baseOut <= 0n) return false
-      quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-      if (quoteNeededBySell > buyRemQuote) return false
-    }
-  }
 
-  const quoteIn = quoteNeededBySell
+      // 5) quote used
+      const quoteIn = (baseOut * execPrice) / BigInt(1000000000000000000)
+
+      // 6) enforce minOut ONCE - reject if constraints not met
+      // buyer constraint
+      if (baseOut < buy.amountOutMin) return false
+
+      // seller constraint
+      if (quoteIn < sell.amountOutMin) return false
 
   // Use Jupiter to get quote and check if it meets the requirements
   try {
@@ -2983,6 +2981,7 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
 
