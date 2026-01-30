@@ -1581,18 +1581,6 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
      const receipt = await tx.wait()
     console.log(`[executor] ${network}: match tx confirmed in block ${receipt.blockNumber}`)
     
-    // Update order statuses to 'filled' after successful match
-    // This prevents orders from being matched multiple times
-    try {
-      await Promise.all([
-        supabase.from('orders').update({ status: 'filled', updated_at: new Date().toISOString() }).eq('order_id', buyRow.order_id),
-        supabase.from('orders').update({ status: 'filled', updated_at: new Date().toISOString() }).eq('order_id', sellRow.order_id)
-      ])
-      console.log(`[executor] ${network}: updated orders ${buyRow.order_id} and ${sellRow.order_id} to 'filled' status`)
-    } catch (updateError) {
-      console.warn(`[executor] ${network}: failed to update order statuses:`, updateError?.message || updateError)
-    }
-    
     // Persist fill record for UI consumption
     try {
       // Insert into fills table
