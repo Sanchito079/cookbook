@@ -633,7 +633,7 @@ async function fetchOpenOrdersAll(network = 'bsc') {
     .from('orders')
     .select('*')
     .eq('network', network)
-    .eq('status', 'open')
+    .in('status', ['open', 'partially_filled'])
     .gt('remaining', '0')
     .order('updated_at', { ascending: true })
     .limit(500)
@@ -646,7 +646,7 @@ async function fetchOpenOrdersCrossChain() {
     .from('cross_chain_orders')
     .select('*')
     .eq('network', 'crosschain')
-    .eq('status', 'open')
+    .in('status', ['open', 'partially_filled'])
     .gt('remaining', '0')
     .order('updated_at', { ascending: true })
     .limit(500)
@@ -853,7 +853,23 @@ async function updateOrderRemaining(orderId, newRemaining, newStatus, network = 
   try {
     const table = network === 'crosschain' ? 'cross_chain_orders' : 'orders'
     const patch = { remaining: newRemaining.toString(), updated_at: new Date().toISOString() }
-    if (newStatus) patch.status = newStatus
+    
+    // Only update status if explicitly provided and it's not 'open' for partially filled orders
+    // Partially filled orders should remain 'processing' or become 'partially_filled'
+    if (newStatus) {
+      if (newStatus === 'open') {
+        // Don't downgrade from 'processing' to 'open' - this breaks reservation logic
+        // Instead, use 'partially_filled' for orders that still have remaining amount
+        if (newRemaining > 0n) {
+          patch.status = 'partially_filled'
+        } else {
+          patch.status = 'filled'
+        }
+      } else {
+        patch.status = newStatus
+      }
+    }
+    
     const { error } = await supabase
       .from(table)
       .update(patch)
@@ -886,16 +902,21 @@ async function reserveOrder(orderId, network = 'bsc') {
   const nowIso = new Date().toISOString()
   const statusUpdate = network === 'crosschain' ? {} : { status: 'processing' }
   try {
+    // Allow reservation of orders that are 'open' or 'partially_filled'
     const { data, error } = await supabase
       .from(table)
       .update({ ...statusUpdate, updated_at: nowIso })
       .eq('order_id', orderId)
-      .eq('status', 'open')
+      .in('status', ['open', 'partially_filled'])
       .gt('remaining', '0')
       .select('order_id, status, remaining')
       .limit(1)
     if (error) throw error
-    return Array.isArray(data) && data.length === 1
+    const success = Array.isArray(data) && data.length === 1
+    if (!success) {
+      console.warn(`[executor] reserveOrder failed for ${orderId}: order not found, already reserved, or has no remaining`)
+    }
+    return success
   } catch (e) {
     console.warn('[executor] reserveOrder failed:', e?.message || e)
     return false
@@ -1826,16 +1847,30 @@ async function runCrossChain() {
       }
 
       console.log(`[executor] cross-chain: checking pair ${base}/${quote} for cross-chain matches`)
-      try {
-        const done = await tryMatchPairCrossChain(base, quote, bids, asks)
-        if (done) {
-          console.log(`[executor] cross-chain: successfully matched cross-chain pair ${base}/${quote}`)
-          return // one match per tick
-        } else {
-          console.log(`[executor] cross-chain: no matches found for cross-chain pair ${base}/${quote}`)
+      
+      // Continue matching until no more matches are possible
+      let matchCount = 0
+      const maxMatchesPerPair = 10 // Safety limit to prevent infinite loops
+      
+      while (bids.length > 0 && asks.length > 0 && matchCount < maxMatchesPerPair) {
+        try {
+          const done = await tryMatchPairCrossChain(base, quote, bids, asks)
+          if (done) {
+            matchCount++
+            console.log(`[executor] cross-chain: successfully matched cross-chain pair ${base}/${quote} (match #${matchCount})`)
+            // Continue to next iteration with updated bids/asks arrays
+          } else {
+            console.log(`[executor] cross-chain: no more matches found for cross-chain pair ${base}/${quote}`)
+            break
+          }
+        } catch (e) {
+          console.error(`[executor] cross-chain: match error for ${base}/${quote}:`, e?.message || e)
+          break
         }
-      } catch (e) {
-        console.error(`[executor] cross-chain: match error for ${base}/${quote}:`, e?.message || e)
+      }
+      
+      if (matchCount >= maxMatchesPerPair) {
+        console.log(`[executor] cross-chain: reached max matches per pair (${maxMatchesPerPair}) for ${base}/${quote}`)
       }
     }
 
@@ -1869,7 +1904,8 @@ async function processOrders(rows, network = 'bsc') {
   console.log(`[executor] ${network}: organized into ${byPair.size} trading pairs`)
 
   let matchesThisCycle = 0
-  const maxMatchesPerCycle = 5
+  const maxMatchesPerCycle = 50 // Increased to allow more matches per cycle
+  
   for (const [pairKey, { base, quote, bids, asks }] of byPair.entries()) {
     console.log(`[executor] ${network}: pair ${pairKey} - bids: ${bids.length}, asks: ${asks.length}`)
 
@@ -1879,20 +1915,36 @@ async function processOrders(rows, network = 'bsc') {
     }
 
     console.log(`[executor] ${network}: checking pair ${base}/${quote} for matches`)
-    try {
-      const done = await tryMatchPairOnce(base, quote, bids, asks, network)
-      if (done) {
-        matchesThisCycle++
-        console.log(`[executor] ${network}: successfully matched pair ${base}/${quote} (${matchesThisCycle}/${maxMatchesPerCycle})`)
-        if (matchesThisCycle >= maxMatchesPerCycle) {
-          console.log(`[executor] ${network}: reached max matches per cycle (${maxMatchesPerCycle}), stopping`)
+    
+    // Continue matching until no more matches are possible
+    let pairMatchCount = 0
+    const maxMatchesPerPair = 20 // Safety limit per pair
+    
+    while (bids.length > 0 && asks.length > 0 && matchesThisCycle < maxMatchesPerCycle && pairMatchCount < maxMatchesPerPair) {
+      try {
+        const done = await tryMatchPairOnce(base, quote, bids, asks, network)
+        if (done) {
+          matchesThisCycle++
+          pairMatchCount++
+          console.log(`[executor] ${network}: successfully matched pair ${base}/${quote} (cycle match #${matchesThisCycle}, pair match #${pairMatchCount})`)
+          // Continue to next iteration with updated bids/asks arrays
+        } else {
+          console.log(`[executor] ${network}: no more matches found for pair ${base}/${quote}`)
           break
         }
-      } else {
-        console.log(`[executor] ${network}: no matches found for pair ${base}/${quote}`)
+      } catch (e) {
+        console.error(`[executor] ${network}: match error for ${base}/${quote}:`, e?.message || e)
+        break
       }
-    } catch (e) {
-      console.error(`[executor] ${network}: match error for ${base}/${quote}:`, e?.message || e)
+    }
+    
+    if (pairMatchCount >= maxMatchesPerPair) {
+      console.log(`[executor] ${network}: reached max matches per pair (${maxMatchesPerPair}) for ${base}/${quote}`)
+    }
+    
+    if (matchesThisCycle >= maxMatchesPerCycle) {
+      console.log(`[executor] ${network}: reached max matches per cycle (${maxMatchesPerCycle}), stopping`)
+      break
     }
   }
 
@@ -2931,7 +2983,6 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
-
 
 
 
