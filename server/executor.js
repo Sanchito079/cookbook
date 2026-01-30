@@ -2710,7 +2710,7 @@ async function updateCustodialOrderPrices(network = 'bsc') {
         if (newPrice <= minPrice) continue
 
         // Skip price updates for orders that were just created (within the last 30 seconds)
-        // This prevents orders from being cancelled immediately after creation due to minor price fluctuations
+        // This prevents orders from being updated immediately after creation due to minor price fluctuations
         const orderCreatedAt = new Date(order.created_at)
         const timeSinceCreation = Date.now() - orderCreatedAt.getTime()
         if (timeSinceCreation < 30000) {
@@ -2718,13 +2718,8 @@ async function updateCustodialOrderPrices(network = 'bsc') {
           continue
         }
 
-        // Cancel old order
-        await supabase
-          .from('orders')
-          .update({ status: 'cancelled', updated_at: new Date().toISOString() })
-          .eq('order_id', order.order_id)
-
-        // Create new order with updated price
+        // Update existing order in place instead of cancelling and creating new one
+        // This keeps the order 'open' and just updates the price, amountOutMin, nonce, and signature
         const inDecimals = await fetchTokenDecimals(order.token_in, network)
         const outDecimals = await fetchTokenDecimals(order.token_out, network)
         const amountIn = toBN(order.amount_in)
@@ -2734,8 +2729,8 @@ async function updateCustodialOrderPrices(network = 'bsc') {
         // amountOutMin should be in quote token units (e.g., 0.6 USDT = 0.6 * 10^18)
         const newAmountOutMin = (amountIn * BigInt(Math.floor(newPrice * 10 ** outDecimals))) / (10n ** BigInt(inDecimals))
         
-        // Create clean new order object (don't spread old order to avoid copying cancelled status)
-        const newOrder = {
+        // Create updated order object with new price and incremented nonce
+        const updatedOrder = {
           maker: order.order_json.maker,
           tokenIn: order.order_json.tokenIn,
           tokenOut: order.order_json.tokenOut,
@@ -2745,80 +2740,68 @@ async function updateCustodialOrderPrices(network = 'bsc') {
           nonce: (Number(order.nonce) + 1).toString(),
           receiver: order.order_json.receiver,
           salt: order.order_json.salt,
-          status: 'open',  // IMPORTANT: Set status to 'open' for new order
+          status: 'open',  // IMPORTANT: Keep status as 'open'
           updated_at: new Date().toISOString()
         }
 
         const wallet = network === 'base' ? walletBase : walletBSC
-        const signature = await signOrder(newOrder, wallet, network)
+        const signature = await signOrder(updatedOrder, wallet, network)
 
-        const orderId = crypto.randomUUID()
-        const orderHash = crypto.createHash('sha1').update(JSON.stringify({
+        const newOrderHash = crypto.createHash('sha1').update(JSON.stringify({
           network,
-          maker: newOrder.maker.toLowerCase(),
-          nonce: newOrder.nonce,
-          tokenIn: newOrder.tokenIn.toLowerCase(),
-          tokenOut: newOrder.tokenOut.toLowerCase(),
-          salt: newOrder.salt
+          maker: updatedOrder.maker.toLowerCase(),
+          nonce: updatedOrder.nonce,
+          tokenIn: updatedOrder.tokenIn.toLowerCase(),
+          tokenOut: updatedOrder.tokenOut.toLowerCase(),
+          salt: updatedOrder.salt
         })).digest('hex')
 
-        await supabase.from('orders').insert({
-          ...order,
-          order_id: orderId,
-          order_hash: orderHash,
-          amount_out_min: newAmountOutMin.toString(),
-          price: newPrice.toString(),
-          nonce: newOrder.nonce,
-          signature,
-          order_json: newOrder,
-          status: 'open',  // IMPORTANT: Set status to 'open' for new order
-          updated_at: new Date().toISOString()
-        })
+        // Update existing order in place - keep it 'open' and just update price, amountOutMin, nonce, and signature
+        const { error: updateError } = await supabase
+          .from('orders')
+          .update({
+            amount_out_min: newAmountOutMin.toString(),
+            price: newPrice.toString(),
+            nonce: updatedOrder.nonce,
+            signature,
+            order_json: updatedOrder,
+            order_hash: newOrderHash,
+            updated_at: new Date().toISOString()
+          })
+          .eq('order_id', order.order_id)
 
-        // DEBUG: Log order details after insertion
-        console.log(`[executor] ${network}: DEBUG - Order inserted into database:`, {
-          orderId: orderId,
-          maker: newOrder.maker,
-          tokenIn: newOrder.tokenIn,
-          tokenOut: newOrder.tokenOut,
-          amountIn: newOrder.amountIn,
-          amountOutMin: newOrder.amountOutMin,
-          price: newPrice.toString(),
-          nonce: newOrder.nonce,
-          status: newOrder.status,
-          orderHash: orderHash,
-          oldOrderId: order.order_id,
-          oldStatus: order.status
-        })
-
-        console.log(`[executor] ${network}: updated price for custodial order ${orderId} from ${order.price} to ${newPrice}`)
-        
-        // DEBUG: Verify order status in database after insertion
-        try {
-          const { data: verifyOrder, error: verifyError } = await supabase
-            .from('orders')
-            .select('order_id, status, price, amount_in, amount_out_min')
-            .eq('order_id', orderId)
-            .single()
+        if (updateError) {
+          console.warn(`[executor] ${network}: error updating order ${order.order_id}:`, updateError.message)
+        } else {
+          console.log(`[executor] ${network}: updated price for custodial order ${order.order_id} from ${order.price} to ${newPrice}`)
           
-          if (verifyError) {
-            console.warn(`[executor] ${network}: DEBUG - Error verifying order ${orderId}:`, verifyError.message)
-          } else {
-            console.log(`[executor] ${network}: DEBUG - Verified order in database:`, {
-              orderId: verifyOrder.order_id,
-              status: verifyOrder.status,
-              price: verifyOrder.price,
-              amount_in: verifyOrder.amount_in,
-              amount_out_min: verifyOrder.amount_out_min
-            })
+          // DEBUG: Verify order status in database after update
+          try {
+            const { data: verifyOrder, error: verifyError } = await supabase
+              .from('orders')
+              .select('order_id, status, price, amount_in, amount_out_min')
+              .eq('order_id', order.order_id)
+              .single()
             
-            // Check if status was changed after insertion
-            if (verifyOrder.status !== 'open') {
-              console.error(`[executor] ${network}: DEBUG - ERROR: Order status changed from 'open' to '${verifyOrder.status}' after insertion!`)
+            if (verifyError) {
+              console.warn(`[executor] ${network}: DEBUG - Error verifying order ${order.order_id}:`, verifyError.message)
+            } else {
+              console.log(`[executor] ${network}: DEBUG - Verified order in database:`, {
+                orderId: verifyOrder.order_id,
+                status: verifyOrder.status,
+                price: verifyOrder.price,
+                amount_in: verifyOrder.amount_in,
+                amount_out_min: verifyOrder.amount_out_min
+              })
+              
+              // Check if status was changed after update
+              if (verifyOrder.status !== 'open') {
+                console.error(`[executor] ${network}: DEBUG - ERROR: Order status changed from 'open' to '${verifyOrder.status}' after update!`)
+              }
             }
+          } catch (verifyErr) {
+            console.warn(`[executor] ${network}: DEBUG - Exception verifying order ${order.order_id}:`, verifyErr?.message || verifyErr)
           }
-        } catch (verifyErr) {
-          console.warn(`[executor] ${network}: DEBUG - Exception verifying order ${orderId}:`, verifyErr?.message || verifyErr)
         }
       }
     }
@@ -2898,6 +2881,7 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
 
