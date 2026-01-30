@@ -1478,49 +1478,67 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   // Convert availBuy (in quote for buy order) to base capacity via buy ratio (floor)
   const baseFromBuyAvail = minOut(diag.availBuy, buy.amountIn, buy.amountOutMin)
   const baseFromSellAvail = diag.availSell // already base
+  console.log(`[executor] ${network}: sizing: baseFromBuyAvail=${baseFromBuyAvail.toString()}, baseFromSellAvail=${baseFromSellAvail.toString()}`)
 
   // Start strictly from buyer's quote budget in base units (floor)
   let baseOut = minOut(buyRemQuote, buy.amountIn, buy.amountOutMin)
+  console.log(`[executor] ${network}: sizing: initial baseOut from buyer quote -> ${baseOut.toString()} (buyRemQuote=${buyRemQuote.toString()}, buy.amountIn=${buy.amountIn.toString()}, buy.amountOutMin=${buy.amountOutMin.toString()})`)
   if (baseOut <= 0n) {
     console.log('[executor] skip: buyer budget insufficient', { buyRemQuote: buyRemQuote.toString(), buyId: buyRow.order_id })
     return false
   }
 
-  // Cap by seller remaining and on-chain availabilities
-  // IMPORTANT: Fill the MAXIMUM amount available in one transaction
-  // This prevents orders from being split into multiple small fills
-  if (baseOut > sellRemBase) baseOut = sellRemBase
-  if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
-  if (baseOut > baseFromBuyAvail) baseOut = baseFromBuyAvail
+  // Cap by seller remaining and on-chain availabilities - track each cap step
+  if (baseOut > sellRemBase) {
+    console.log(`[executor] ${network}: sizing: capping by sellRemBase (${sellRemBase.toString()}) from ${baseOut.toString()}`)
+    baseOut = sellRemBase
+  }
+  if (baseOut > baseFromSellAvail) {
+    console.log(`[executor] ${network}: sizing: capping by baseFromSellAvail (${baseFromSellAvail.toString()}) from ${baseOut.toString()}`)
+    baseOut = baseFromSellAvail
+  }
+  if (baseOut > baseFromBuyAvail) {
+    console.log(`[executor] ${network}: sizing: capping by baseFromBuyAvail (${baseFromBuyAvail.toString()}) from ${baseOut.toString()}`)
+    baseOut = baseFromBuyAvail
+  }
   if (baseOut <= 0n) return false
 
   // Seller requires at least this much quote for that base, use ceil to avoid underpayment
   let quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
+  console.log(`[executor] ${network}: sizing: quoteNeededBySell=${quoteNeededBySell.toString()} for baseOut=${baseOut.toString()} (sell.amountOutMin=${sell.amountOutMin.toString()}, sell.amountIn=${sell.amountIn.toString()})`)
 
   // If buyer can't cover, reduce baseOut using seller ratio inverted (floor), then recompute ceil quote
   if (quoteNeededBySell > buyRemQuote) {
-    baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin // floor
+    const newBaseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin // floor
+    console.log(`[executor] ${network}: sizing: buyer can't cover, shrinking baseOut from ${baseOut.toString()} to ${newBaseOut.toString()} using seller ratio`)
+    baseOut = newBaseOut
     if (baseOut <= 0n) return false
-    if (baseOut > sellRemBase) baseOut = sellRemBase
-    if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
-    if (baseOut > baseFromBuyAvail) baseOut = baseFromBuyAvail
+    if (baseOut > sellRemBase) { console.log(`[executor] ${network}: sizing: re-cap by sellRemBase ${sellRemBase.toString()}`); baseOut = sellRemBase }
+    if (baseOut > baseFromSellAvail) { console.log(`[executor] ${network}: sizing: re-cap by baseFromSellAvail ${baseFromSellAvail.toString()}`); baseOut = baseFromSellAvail }
+    if (baseOut > baseFromBuyAvail) { console.log(`[executor] ${network}: sizing: re-cap by baseFromBuyAvail ${baseFromBuyAvail.toString()}`); baseOut = baseFromBuyAvail }
     if (baseOut <= 0n) return false
     quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
+    console.log(`[executor] ${network}: sizing: recomputed quoteNeededBySell=${quoteNeededBySell.toString()} vs buyRemQuote=${buyRemQuote.toString()}`)
     if (quoteNeededBySell > buyRemQuote) return false
   }
 
-  // Enforce buyer's min base for the chosen quote (floor)
+  // Enforce buyer's min base for the chosen quote (floor) without shrinking baseOut
   const buyerMinBaseForQuoteIn = minOut(quoteNeededBySell, buy.amountIn, buy.amountOutMin)
-  if (buyerMinBaseForQuoteIn < baseOut) {
-    baseOut = buyerMinBaseForQuoteIn
-    if (baseOut <= 0n) return false
-    quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-    if (quoteNeededBySell > buyRemQuote) {
-      // Final shrink to satisfy seller given buyer budget
-      baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin // floor
+  console.log(`[executor] ${network}: sizing: buyerMinBaseForQuoteIn=${buyerMinBaseForQuoteIn.toString()} for chosen quoteIn=${quoteNeededBySell.toString()}`)
+  if (baseOut < buyerMinBaseForQuoteIn) {
+    // Edge case: increase quote to satisfy buyer's minimum for the chosen baseOut
+    const quoteMinByBuyer = ceilDiv(baseOut * buy.amountIn, buy.amountOutMin)
+    console.log(`[executor] ${network}: sizing: baseOut below buyer min; raising quoteIn to satisfy buyer: ${quoteNeededBySell.toString()} -> ${quoteMinByBuyer.toString()}`)
+    if (quoteMinByBuyer > buyRemQuote) {
+      // If buyer cannot cover at their ratio, shrink baseOut to what buyer can cover at buyer ratio
+      const shrinkBase = (buyRemQuote * buy.amountOutMin) / buy.amountIn // floor
+      console.log(`[executor] ${network}: sizing: buyer cannot cover quoteMinByBuyer; shrinking baseOut to buyer-coverable: ${baseOut.toString()} -> ${shrinkBase.toString()}`)
+      baseOut = shrinkBase
       if (baseOut <= 0n) return false
       quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
       if (quoteNeededBySell > buyRemQuote) return false
+    } else {
+      quoteNeededBySell = quoteMinByBuyer
     }
   }
 
@@ -2884,7 +2902,6 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
-
 
 
 
