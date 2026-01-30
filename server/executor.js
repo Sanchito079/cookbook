@@ -1487,6 +1487,8 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   }
 
   // Cap by seller remaining and on-chain availabilities
+  // IMPORTANT: Fill the MAXIMUM amount available in one transaction
+  // This prevents orders from being split into multiple small fills
   if (baseOut > sellRemBase) baseOut = sellRemBase
   if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
   if (baseOut > baseFromBuyAvail) baseOut = baseFromBuyAvail
@@ -1523,6 +1525,17 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   }
 
   const quoteIn = quoteNeededBySell
+
+  // Dust guard to avoid micro-fills and surface unit mismatches
+  let baseDec = 18, quoteDec = 18
+  try { baseDec = await fetchTokenDecimals(base, network) } catch {}
+  try { quoteDec = await fetchTokenDecimals(quote, network) } catch {}
+  const baseDust = 1n // smallest unit thresholds; adjust as policy if needed
+  const quoteDust = 1n
+  if (baseOut < baseDust || quoteIn < quoteDust) {
+    console.log(`[executor] ${network}: skipping dust-sized match for ${base}/${quote} (baseOut=${baseOut.toString()} in 10^${baseDec}, quoteIn=${quoteIn.toString()} in 10^${quoteDec}) - likely unit mismatch`)
+    return false
+  }
 
   // Preflight diagnostics (reuse diag)
   const pre = {
@@ -1572,17 +1585,7 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
      const receipt = await tx.wait()
     console.log(`[executor] ${network}: match tx confirmed in block ${receipt.blockNumber}`)
     
-    // Update order statuses to 'filled' after successful match
-    // This prevents orders from being matched multiple times
-    try {
-      await Promise.all([
-        supabase.from('orders').update({ status: 'filled', updated_at: new Date().toISOString() }).eq('order_id', buyRow.order_id),
-        supabase.from('orders').update({ status: 'filled', updated_at: new Date().toISOString() }).eq('order_id', sellRow.order_id)
-      ])
-      console.log(`[executor] ${network}: updated orders ${buyRow.order_id} and ${sellRow.order_id} to 'filled' status`)
-    } catch (updateError) {
-      console.warn(`[executor] ${network}: failed to update order statuses:`, updateError?.message || updateError)
-    }
+    // Rely on updateOrderRemaining below to set correct status based on remaining
     
     // Persist fill record for UI consumption
     try {
