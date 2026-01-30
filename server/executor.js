@@ -1120,6 +1120,10 @@ async function tryMatchPairCrossChain(base, quote, bids, asks) {
     return false
   }
 
+  // Store original indices for removal from in-memory arrays (AFTER sorting)
+  const bestBidIndex = bids.findIndex(b => b.order_id === bestBid.order_id)
+  const bestAskIndex = asks.findIndex(a => a.order_id === bestAsk.order_id)
+
   // Skip self-trading
   if (bestBid.maker === bestAsk.maker) {
     console.log(`[executor] cross-chain: skipping ${base}/${quote} - same maker (${bestBid.maker})`)
@@ -1367,6 +1371,30 @@ async function tryMatchPairCrossChain(base, quote, bids, asks) {
     await updateOrderRemaining(buyRow.order_id, newBuyRem, newBuyRem === 0n ? 'filled' : 'open', buyRow.network)
     await updateOrderRemaining(sellRow.order_id, newSellRem, newSellRem === 0n ? 'filled' : 'open', sellRow.network)
 
+    // Remove matched orders from in-memory arrays to prevent re-matching
+    if (bestBidIndex >= 0 && bestBidIndex < bids.length) {
+      if (newBuyRem === 0n) {
+        // Fully filled - remove from array
+        bids.splice(bestBidIndex, 1)
+        console.log(`[executor] cross-chain: removed fully filled buy order ${buyRow.order_id} from in-memory bids`)
+      } else {
+        // Partially filled - update remaining amount in array
+        bids[bestBidIndex].remaining = newBuyRem.toString()
+        console.log(`[executor] cross-chain: updated partially filled buy order ${buyRow.order_id} remaining to ${newBuyRem.toString()}`)
+      }
+    }
+    if (bestAskIndex >= 0 && bestAskIndex < asks.length) {
+      if (newSellRem === 0n) {
+        // Fully filled - remove from array
+        asks.splice(bestAskIndex, 1)
+        console.log(`[executor] cross-chain: removed fully filled sell order ${sellRow.order_id} from in-memory asks`)
+      } else {
+        // Partially filled - update remaining amount in array
+        asks[bestAskIndex].remaining = newSellRem.toString()
+        console.log(`[executor] cross-chain: updated partially filled sell order ${sellRow.order_id} remaining to ${newSellRem.toString()}`)
+      }
+    }
+
     return true
 
   } catch (e) {
@@ -1424,6 +1452,10 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
     console.log(`[executor] ${network}: no best bid or ask available for ${base}/${quote}`)
     return false
   }
+
+  // Store original indices for removal from in-memory arrays
+  const bestBidIndex = bids.findIndex(b => b.order_id === bestBid.order_id)
+  const bestAskIndex = asks.findIndex(a => a.order_id === bestAsk.order_id)
 
   // Skip self-trading
   if (bestBid.maker === bestAsk.maker) {
@@ -1713,6 +1745,27 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   const newSellRem = sellRemBase - baseOut
   await updateOrderRemaining(buyRow.order_id, newBuyRem, newBuyRem === 0n ? 'filled' : 'open', network)
   await updateOrderRemaining(sellRow.order_id, newSellRem, newSellRem === 0n ? 'filled' : 'open', network)
+  
+  // CRITICAL: Remove matched orders from in-memory arrays to prevent re-matching
+  // This ensures atomic max-fill execution and prevents micro-fills
+  if (newBuyRem === 0n && bestBidIndex !== -1) {
+    bids.splice(bestBidIndex, 1)
+    console.log(`[executor] ${network}: removed fully filled buy order ${buyRow.order_id} from in-memory bids`)
+  } else if (bestBidIndex !== -1) {
+    // Update the in-memory order with new remaining amount
+    bids[bestBidIndex].remaining = newBuyRem.toString()
+    console.log(`[executor] ${network}: updated partially filled buy order ${buyRow.order_id} remaining to ${newBuyRem.toString()}`)
+  }
+  
+  if (newSellRem === 0n && bestAskIndex !== -1) {
+    asks.splice(bestAskIndex, 1)
+    console.log(`[executor] ${network}: removed fully filled sell order ${sellRow.order_id} from in-memory asks`)
+  } else if (bestAskIndex !== -1) {
+    // Update the in-memory order with new remaining amount
+    asks[bestAskIndex].remaining = newSellRem.toString()
+    console.log(`[executor] ${network}: updated partially filled sell order ${sellRow.order_id} remaining to ${newSellRem.toString()}`)
+  }
+  
   // No need to release explicitly; status is set by updateOrderRemaining
   return true
 }
