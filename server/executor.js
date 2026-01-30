@@ -377,6 +377,30 @@ function classifyRowSide(base, quote, r) {
   return null
 }
 
+
+function sortOrdersByPriceTime(orders, isBid) {
+  return orders.sort((a, b) => {
+    const priceA = isBid ? priceBid(a) : priceAsk(a)
+    const priceB = isBid ? priceBid(b) : priceAsk(b)
+    
+    if (priceA === null && priceB === null) return 0
+    if (priceA === null) return 1
+    if (priceB === null) return -1
+    
+    // Compare prices using proper operators for BigInt
+    if (priceA !== priceB) {
+      // For bids: higher price first (return -1 if A < B)
+      // For asks: lower price first (return 1 if A > B)
+      return isBid ? -1 : 1
+    }
+    
+    // Price-time priority: earlier orders first
+    const timeA = new Date(a.created_at || a.updated_at)
+    const timeB = new Date(b.created_at || b.updated_at)
+    return timeA - timeB
+  })
+}
+
 function getNetworkForToken(address) {
   const addr = (address || '').toLowerCase()
   if (addr === '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c') return 'bsc' // WBNB
@@ -1389,29 +1413,12 @@ async function tryMatchPairCrossChain(base, quote, bids, asks) {
 async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   console.log(`[executor] ${network}: sorting ${bids.length} bids and ${asks.length} asks for ${base}/${quote}`)
 
-  bids.sort((a, b) => {
-    const pb = priceBid(b)
-    const pa = priceBid(a)
-    if (pb === null && pa === null) return 0
-    if (pb === null) return 1
-    if (pa === null) return -1
-    if (pb !== pa) return Number(pb - pa)
-    // same price, earlier time first
-    return new Date(a.created_at || a.updated_at) - new Date(b.created_at || b.updated_at)
-  }) // highest bid first, then earliest time
-  asks.sort((a, b) => {
-    const pa = priceAsk(a)
-    const pb = priceAsk(b)
-    if (pa === null && pb === null) return 0
-    if (pa === null) return 1
-    if (pb === null) return -1
-    if (pa !== pb) return Number(pa - pb)
-    // same price, earlier time first
-    return new Date(a.created_at || a.updated_at) - new Date(b.created_at || b.updated_at)
-  }) // lowest ask first, then earliest time
+  // Sort orders with price-time priority
+  const sortedBids = sortOrdersByPriceTime(bids, true)
+  const sortedAsks = sortOrdersByPriceTime(asks, false)
 
-  const bestBid = bids[0]
-  const bestAsk = asks[0]
+  const bestBid = sortedBids[0]
+  const bestAsk = sortedAsks[0]
 
   if (!bestBid || !bestAsk) {
     console.log(`[executor] ${network}: no best bid or ask available for ${base}/${quote}`)
@@ -2883,7 +2890,6 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
-
 
 
 
