@@ -26,6 +26,13 @@ const SETTLEMENT_ADDRESS_BSC = process.env.SETTLEMENT_ADDRESS_BSC || '0x7DBA6a14
 const SETTLEMENT_ADDRESS_BASE = process.env.SETTLEMENT_ADDRESS_BASE || '0xBBf7A39F053BA2B8F4991282425ca61F2D871f45'
 const CUSTODIAL_ADDRESS = '0x6E11b5c17258C3F3ea684881Da4bB591C4C7bE05'
 
+// Liquidity provision configuration
+// Tranche sizing for provisions: percentage of remaining (basis points), and minimum base tokens per tranche
+const PROVISION_TRANCHE_BPS = Number(process.env.PROVISION_TRANCHE_BPS || 2000) // default 20%
+const PROVISION_MIN_TRANCHE_BASE_TOKENS = Number(process.env.PROVISION_MIN_TRANCHE_BASE_TOKENS || 100) // default 100 tokens
+// Price update threshold to avoid frequent re-signs: minimum percent change to trigger update
+const PROVISION_PRICE_UPDATE_PCT = Number(process.env.PROVISION_PRICE_UPDATE_PCT || 1) // default 1%
+
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE
 
@@ -2465,9 +2472,16 @@ async function createOrdersFromProvisions(network = 'bsc') {
       // Get decimals
       const inDecimals = await fetchTokenDecimals(tokenAddr, network)
       const outDecimals = await fetchTokenDecimals(quoteAddr, network)
-
-      // Calculate amount to sell (up to remaining, but reasonable chunk)
-      const amountIn = remaining > 10n ** BigInt(inDecimals) ? 10n ** BigInt(inDecimals) : remaining
+      
+      // Calculate tranche amount to sell from provision
+      // tranche = max(minTranche, remaining * BPS/10000), capped by remaining
+      const bps = Math.max(1, Math.min(10000, Math.floor(PROVISION_TRANCHE_BPS || 2000)))
+      let tranche = (remaining * BigInt(bps)) / 10000n
+      const minTranche = BigInt(Math.max(1, Math.floor(PROVISION_MIN_TRANCHE_BASE_TOKENS || 1))) * (10n ** BigInt(inDecimals))
+      if (tranche < minTranche) tranche = minTranche
+      if (tranche > remaining) tranche = remaining
+      const amountIn = tranche
+      console.log(`[executor] ${network}: provision ${provision.id} tranche sizing -> remaining=${remaining.toString()}, trancheBps=${bps}, minTrancheBaseTokens=${PROVISION_MIN_TRANCHE_BASE_TOKENS}, amountIn=${amountIn.toString()}`)
       // Calculate minimum output amount: amountIn * price, adjusted for decimals
       // price is quote per base (e.g., 0.5 USDT per ASTER)
       // amountIn is in base token units (e.g., 1 ASTER = 10^18)
@@ -2807,6 +2821,16 @@ async function updateCustodialOrderPrices(network = 'bsc') {
         if (timeSinceCreation < 30000) {
           console.log(`[executor] ${network}: skipping price update for order ${order.order_id} (created ${timeSinceCreation}ms ago)`)
           continue
+        }
+
+        // Threshold: only update if price moved sufficiently to avoid churn
+        const currentPriceNum = Number(order.price || '0')
+        if (currentPriceNum > 0) {
+          const diffPct = Math.abs(newPrice - currentPriceNum) / currentPriceNum * 100
+          if (diffPct < PROVISION_PRICE_UPDATE_PCT) {
+            console.log(`[executor] ${network}: skipping price update for order ${order.order_id} (change ${diffPct.toFixed(4)}% < ${PROVISION_PRICE_UPDATE_PCT}%)`)
+            continue
+          }
         }
 
         // Update existing order in place instead of cancelling and creating new one
