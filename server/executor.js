@@ -1586,34 +1586,19 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   }
   // Seller: for baseOut must receive at least min quote
   const sellerMinQuoteForBase = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-  let usedBuyerBuffer = false
-  let usedSellerBuffer = false
+  // Always snap seller side if needed (raise quoteIn and adjust baseOut), then re-check caps
   if (quoteIn < sellerMinQuoteForBase) {
-    // Apply 1-wei rounding buffer for seller minOut
-    if (quoteIn + 1n >= sellerMinQuoteForBase) {
-      usedSellerBuffer = true
-      console.log(`[executor] ${network}: rounding-buffer: seller minOut satisfied with +1 wei`, { quoteIn: quoteIn.toString(), sellerMinQuoteForBase: sellerMinQuoteForBase.toString() })
-    } else {
-      console.log(`[executor] ${network}: SKIP max-fill: seller minOut not satisfied`, { quoteIn: quoteIn.toString(), sellerMinQuoteForBase: sellerMinQuoteForBase.toString() })
+    console.log(`[executor] ${network}: snapping: raising quoteIn to sellerMinQuoteForBase`, { quoteIn: quoteIn.toString(), sellerMin: sellerMinQuoteForBase.toString() })
+    quoteIn = sellerMinQuoteForBase
+    // Adjust baseOut down so buyer still meets minOut for the lifted quote
+    const buyerMinBaseForNewQuote = minOut(quoteIn, buy.amountIn, buy.amountOutMin)
+    if (baseOut > buyerMinBaseForNewQuote) baseOut = buyerMinBaseForNewQuote
+    // Buyer budget must still cover quoteIn
+    if (quoteIn > buyRemQuote) {
+      console.log(`[executor] ${network}: SKIP after seller snap: quote exceeds buyer budget`, { quoteIn: quoteIn.toString(), buyRemQuote: buyRemQuote.toString() })
       return false
     }
-  }
-
-  // If buyer minOut used buffer, track it (from previous check)
-  if (baseOut < buyerMinBaseForQuote && baseOut + 1n >= buyerMinBaseForQuote) {
-    usedBuyerBuffer = true
-  }
-
-  // Snap on-chain params to exact boundaries when buffers were used
-  if (usedSellerBuffer) {
-    // Lift quote to seller's exact minimum
-    quoteIn = sellerMinQuoteForBase
-    // Ensure buyer receives at least min base for the lifted quote
-    const buyerMinBaseForNewQuote = minOut(quoteIn, buy.amountIn, buy.amountOutMin)
-    if (baseOut > buyerMinBaseForNewQuote) {
-      baseOut = buyerMinBaseForNewQuote
-    }
-    // Re-cap baseOut against all caps
+    // Re-cap baseOut against all capacities
     if (baseOut > maxBaseBySeller) baseOut = maxBaseBySeller
     if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
     const baseFromBuyAvailAfter = (diag.availBuy * 10n ** 18n) / execPrice
@@ -1624,18 +1609,17 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
     }
   }
 
-  if (usedBuyerBuffer) {
-    // Raise baseOut to buyer's exact minimum base
-    baseOut = buyerMinBaseForQuote
-    // Recompute seller min quote for this base
+  // Ensure buyer-side minOut as well, snapping baseOut up if necessary and adjusting quoteIn
+  const buyerMinBaseForQuote2 = minOut(quoteIn, buy.amountIn, buy.amountOutMin)
+  if (baseOut < buyerMinBaseForQuote2) {
+    console.log(`[executor] ${network}: snapping: raising baseOut to buyerMinBaseForQuote`, { baseOut: baseOut.toString(), buyerMin: buyerMinBaseForQuote2.toString() })
+    baseOut = buyerMinBaseForQuote2
     const minQuoteForThisBase = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
     if (quoteIn < minQuoteForThisBase) quoteIn = minQuoteForThisBase
-    // Re-validate caps: quoteIn must be within buyer budget
     if (quoteIn > buyRemQuote) {
       console.log(`[executor] ${network}: SKIP after buyer snap: quote exceeds buyer budget`, { quoteIn: quoteIn.toString(), buyRemQuote: buyRemQuote.toString() })
       return false
     }
-    // Re-cap base against capacities (in case bump exceeded)
     if (baseOut > maxBaseBySeller) baseOut = maxBaseBySeller
     if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
     const baseFromBuyAvailAfter2 = (diag.availBuy * 10n ** 18n) / execPrice
@@ -2997,6 +2981,22 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
