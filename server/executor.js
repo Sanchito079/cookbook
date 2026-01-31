@@ -2839,14 +2839,15 @@ async function updateCustodialOrderPrices(network = 'bsc') {
         const outDecimals = await fetchTokenDecimals(order.token_out, network)
         const amountIn = toBN(order.amount_in)
         // Calculate minimum output amount: amountIn * price, adjusted for decimals
-        // price is quote per base (e.g., 0.6 USDT per ASTER)
-        // amountIn is in base token units (e.g., 1 ASTER = 10^18)
-        // amountOutMin should be in quote token units (e.g., 0.6 USDT = 0.6 * 10^18)
         const newAmountOutMin = (amountIn * BigInt(Math.floor(newPrice * 10 ** outDecimals))) / (10n ** BigInt(inDecimals))
         
-        // Create updated order object with new price and incremented nonce
+        // Force maker to executor wallet (normalize legacy rows)
+        const wallet = network === 'base' ? walletBase : walletBSC
+        const execMaker = wallet.address
+
+        // Create updated order object with new price, incremented nonce, and enforced maker
         const updatedOrder = {
-          maker: order.order_json.maker,
+          maker: execMaker,
           tokenIn: order.order_json.tokenIn,
           tokenOut: order.order_json.tokenOut,
           amountIn: order.order_json.amountIn,
@@ -2855,11 +2856,10 @@ async function updateCustodialOrderPrices(network = 'bsc') {
           nonce: (Number(order.nonce) + 1).toString(),
           receiver: order.order_json.receiver,
           salt: order.order_json.salt,
-          status: 'open',  // IMPORTANT: Keep status as 'open'
+          status: 'open',
           updated_at: new Date().toISOString()
         }
 
-        const wallet = network === 'base' ? walletBase : walletBSC
         const signature = await signOrder(updatedOrder, wallet, network)
 
         const newOrderHash = crypto.createHash('sha1').update(JSON.stringify({
@@ -2871,10 +2871,11 @@ async function updateCustodialOrderPrices(network = 'bsc') {
           salt: updatedOrder.salt
         })).digest('hex')
 
-        // Update existing order in place - keep it 'open' and just update price, amountOutMin, nonce, and signature
+        // Atomically update order: maker (column), order_json.maker, amounts, nonce, signature, hash, and display price
         const { error: updateError } = await supabase
           .from('orders')
           .update({
+            maker: execMaker.toLowerCase(),
             amount_out_min: newAmountOutMin.toString(),
             price: newPrice.toString(),
             nonce: updatedOrder.nonce,
@@ -2996,6 +2997,7 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
 
