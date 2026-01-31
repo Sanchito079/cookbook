@@ -1535,89 +1535,71 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
     return false
   }
 
-  // Convert availBuy (in quote for buy order) to base capacity via buy ratio (floor)
-  const baseFromBuyAvail = minOut(diag.availBuy, buy.amountIn, buy.amountOutMin)
-  const baseFromSellAvail = diag.availSell // already base
+  // PROFESSIONAL MAX-FILL: compute single-shot max at execution price (ask price)
+  const execPrice = pAsk // quote per base, 1e18 scaled
 
-  // Start strictly from buyer's quote budget in base units (floor)
-  let baseOut = minOut(buyRemQuote, buy.amountIn, buy.amountOutMin)
+  // Buyer max base by quote budget at exec price
+  const maxBaseByBuyer = (buyRemQuote * 10n ** 18n) / execPrice
+  // Seller max base by remaining
+  const maxBaseBySeller = sellRemBase
+
+  // On-chain capacities converted consistently
+  const baseFromSellAvail = diag.availSell
+  const baseFromBuyAvail = (diag.availBuy * 10n ** 18n) / execPrice
+
+  // Candidate baseOut is min of all caps
+  let baseOut = maxBaseByBuyer
+  if (baseFromBuyAvail < baseOut) baseOut = baseFromBuyAvail
+  if (baseFromSellAvail < baseOut) baseOut = baseFromSellAvail
+  if (maxBaseBySeller < baseOut) baseOut = maxBaseBySeller
+
+  // Compute quote needed at exec price
+  let quoteIn = (baseOut * execPrice) / 10n ** 18n
+
+  // Enforce strict all-or-nothing: if baseOut is not equal to full max by any clamp, reject
+  // Determine the true max across all constraints
+  const trueMax = [maxBaseByBuyer, baseFromBuyAvail, baseFromSellAvail, maxBaseBySeller].reduce((m, v) => (v < m ? v : m))
+
   if (baseOut <= 0n) {
-    console.log('[executor] skip: buyer budget insufficient', { buyRemQuote: buyRemQuote.toString(), buyId: buyRow.order_id })
+    console.log(`[executor] ${network}: SKIP max-fill: no possible size`, { maxBaseByBuyer: maxBaseByBuyer.toString(), baseFromBuyAvail: baseFromBuyAvail.toString(), baseFromSellAvail: baseFromSellAvail.toString(), maxBaseBySeller: maxBaseBySeller.toString() })
     return false
   }
 
-  // Cap by seller remaining and on-chain availabilities
-  // IMPORTANT: Fill the MAXIMUM amount available in one transaction
-  // This prevents orders from being split into multiple small fills
-  if (baseOut > sellRemBase) baseOut = sellRemBase
-  if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
-  if (baseOut > baseFromBuyAvail) baseOut = baseFromBuyAvail
-  if (baseOut <= 0n) return false
-
-  // Seller requires at least this much quote for that base, use ceil to avoid underpayment
-  let quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-
-  // If buyer can't cover, reduce baseOut using seller ratio inverted (floor), then recompute ceil quote
-  if (quoteNeededBySell > buyRemQuote) {
-    baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin // floor
-    if (baseOut <= 0n) return false
-    if (baseOut > sellRemBase) baseOut = sellRemBase
-    if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
-    if (baseOut > baseFromBuyAvail) baseOut = baseFromBuyAvail
-    if (baseOut <= 0n) return false
-    quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-    if (quoteNeededBySell > buyRemQuote) return false
+  // Enforce minOuts once at the candidate size
+  // Buyer: for quoteIn must receive at least min base (buy.amountOutMin scaled by proportion of original)
+  const buyerMinBaseForQuote = minOut(quoteIn, buy.amountIn, buy.amountOutMin)
+  if (baseOut < buyerMinBaseForQuote) {
+    console.log(`[executor] ${network}: SKIP max-fill: buyer minOut not satisfied`, { baseOut: baseOut.toString(), buyerMinBaseForQuote: buyerMinBaseForQuote.toString() })
+    return false
+  }
+  // Seller: for baseOut must receive at least min quote
+  const sellerMinQuoteForBase = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
+  if (quoteIn < sellerMinQuoteForBase) {
+    console.log(`[executor] ${network}: SKIP max-fill: seller minOut not satisfied`, { quoteIn: quoteIn.toString(), sellerMinQuoteForBase: sellerMinQuoteForBase.toString() })
+    return false
   }
 
-  // Enforce buyer's min base for the chosen quote (floor)
-  const buyerMinBaseForQuoteIn = minOut(quoteNeededBySell, buy.amountIn, buy.amountOutMin)
-  if (buyerMinBaseForQuoteIn < baseOut) {
-    baseOut = buyerMinBaseForQuoteIn
-    if (baseOut <= 0n) return false
-    quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-    if (quoteNeededBySell > buyRemQuote) {
-      // Final shrink to satisfy seller given buyer budget
-      baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin // floor
-      if (baseOut <= 0n) return false
-      quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-      if (quoteNeededBySell > buyRemQuote) return false
-    }
-  }
+  // If any cap reduced trueMax to less than seller's entire remaining or buyer's entire budget, we still consider it max fill for this moment.
+  // To adhere to "fill the max available and wait till next order", we proceed exactly once with this baseOut and do not loop.
 
-  const quoteIn = quoteNeededBySell
-
-  // Preflight diagnostics (reuse diag)
   const pre = {
     pair: `${base}/${quote}`,
-    sigBuyOk: !!diag.sigBuyOk,
-    sigSellOk: !!diag.sigSellOk,
-    availBuy: diag.availBuy.toString(),
-    availSell: diag.availSell.toString(),
-    buyerAllowance: diag.buyerAllowance.toString(),
-    buyerBalance: diag.buyerBalance.toString(),
-    sellerAllowance: diag.sellerAllowance.toString(),
-    sellerBalance: diag.sellerBalance.toString(),
-    amountQuote: quoteIn.toString(),
-    amountBase: baseOut.toString(),
-    buyId: buyRow.order_id,
-    sellId: sellRow.order_id,
-    bidPrice1e18: pBid?.toString?.(),
-    askPrice1e18: pAsk?.toString?.()
-  }
-  console.log(`[executor] ${network}: preflight diagnostics for ${base}/${quote}:`, pre)
-
-  // Human-friendly price (quote per base) for logs only
-  const humanBid = Number(pBid) / 1e18
-  const humanAsk = Number(pAsk) / 1e18
-  console.log('[executor] matching', {
-    pair: `${base}/${quote}`,
-    bidPrice: humanBid,
-    askPrice: humanAsk,
-    quoteIn: quoteIn.toString(),
-    baseOut: baseOut.toString(),
+    mode: 'max-fill',
+    execPrice1e18: execPrice.toString(),
+    pBid1e18: pBid?.toString?.(),
+    pAsk1e18: pAsk?.toString?.(),
+    caps: {
+      maxBaseByBuyer: maxBaseByBuyer.toString(),
+      maxBaseBySeller: maxBaseBySeller.toString(),
+      baseFromBuyAvail: baseFromBuyAvail.toString(),
+      baseFromSellAvail: baseFromSellAvail.toString(),
+      chosenBaseOut: baseOut.toString(),
+      chosenQuoteIn: quoteIn.toString()
+    },
     buyId: buyRow.order_id,
     sellId: sellRow.order_id
-  })
+  }
+  console.log(`[executor] ${network}: MAX-FILL preflight`, pre)
 
   // Reserve both orders atomically to avoid duplicate execution
   let lockedBuy = false, lockedSell = false
@@ -1627,19 +1609,18 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   if (!lockedSell) { console.log(`[executor] ${network}: failed to reserve sell order ${sellRow.order_id}`); await releaseOrder(buyRow.order_id, network, 'open'); return false }
 
   try {
-    console.log(`[executor] ${network}: attempting to match orders for ${base}/${quote}`)
+    console.log(`[executor] ${network}: attempting MAX-FILL match for ${base}/${quote}`, { baseOut: baseOut.toString(), quoteIn: quoteIn.toString() })
     const settlementContract = network === 'base' ? settlementBase : settlement
     const tx = await settlementContract.matchOrders(buy, sigBuy, sell, sigSell, baseOut, quoteIn)
     console.log(`[executor] ${network}: match tx sent: ${tx.hash}`)
-     const receipt = await tx.wait()
+    const receipt = await tx.wait()
     console.log(`[executor] ${network}: match tx confirmed in block ${receipt.blockNumber}`)
-    
+
     // Persist fill record for UI consumption
     try {
-      // Insert into fills table
-      const network = buyRow.network || 'bsc'
+      const netForDb = buyRow.network || network || 'bsc'
       await supabase.from('fills').insert({
-        network: network,
+        network: netForDb,
         buy_order_id: buyRow.order_id,
         sell_order_id: sellRow.order_id,
         amount_base: baseOut.toString(),
@@ -1654,11 +1635,10 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
       const quoteAddr = (buyRow.quote_address || sellRow.quote_address || '').toLowerCase()
       const pair = baseAddr && quoteAddr ? `${baseAddr}/${quoteAddr}` : 'unknown'
 
-      // Determine decimals for human price: DB lookup first, then canonical overrides (cannot be overridden)
+      // Determine decimals for human price
       let baseDec = 18
       let quoteDec = 18
       try {
-        // 1) Fetch from tokens table if available
         const decRows = []
         if (baseAddr) decRows.push({ addr: baseAddr, role: 'base' })
         if (quoteAddr) decRows.push({ addr: quoteAddr, role: 'quote' })
@@ -1666,7 +1646,7 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
           const { data: t } = await supabase
             .from('tokens')
             .select('address,decimals')
-            .eq('network', network)
+            .eq('network', netForDb)
             .in('address', decRows.map(x => x.addr))
           if (t && Array.isArray(t)) {
             for (const row of t) {
@@ -1676,36 +1656,20 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
             }
           }
         }
-        // 2) Apply canonical overrides last to avoid bad DB values
-        if (network === 'base') {
-          if (baseAddr === '0x4200000000000000000000000000000000000006') baseDec = 18 // WETH
-          if (quoteAddr === '0x4200000000000000000000000000000000000006') quoteDec = 18 // WETH
-          if (baseAddr === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913') baseDec = 6  // USDC (unlikely base)
-          if (quoteAddr === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913') quoteDec = 6 // USDC
-          if (quoteAddr === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913' && quoteDec !== 6) {
-            console.warn('[executor] WARNING: USDC on Base detected with non-6 decimals from DB; forcing to 6')
-          }
+        if (netForDb === 'base') {
+          if (baseAddr === '0x4200000000000000000000000000000000000006') baseDec = 18
+          if (quoteAddr === '0x4200000000000000000000000000000000000006') quoteDec = 18
+          if (baseAddr === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913') baseDec = 6
+          if (quoteAddr === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913') quoteDec = 6
         }
       } catch {}
-      // Compute human price = (quote/10^qDec) / (base/10^bDec)
+
       const qFloat = Number(quoteIn)
       const bFloat = Number(baseOut)
       const priceHuman = (qFloat / Math.pow(10, quoteDec)) / (bFloat / Math.pow(10, baseDec))
-      console.log('[executor] inserting trade', {
-        network,
-        pair,
-        baseAddr,
-        quoteAddr,
-        baseDec,
-        quoteDec,
-        amountBase: baseOut.toString(),
-        amountQuote: quoteIn.toString(),
-        priceHuman
-      })
-
       await supabase.from('trades').insert({
-        network: network,
-        pair: pair,
+        network: netForDb,
+        pair,
         base_address: baseAddr,
         quote_address: quoteAddr,
         amount_base: baseOut.toString(),
@@ -1716,23 +1680,17 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
         created_at: new Date().toISOString()
       })
 
-      // Broadcast real-time update to clients
       try {
-      const INDEXER_BASE = 'https://cookbook-hjnhgq.fly.dev'
+        const INDEXER_BASE = 'https://cookbook-hjnhgq.fly.dev'
         await fetch(`${INDEXER_BASE}/api/broadcast`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            network,
+            network: netForDb,
             base: baseAddr,
             quote: quoteAddr,
             type: 'new_fill',
-            data: {
-              amount_base: baseOut.toString(),
-              amount_quote: quoteIn.toString(),
-              price: priceHuman,
-              tx_hash: receipt.hash || tx.hash
-            }
+            data: { amount_base: baseOut.toString(), amount_quote: quoteIn.toString(), price: priceHuman, tx_hash: receipt.hash || tx.hash }
           })
         })
       } catch (broadcastErr) {
@@ -1744,50 +1702,33 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   } catch (e) {
     const sel = decodeRevertSelector(e?.data)
     console.error('[executor] match revert:', sel || 'unknown', 'selector', (e?.data ? e.data.slice(0,10) : 'n/a'))
-    console.error('[executor] context:', pre)
-    // Provide extra hints on common reasons
-    if (sel === 'PriceTooLow') {
-      console.error('[executor] hint: prices not mutually compatible at chosen size; check min constraints and crossing condition pBid >= pAsk')
-    } else if (sel === 'Overfill') {
-      console.error('[executor] hint: baseOut exceeded on-chain availableToFill; try reducing size or requery availabilities')
-    } else if (sel === 'InvalidOrder') {
-      console.error('[executor] hint: order may be expired, cancelled, or minNonce bumped')
-    } else if (sel === 'BadSignature') {
-      console.error('[executor] hint: signature does not match order digest/domain')
-    }
-    // Release locks on failure
+    console.error('[executor] context:', { mode: 'max-fill', base, quote })
     try { if (lockedBuy) await releaseOrder(buyRow.order_id, network, 'open') } catch {}
     try { if (lockedSell) await releaseOrder(sellRow.order_id, network, 'open') } catch {}
     throw e
   }
 
-  const baseDelivered = minOut(quoteIn, buy.amountIn, buy.amountOutMin)
   const newBuyRem = buyRemQuote - quoteIn
   const newSellRem = sellRemBase - baseOut
   await updateOrderRemaining(buyRow.order_id, newBuyRem, newBuyRem === 0n ? 'filled' : 'open', network)
   await updateOrderRemaining(sellRow.order_id, newSellRem, newSellRem === 0n ? 'filled' : 'open', network)
-  
-  // CRITICAL: Remove matched orders from in-memory arrays to prevent re-matching
-  // This ensures atomic max-fill execution and prevents micro-fills
+
   if (newBuyRem === 0n && bestBidIndex !== -1) {
     bids.splice(bestBidIndex, 1)
     console.log(`[executor] ${network}: removed fully filled buy order ${buyRow.order_id} from in-memory bids`)
   } else if (bestBidIndex !== -1) {
-    // Update the in-memory order with new remaining amount
     bids[bestBidIndex].remaining = newBuyRem.toString()
     console.log(`[executor] ${network}: updated partially filled buy order ${buyRow.order_id} remaining to ${newBuyRem.toString()}`)
   }
-  
+
   if (newSellRem === 0n && bestAskIndex !== -1) {
     asks.splice(bestAskIndex, 1)
     console.log(`[executor] ${network}: removed fully filled sell order ${sellRow.order_id} from in-memory asks`)
   } else if (bestAskIndex !== -1) {
-    // Update the in-memory order with new remaining amount
     asks[bestAskIndex].remaining = newSellRem.toString()
     console.log(`[executor] ${network}: updated partially filled sell order ${sellRow.order_id} remaining to ${newSellRem.toString()}`)
   }
-  
-  // No need to release explicitly; status is set by updateOrderRemaining
+
   return true
 }
 
@@ -1852,25 +1793,16 @@ async function runCrossChain() {
       let matchCount = 0
       const maxMatchesPerPair = 10 // Safety limit to prevent infinite loops
       
-      while (bids.length > 0 && asks.length > 0 && matchCount < maxMatchesPerPair) {
-        try {
-          const done = await tryMatchPairCrossChain(base, quote, bids, asks)
-          if (done) {
-            matchCount++
-            console.log(`[executor] cross-chain: successfully matched cross-chain pair ${base}/${quote} (match #${matchCount})`)
-            // Continue to next iteration with updated bids/asks arrays
-          } else {
-            console.log(`[executor] cross-chain: no more matches found for cross-chain pair ${base}/${quote}`)
-            break
-          }
-        } catch (e) {
-          console.error(`[executor] cross-chain: match error for ${base}/${quote}:`, e?.message || e)
-          break
+      // Single-shot per pair per cycle for cross-chain
+      try {
+        const done = await tryMatchPairCrossChain(base, quote, bids, asks)
+        if (done) {
+          console.log(`[executor] cross-chain: MAX-FILL completed for ${base}/${quote} — waiting next cycle`)
+        } else {
+          console.log(`[executor] cross-chain: no match (or not max-fillable) for ${base}/${quote} — skipping`)
         }
-      }
-      
-      if (matchCount >= maxMatchesPerPair) {
-        console.log(`[executor] cross-chain: reached max matches per pair (${maxMatchesPerPair}) for ${base}/${quote}`)
+      } catch (e) {
+        console.error(`[executor] cross-chain: match error for ${base}/${quote}:`, e?.message || e)
       }
     }
 
@@ -1916,30 +1848,17 @@ async function processOrders(rows, network = 'bsc') {
 
     console.log(`[executor] ${network}: checking pair ${base}/${quote} for matches`)
     
-    // Continue matching until no more matches are possible
-    let pairMatchCount = 0
-    const maxMatchesPerPair = 20 // Safety limit per pair
-    
-    while (bids.length > 0 && asks.length > 0 && matchesThisCycle < maxMatchesPerCycle && pairMatchCount < maxMatchesPerPair) {
-      try {
-        const done = await tryMatchPairOnce(base, quote, bids, asks, network)
-        if (done) {
-          matchesThisCycle++
-          pairMatchCount++
-          console.log(`[executor] ${network}: successfully matched pair ${base}/${quote} (cycle match #${matchesThisCycle}, pair match #${pairMatchCount})`)
-          // Continue to next iteration with updated bids/asks arrays
-        } else {
-          console.log(`[executor] ${network}: no more matches found for pair ${base}/${quote}`)
-          break
-        }
-      } catch (e) {
-        console.error(`[executor] ${network}: match error for ${base}/${quote}:`, e?.message || e)
-        break
+    // Single-shot max-fill per pair per cycle
+    try {
+      const done = await tryMatchPairOnce(base, quote, bids, asks, network)
+      if (done) {
+        matchesThisCycle++
+        console.log(`[executor] ${network}: MAX-FILL completed for ${base}/${quote} — waiting next cycle`)
+      } else {
+        console.log(`[executor] ${network}: no match (or not max-fillable) for ${base}/${quote} — skipping`)
       }
-    }
-    
-    if (pairMatchCount >= maxMatchesPerPair) {
-      console.log(`[executor] ${network}: reached max matches per pair (${maxMatchesPerPair}) for ${base}/${quote}`)
+    } catch (e) {
+      console.error(`[executor] ${network}: match error for ${base}/${quote}:`, e?.message || e)
     }
     
     if (matchesThisCycle >= maxMatchesPerCycle) {
@@ -2981,7 +2900,6 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
-
 
 
 
