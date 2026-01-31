@@ -1579,14 +1579,76 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   }
   // Seller: for baseOut must receive at least min quote
   const sellerMinQuoteForBase = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
+  let usedBuyerBuffer = false
+  let usedSellerBuffer = false
   if (quoteIn < sellerMinQuoteForBase) {
     // Apply 1-wei rounding buffer for seller minOut
     if (quoteIn + 1n >= sellerMinQuoteForBase) {
+      usedSellerBuffer = true
       console.log(`[executor] ${network}: rounding-buffer: seller minOut satisfied with +1 wei`, { quoteIn: quoteIn.toString(), sellerMinQuoteForBase: sellerMinQuoteForBase.toString() })
     } else {
       console.log(`[executor] ${network}: SKIP max-fill: seller minOut not satisfied`, { quoteIn: quoteIn.toString(), sellerMinQuoteForBase: sellerMinQuoteForBase.toString() })
       return false
     }
+  }
+
+  // If buyer minOut used buffer, track it (from previous check)
+  if (baseOut < buyerMinBaseForQuote && baseOut + 1n >= buyerMinBaseForQuote) {
+    usedBuyerBuffer = true
+  }
+
+  // Snap on-chain params to exact boundaries when buffers were used
+  if (usedSellerBuffer) {
+    // Lift quote to seller's exact minimum
+    quoteIn = sellerMinQuoteForBase
+    // Ensure buyer receives at least min base for the lifted quote
+    const buyerMinBaseForNewQuote = minOut(quoteIn, buy.amountIn, buy.amountOutMin)
+    if (baseOut > buyerMinBaseForNewQuote) {
+      baseOut = buyerMinBaseForNewQuote
+    }
+    // Re-cap baseOut against all caps
+    if (baseOut > maxBaseBySeller) baseOut = maxBaseBySeller
+    if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
+    const baseFromBuyAvailAfter = (diag.availBuy * 10n ** 18n) / execPrice
+    if (baseOut > baseFromBuyAvailAfter) baseOut = baseFromBuyAvailAfter
+    if (baseOut <= 0n) {
+      console.log(`[executor] ${network}: SKIP after seller snap: no feasible baseOut`)
+      return false
+    }
+  }
+
+  if (usedBuyerBuffer) {
+    // Raise baseOut to buyer's exact minimum base
+    baseOut = buyerMinBaseForQuote
+    // Recompute seller min quote for this base
+    const minQuoteForThisBase = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
+    if (quoteIn < minQuoteForThisBase) quoteIn = minQuoteForThisBase
+    // Re-validate caps: quoteIn must be within buyer budget
+    if (quoteIn > buyRemQuote) {
+      console.log(`[executor] ${network}: SKIP after buyer snap: quote exceeds buyer budget`, { quoteIn: quoteIn.toString(), buyRemQuote: buyRemQuote.toString() })
+      return false
+    }
+    // Re-cap base against capacities (in case bump exceeded)
+    if (baseOut > maxBaseBySeller) baseOut = maxBaseBySeller
+    if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
+    const baseFromBuyAvailAfter2 = (diag.availBuy * 10n ** 18n) / execPrice
+    if (baseOut > baseFromBuyAvailAfter2) baseOut = baseFromBuyAvailAfter2
+    if (baseOut <= 0n) {
+      console.log(`[executor] ${network}: SKIP after buyer snap: no feasible baseOut`)
+      return false
+    }
+  }
+
+  // Final safety: recompute strict minOuts with snapped params
+  const buyerMinBaseFinal = minOut(quoteIn, buy.amountIn, buy.amountOutMin)
+  if (baseOut < buyerMinBaseFinal) {
+    console.log(`[executor] ${network}: SKIP final check: buyer minOut not satisfied after snap`, { baseOut: baseOut.toString(), buyerMinBaseFinal: buyerMinBaseFinal.toString() })
+    return false
+  }
+  const sellerMinQuoteFinal = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
+  if (quoteIn < sellerMinQuoteFinal) {
+    console.log(`[executor] ${network}: SKIP final check: seller minOut not satisfied after snap`, { quoteIn: quoteIn.toString(), sellerMinQuoteFinal: sellerMinQuoteFinal.toString() })
+    return false
   }
 
   // If any cap reduced trueMax to less than seller's entire remaining or buyer's entire budget, we still consider it max fill for this moment.
