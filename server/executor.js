@@ -1569,14 +1569,24 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   // Buyer: for quoteIn must receive at least min base (buy.amountOutMin scaled by proportion of original)
   const buyerMinBaseForQuote = minOut(quoteIn, buy.amountIn, buy.amountOutMin)
   if (baseOut < buyerMinBaseForQuote) {
-    console.log(`[executor] ${network}: SKIP max-fill: buyer minOut not satisfied`, { baseOut: baseOut.toString(), buyerMinBaseForQuote: buyerMinBaseForQuote.toString() })
-    return false
+    // Apply 1-wei rounding buffer for buyer minOut
+    if (baseOut + 1n >= buyerMinBaseForQuote) {
+      console.log(`[executor] ${network}: rounding-buffer: buyer minOut satisfied with +1 wei`, { baseOut: baseOut.toString(), buyerMinBaseForQuote: buyerMinBaseForQuote.toString() })
+    } else {
+      console.log(`[executor] ${network}: SKIP max-fill: buyer minOut not satisfied`, { baseOut: baseOut.toString(), buyerMinBaseForQuote: buyerMinBaseForQuote.toString() })
+      return false
+    }
   }
   // Seller: for baseOut must receive at least min quote
   const sellerMinQuoteForBase = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
   if (quoteIn < sellerMinQuoteForBase) {
-    console.log(`[executor] ${network}: SKIP max-fill: seller minOut not satisfied`, { quoteIn: quoteIn.toString(), sellerMinQuoteForBase: sellerMinQuoteForBase.toString() })
-    return false
+    // Apply 1-wei rounding buffer for seller minOut
+    if (quoteIn + 1n >= sellerMinQuoteForBase) {
+      console.log(`[executor] ${network}: rounding-buffer: seller minOut satisfied with +1 wei`, { quoteIn: quoteIn.toString(), sellerMinQuoteForBase: sellerMinQuoteForBase.toString() })
+    } else {
+      console.log(`[executor] ${network}: SKIP max-fill: seller minOut not satisfied`, { quoteIn: quoteIn.toString(), sellerMinQuoteForBase: sellerMinQuoteForBase.toString() })
+      return false
+    }
   }
 
   // If any cap reduced trueMax to less than seller's entire remaining or buyer's entire budget, we still consider it max fill for this moment.
@@ -2900,7 +2910,6 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
-
 
 
 
