@@ -24,63 +24,7 @@ const EXECUTOR_PRIVATE_KEY = process.env.EXECUTOR_PRIVATE_KEY
 const CUSTODIAL_PRIVATE_KEY = process.env.CUSTODIAL_PRIVATE_KEY
 const SETTLEMENT_ADDRESS_BSC = process.env.SETTLEMENT_ADDRESS_BSC || '0x7DBA6a1488356428C33cC9fB8Ef3c8462c8679d0'
 const SETTLEMENT_ADDRESS_BASE = process.env.SETTLEMENT_ADDRESS_BASE || '0xBBf7A39F053BA2B8F4991282425ca61F2D871f45'
-const CUSTODIAL_ADDRESS = '0x6E11b5c17258C3F3ea684881Da4bB591C4C7bE05'
-
-// One-route normalization mode: re-sign provision-backed orders with executor maker
-const ONE_ROUTE_MODE = true
-
-function getExecutorWallet(network) {
-  return network === 'base' ? walletBase : walletBSC
-}
-
-async function normalizeProvisionOrderRow(row, network) {
-  try {
-    if (!ONE_ROUTE_MODE || !row) return row
-    const src = String(row.source || row.tag || '').toLowerCase()
-    const lpBacked = src === 'custodial' || src === 'liquidity_provision'
-    if (!lpBacked) return row
-
-    const execWallet = getExecutorWallet(network)
-    const execAddr = execWallet?.address?.toLowerCase?.()
-    const makerNow = (row.maker || row.maker_address || '').toLowerCase()
-    if (!execAddr || makerNow === execAddr) return row
-
-    let o = row.order_json || row.order || null
-    if (typeof o === 'string') { try { o = JSON.parse(o) } catch { o = null } }
-    if (!o) return row
-
-    const updatedOrder = {
-      ...o,
-      maker: execAddr,
-      nonce: (BigInt(o.nonce || 0) + 1n).toString()
-    }
-
-    const signature = await signOrder(updatedOrder, execWallet, network)
-
-    try {
-      const { error: err } = await supabase
-        .from('orders')
-        .update({
-          maker: execAddr,
-          maker_address: execAddr,
-          signature,
-          order_json: updatedOrder,
-          order_hash: null,
-          updated_at: new Date().toISOString()
-        })
-        .eq('order_id', row.order_id)
-        .limit(1)
-      if (err) console.error('[ONE_ROUTE] DB update error:', err)
-    } catch (e) {
-      console.error('[ONE_ROUTE] DB update threw:', e?.message || e)
-    }
-
-    return { ...row, maker: execAddr, maker_address: execAddr, signature, order_json: updatedOrder }
-  } catch (e) {
-    console.error('[ONE_ROUTE] normalize failed:', e?.message || e)
-    return row
-  }
-}
+const CUSTODIAL_ADDRESS = '0x95c448c49F07B11F0201c4Df19E7a0DE7AEB2865'
 
 // Liquidity provision configuration
 // Tranche sizing for provisions: percentage of remaining (basis points), and minimum base tokens per tranche
@@ -584,11 +528,9 @@ async function initProvidersAndWallets() {
         if (network.name === 'BSC') {
           providerBSC = prov
           walletBSC = w
-          custodialWalletBSC = custodialW
         } else if (network.name === 'Base') {
           providerBase = prov
           walletBase = w
-          custodialWalletBase = custodialW
         }
 
         console.log(`[executor] ${network.name} connected successfully. wallet: ${w.address}, chainId: ${chainId}`)
@@ -1584,26 +1526,6 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   }
 
   // Query contract-side availability (skip if unfillable)
-  // One-route normalization for provision-backed orders (mutates in-place)
-  try {
-    const nb = await normalizeProvisionOrderRow(buyRow, network)
-    if (nb && nb !== buyRow) {
-      buyRow.maker = nb.maker
-      buyRow.maker_address = nb.maker_address || nb.maker
-      buyRow.signature = nb.signature
-      buyRow.order_json = nb.order_json
-    }
-    const ns = await normalizeProvisionOrderRow(sellRow, network)
-    if (ns && ns !== sellRow) {
-      sellRow.maker = ns.maker
-      sellRow.maker_address = ns.maker_address || ns.maker
-      sellRow.signature = ns.signature
-      sellRow.order_json = ns.order_json
-    }
-  } catch (e) {
-    console.warn('[ONE_ROUTE] normalization skipped:', e?.message || e)
-  }
-
   console.log(`[executor] ${network}: running preflight diagnostics for ${base}/${quote}`)
   const diag = await preflightDiagnostics(buyRow, sellRow, network)
 
@@ -2322,106 +2244,98 @@ async function runOnce(network = 'bsc') {
 // LIQUIDITY PROVISION FUNCTIONS
 // =============================
 
-async function checkCustodialDeposits(network = 'bsc') {
-  if (!supabase) return
+  async function checkCustodialDeposits(network = 'bsc') {
+    if (!supabase) return
 
-  console.log(`[executor] ${network}: checking custodial deposits...`)
+    console.log(`[executor] ${network}: checking deposits...`)
 
-  try {
-    // Get custodial address
-    const custodialAddr = CUSTODIAL_ADDRESS.toLowerCase()
-
-    // Get provider for network
-    const provider = network === 'base' ? providerBase : providerBSC
-    if (!provider) return
-
-    // Get all tokens that have provisions in the database for this network
-    // Include both claimed provisions AND pending_claim provisions to detect new deposits
-    const { data: existingProvisions } = await supabase
-      .from('liquidity_provisions')
-      .select('token_address')
-      .eq('network', network)
-
-    // Get unique token addresses from existing provisions (already filtered by network)
-    const tokensFromDb = [...new Set(existingProvisions?.map(p => p.token_address) || [])]
-
-    // Only check tokens that have provisions in the database
-    // This prevents creating provisions for tokens that happen to have a balance but weren't intentionally deposited
-    const tokensToCheck = tokensFromDb
-
-    for (const tokenAddr of tokensToCheck) {
-      // Get current balance
-      const tokenContract = new Contract(tokenAddr, ERC20_MIN_ABI, provider)
-      const balance = await tokenContract.balanceOf(custodialAddr).catch(() => 0n)
-      const balanceStr = balance.toString()
-
-      // Get sum of remaining amounts in provisions (including pending_claim to prevent duplicates)
-      const { data: provisions } = await supabase
+    try {
+      // Get all tokens that have provisions in the database for this network
+      // Include both claimed provisions AND pending_claim provisions to detect new deposits
+      const { data: existingProvisions } = await supabase
         .from('liquidity_provisions')
-        .select('remaining_amount')
+        .select('token_address')
         .eq('network', network)
-        .eq('token_address', tokenAddr)
 
-      const totalRemaining = provisions?.reduce((sum, p) => sum + toBN(p.remaining_amount), 0n) || 0n
+      // Get unique token addresses from existing provisions (already filtered by network)
+      const tokensFromDb = [...new Set(existingProvisions?.map(p => p.token_address) || [])]
 
-      if (toBN(balanceStr) > totalRemaining) {
-        const excess = toBN(balanceStr) - totalRemaining
-        console.log(`[executor] ${network}: detected deposit of ${excess.toString()} ${tokenAddr} to custodial`)
+      // Only check tokens that have provisions in the database
+      // This prevents creating provisions for tokens that happen to have a balance but weren't intentionally deposited
+      const tokensToCheck = tokensFromDb
 
-        // Check if provision already exists for this token/network (any depositor)
-        const { data: existingProvision } = await supabase
+      for (const tokenAddr of tokensToCheck) {
+        // Get current balance
+        const tokenContract = new Contract(tokenAddr, ERC20_MIN_ABI, provider)
+        const balance = await tokenContract.balanceOf(wallet.address).catch(() => 0n)
+        const balanceStr = balance.toString()
+
+        // Get sum of remaining amounts in provisions (including pending_claim to prevent duplicates)
+        const { data: provisions } = await supabase
           .from('liquidity_provisions')
-          .select('id, pair_key, amount_deposited, remaining_amount')
+          .select('remaining_amount')
           .eq('network', network)
           .eq('token_address', tokenAddr)
-          .single()
 
-        if (existingProvision) {
-          // Update existing provision with detected deposit amount
-          const newAmountDeposited = toBN(existingProvision.amount_deposited || '0') + excess
-          const newRemaining = toBN(existingProvision.remaining_amount || '0') + excess
-          const { error: updateError } = await supabase
+        const totalRemaining = provisions?.reduce((sum, p) => sum + toBN(p.remaining_amount), 0n) || 0n
+
+        if (toBN(balanceStr) > totalRemaining) {
+          const excess = toBN(balanceStr) - totalRemaining
+          console.log(`[executor] ${network}: detected deposit of ${excess.toString()} ${tokenAddr} to executor wallet`)
+
+          // Check if provision already exists for this token/network (any depositor)
+          const { data: existingProvision } = await supabase
             .from('liquidity_provisions')
-            .update({
-              amount_deposited: newAmountDeposited.toString(),
-              remaining_amount: newRemaining.toString(),
-              updated_at: new Date().toISOString()
+            .select('id, pair_key, amount_deposited, remaining_amount')
+            .eq('network', network)
+            .eq('token_address', tokenAddr)
+            .single()
+
+          if (existingProvision) {
+            // Update existing provision with detected deposit amount
+            const newAmountDeposited = toBN(existingProvision.amount_deposited || '0') + excess
+            const newRemaining = toBN(existingProvision.remaining_amount || '0') + excess
+            const { error: updateError } = await supabase
+              .from('liquidity_provisions')
+              .update({
+                amount_deposited: newAmountDeposited.toString(),
+                remaining_amount: newRemaining.toString(),
+                updated_at: new Date().toISOString()
+              })
+              .eq('id', existingProvision.id)
+
+            if (updateError) {
+              console.warn(`[executor] ${network}: error updating provision:`, updateError.message)
+            } else {
+              console.log(`[executor] ${network}: updated provision ${existingProvision.id} with ${excess.toString()} ${tokenAddr}`)
+            }
+          } else {
+            // Create pending provision without pair_key - user will provide it when claiming
+            const { error: insertError } = await supabase.from('liquidity_provisions').insert({
+              network,
+              depositor: 'pending_claim',
+              token_address: tokenAddr,
+              amount_deposited: excess.toString(),
+              min_price_per_token: '0', // Will be set on claim
+              remaining_amount: excess.toString(),
+              pair_key: null // Will be set on claim
             })
-            .eq('id', existingProvision.id)
 
-          if (updateError) {
-            console.warn(`[executor] ${network}: error updating provision:`, updateError.message)
-          } else {
-            console.log(`[executor] ${network}: updated provision ${existingProvision.id} with ${excess.toString()} ${tokenAddr}`)
-          }
-        } else {
-          // Create pending provision without pair_key - user will provide it when claiming
-          const { error: insertError } = await supabase.from('liquidity_provisions').insert({
-            network,
-            depositor: 'pending_claim',
-            token_address: tokenAddr,
-            amount_deposited: excess.toString(),
-            min_price_per_token: '0', // Will be set on claim
-            remaining_amount: excess.toString(),
-            pair_key: null // Will be set on claim
-          })
-
-          if (insertError) {
-            console.warn(`[executor] ${network}: error creating provision:`, insertError.message)
-          } else {
-            console.log(`[executor] ${network}: created pending provision for ${excess.toString()} ${tokenAddr}`)
+            if (insertError) {
+              console.warn(`[executor] ${network}: error creating provision:`, insertError.message)
+            } else {
+              console.log(`[executor] ${network}: created pending provision for ${excess.toString()} ${tokenAddr}`)
+            }
           }
         }
       }
+    } catch (e) {
+      console.warn(`[executor] ${network}: error checking deposits:`, e?.message || e)
     }
-  } catch (e) {
-    console.warn(`[executor] ${network}: error checking custodial deposits:`, e?.message || e)
   }
-}
 
 async function createOrdersFromProvisions(network = 'bsc') {
   const wallet = network === 'base' ? walletBase : walletBSC
-  const custodialWallet = network === 'base' ? custodialWalletBase : custodialWalletBSC
   if (!supabase || !wallet) return
 
   console.log(`[executor] ${network}: creating orders from liquidity provisions...`)
@@ -2548,23 +2462,8 @@ async function createOrdersFromProvisions(network = 'bsc') {
       // amountOutMin should be in quote token units (e.g., 0.5 USDT = 0.5 * 10^18)
       const amountOutMin = (amountIn * BigInt(Math.floor(currentPrice * 10 ** outDecimals))) / (10n ** BigInt(inDecimals))
 
-      // IMPORTANT: Transfer tokens from custodial wallet to executor wallet before creating order
-      // The order's maker is the executor wallet, so the executor wallet must have the tokens
-      // The contract will try to transfer tokens from the maker address during order execution
-      console.log(`[executor] ${network}: transferring ${amountIn.toString()} tokens from custodial to executor wallet`)
-      try {
-        if (!custodialWallet) {
-          throw new Error('Custodial wallet not available. Please set CUSTODIAL_PRIVATE_KEY in .env')
-        }
-        const tokenContract = new Contract(tokenAddr, ERC20_MIN_ABI, custodialWallet)
-        const tx = await tokenContract.transfer(wallet.address, amountIn)
-        await tx.wait()
-        console.log(`[executor] ${network}: token transfer completed, tx hash: ${tx.hash}`)
-      } catch (transferError) {
-        console.warn(`[executor] ${network}: failed to transfer tokens from custodial to executor wallet:`, transferError?.message || transferError)
-        console.warn(`[executor] ${network}: skipping order creation for provision ${provision.id}`)
-        continue
-      }
+      // IMPORTANT: Tokens are already in executor wallet (deposited directly by user)
+      // No transfer needed from custodial wallet
 
       // IMPORTANT: Approve the settlement contract to transfer tokens from the executor wallet
       // The settlement contract needs approval to transfer tokens from the maker (executor wallet)
@@ -3057,7 +2956,6 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
-
 
 
 
