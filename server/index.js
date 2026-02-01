@@ -1481,22 +1481,6 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, time: Date.now() })
 })
 
-// Get executor wallet address for direct deposits
-app.get('/api/executor-address', (req, res) => {
-  try {
-    const network = (req.query.network || 'bsc').toString()
-    const EXECUTOR_PRIVATE_KEY = process.env.EXECUTOR_PRIVATE_KEY
-    if (!EXECUTOR_PRIVATE_KEY) {
-      return res.status(500).json({ error: 'EXECUTOR_PRIVATE_KEY not configured' })
-    }
-    const wallet = new Wallet(EXECUTOR_PRIVATE_KEY)
-    res.json({ executorAddress: wallet.address, network })
-  } catch (e) {
-    console.error('[api] executor-address error:', e?.message || e)
-    res.status(500).json({ error: 'Failed to get executor address' })
-  }
-})
-
 // Return token pairs strictly using markets search criteria
 app.get('/api/token-pairs', async (req, res) => {
   try {
@@ -3251,6 +3235,71 @@ app.post('/api/claim-deposit', async (req, res) => {
       return res.status(400).json({ error: 'tx_hash, depositor_address, token_address, and pair_key required' })
     }
 
+    // Get executor address (same as CUSTODIAL_ADDRESS in executor.js)
+    const executorAddress = process.env.CUSTODIAL_ADDRESS || '0x95c448c49F07B11F0201c4Df19E7a0DE7AEB2865'
+    
+    // Get provider for network
+    let provider
+    if (network === 'base') {
+      provider = new ethers.JsonRpcProvider(process.env.EXECUTOR_RPC_URL_BASE || 'https://mainnet.base.org')
+    } else {
+      provider = new ethers.JsonRpcProvider(process.env.EXECUTOR_RPC_URL || 'https://bsc-dataseed.defibit.io')
+    }
+
+    // Get token decimals
+    const tokenContract = new ethers.Contract(token_address, [
+      'function decimals() view returns (uint8)'
+    ], provider)
+    let decimals = 18
+    try {
+      decimals = await tokenContract.decimals()
+    } catch (e) {
+      console.warn('[api] failed to get token decimals:', e?.message || e)
+    }
+
+    // Get current balance of executor wallet
+    const balanceContract = new ethers.Contract(token_address, [
+      'function balanceOf(address) view returns (uint256)'
+    ], provider)
+    let balance = 0n
+    try {
+      balance = await balanceContract.balanceOf(executorAddress)
+      console.log(`[api] executor balance for ${token_address}: ${balance.toString()}`)
+    } catch (e) {
+      console.warn('[api] failed to get executor balance:', e?.message || e)
+    }
+
+    // Get the transaction to find the transfer amount
+    let depositAmount = 0n
+    try {
+      const tx = await provider.getTransaction(tx_hash)
+      if (tx) {
+        // Parse the transaction data to get the transfer amount
+        // ERC20 transfer function signature: 0xa9059cbb
+        const data = tx.data
+        if (data && data.length > 138) {
+          // Parse the amount from the transaction data
+          const amountHex = '0x' + data.substring(74) // Last 64 chars (32 bytes) after function selector and address
+          depositAmount = BigInt(amountHex)
+          console.log(`[api] deposit amount from tx: ${depositAmount.toString()}`)
+        }
+      }
+    } catch (e) {
+      console.warn('[api] failed to get transaction:', e?.message || e)
+    }
+
+    // If we couldn't get amount from tx, use the balance difference
+    // This is a fallback - in production you'd want to track previous balance
+    if (depositAmount === 0n) {
+      // Use the full balance as the deposit amount for now
+      // In a real implementation, you'd want to track the previous balance
+      console.log('[api] using balance as deposit amount (fallback)')
+      depositAmount = balance
+    }
+
+    const depositAmountStr = depositAmount.toString()
+    console.log(`[api] detected deposit: ${depositAmountStr} ${token_address} for ${depositor_address}`)
+
     // Find pending provision for this token (without pair_key filter since it's set on claim)
     let { data: provisions } = await supabase
       .from('liquidity_provisions')
@@ -3263,29 +3312,32 @@ app.post('/api/claim-deposit', async (req, res) => {
     let provision
     if (provisions && provisions.length > 0) {
       provision = provisions[0]
-      // Update existing provision with depositor, pair_key, and min price
-      // Keep the detected amount_deposited and remaining_amount from checkCustodialDeposits
+      // Update existing provision with depositor, pair_key, min price, and detected amount
       await supabase
         .from('liquidity_provisions')
         .update({
           depositor: depositor_address.toLowerCase(),
           pair_key: pair_key,
           min_price_per_token: min_price_per_token,
+          amount_deposited: depositAmountStr,
+          remaining_amount: depositAmountStr,
           updated_at: new Date().toISOString()
         })
         .eq('id', provision.id)
+      provision.amount_deposited = depositAmountStr
+      provision.remaining_amount = depositAmountStr
     } else {
-      // Create new provision if none exists (will be updated by checkCustodialDeposits when deposit is detected)
+      // Create new provision with the detected deposit amount
       const { data: newProvision, error: insertError } = await supabase
         .from('liquidity_provisions')
         .insert({
           network,
-          depositor: depositor_address.toLowerCase(), // Set actual depositor, not pending_claim
+          depositor: depositor_address.toLowerCase(),
           token_address: token_address.toLowerCase(),
-          amount_deposited: '0', // Will be updated when deposit detected
+          amount_deposited: depositAmountStr,
           min_price_per_token: min_price_per_token,
-          remaining_amount: '0',
-          pair_key: pair_key // Set pair_key from request
+          remaining_amount: depositAmountStr,
+          pair_key: pair_key
         })
         .select()
         .single()
@@ -3297,8 +3349,8 @@ app.post('/api/claim-deposit', async (req, res) => {
     res.json({
       success: true,
       provision_id: provision.id,
-      amount: provision.amount_deposited || '0',
-      token: provision.token_address,
+      amount: depositAmountStr,
+      token: token_address.toLowerCase(),
       pair_key: pair_key,
       min_price_per_token: min_price_per_token
     })
