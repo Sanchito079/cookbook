@@ -2397,7 +2397,7 @@ async function createOrdersFromProvisions(network = 'bsc') {
       }
 
       const tokenAddr = provision.token_address
-      const remaining = toBN(provision.remaining_amount)
+      let remaining = toBN(provision.remaining_amount)
       const minPrice = Number(provision.min_price_per_token || '0')
 
       console.log(`[executor] ${network}: processing provision ${provision.id}, token=${tokenAddr}, remaining=${remaining.toString()}, minPrice=${minPrice}`)
@@ -2937,39 +2937,88 @@ async function attributeFillsToProvisions(network = 'bsc') {
       return
     }
 
+    // Debug: Also query orders with liquidity_provision_id to see which provisions have orders
+    const { data: provisionOrders } = await supabase
+      .from('orders')
+      .select('order_id, liquidity_provision_id, status, remaining, network')
+      .eq('network', network)
+      .not('liquidity_provision_id', 'is', null)
+
     console.log(`[executor] ${network}: found ${fills.length} fills to process`)
+    console.log(`[executor] ${network}: found ${provisionOrders?.length || 0} orders with liquidity_provision_id`)
+    
+    // Debug: Also query provisions with remaining_amount > 0
+    const { data: activeProvisions } = await supabase
+      .from('liquidity_provisions')
+      .select('id, depositor, token_address, remaining_amount, proceeds_earned, pair_key')
+      .eq('network', network)
+      .gt('remaining_amount', '0')
+      .neq('depositor', 'pending_claim')
+
+    if (activeProvisions && activeProvisions.length > 0) {
+      console.log(`[executor] ${network}: found ${activeProvisions.length} active provisions with remaining_amount > 0:`)
+      for (const p of activeProvisions) {
+        console.log(`[executor] ${network}:   provision ${p.id}: remaining=${p.remaining_amount}, token=${p.token_address}, pair=${p.pair_key}`)
+      }
+    }
+    
+    // Log the provision orders for debugging
+    if (provisionOrders && provisionOrders.length > 0) {
+      console.log(`[executor] ${network}: provision orders:`, provisionOrders.map(o => ({
+        order_id: o.order_id,
+        provision_id: o.liquidity_provision_id,
+        status: o.status,
+        remaining: o.remaining
+      })))
+    }
 
     let attributedCount = 0
     for (const fill of fills) {
-      // Get the order to find liquidity_provision_id
-      // Try both buy_order_id and sell_order_id
-      const { data: orders, error: orderError } = await supabase
+      console.log(`[executor] ${network}: processing fill ${fill.id}, buy_order_id: ${fill.buy_order_id}, sell_order_id: ${fill.sell_order_id}`)
+      
+      // Find the order by matching fill's buy_order_id or sell_order_id with order's order_id
+      let query = supabase
         .from('orders')
-        .select('liquidity_provision_id, token_out')
-        .or(`order_id.eq.${fill.buy_order_id},order_id.eq.${fill.sell_order_id}`)
-        .limit(1)
+        .select('order_id, liquidity_provision_id, token_out')
+
+      // Build OR conditions to match fill's order IDs against order's order_id
+      const orConditions = []
+      if (fill.buy_order_id) {
+        orConditions.push(`order_id.eq.${fill.buy_order_id}`)
+      }
+      if (fill.sell_order_id) {
+        orConditions.push(`order_id.eq.${fill.sell_order_id}`)
+      }
+      
+      if (orConditions.length > 0) {
+        query = query.or(orConditions.join(','))
+      }
+      
+      const { data: orders, error: orderError } = await query.limit(1)
 
       if (orderError) {
-        console.warn(`[executor] ${network}: error fetching order for fill ${fill.fill_id}:`, orderError.message)
+        console.warn(`[executor] ${network}: error fetching order for fill ${fill.id}:`, orderError.message)
         continue
       }
 
       if (!orders || orders.length === 0) {
-        console.log(`[executor] ${network}: fill ${fill.fill_id} has no linked order`)
+        console.log(`[executor] ${network}: fill ${fill.id} has no linked order (checked buy=${fill.buy_order_id}, sell=${fill.sell_order_id})`)
         continue
       }
 
       const order = orders[0]
+      console.log(`[executor] ${network}: fill ${fill.id} found order ${order.order_id} with liquidity_provision_id: ${order.liquidity_provision_id}`)
+      
       const provisionId = order.liquidity_provision_id
       if (!provisionId) {
-        console.log(`[executor] ${network}: fill ${fill.fill_id} order has no liquidity_provision_id`)
+        console.log(`[executor] ${network}: fill ${fill.id} order ${order.order_id} is a regular trade (no liquidity_provision_id), skipping`)
         continue
       }
 
       const filledAmount = toBN(fill.amount_base || '0')
       const proceeds = toBN(fill.amount_quote || '0')
 
-      console.log(`[executor] ${network}: processing fill ${fill.fill_id} - amount_base: ${filledAmount.toString()}, amount_quote: ${proceeds.toString()}, provision: ${provisionId}`)
+      console.log(`[executor] ${network}: processing fill ${fill.id} - buy_order: ${fill.buy_order_id}, sell_order: ${fill.sell_order_id}, amount_base: ${filledAmount.toString()}, amount_quote: ${proceeds.toString()}, provision: ${provisionId}`)
 
       // Update provision
       const { data: provision, error: provError } = await supabase
@@ -3039,7 +3088,6 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
-
 
 
 
