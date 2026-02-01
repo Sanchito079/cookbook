@@ -2919,13 +2919,15 @@ async function attributeFillsToProvisions(network = 'bsc') {
   console.log(`[executor] ${network}: attributing fills to provisions...`)
 
   try {
-    // Get all fills from the last 24 hours
+    // Get all unattributed fills from the last 24 hours
     const oneDayAgo = new Date(Date.now() - 86400000).toISOString()
     const { data: fills, error: fillsError } = await supabase
       .from('fills')
       .select('*')
       .eq('network', network)
       .gte('created_at', oneDayAgo)
+      .is('attributed_at', null)
+      .order('created_at', { ascending: true })
 
     if (fillsError) {
       console.warn(`[executor] ${network}: error fetching fills:`, fillsError.message)
@@ -3039,7 +3041,14 @@ async function attributeFillsToProvisions(network = 'bsc') {
 
       const currentRemaining = toBN(provision.remaining_amount || '0')
       const currentProceeds = toBN(provision.proceeds_earned || '0')
-      const newRemaining = currentRemaining - filledAmount
+      
+      // Calculate new values, but don't let remaining go below 0
+      // If fill amount exceeds remaining, cap the deduction
+      let newRemaining = currentRemaining - filledAmount
+      if (newRemaining < 0n) {
+        console.warn(`[executor] ${network}: fill amount ${filledAmount.toString()} exceeds remaining ${currentRemaining.toString()}, capping at 0`)
+        newRemaining = 0n
+      }
       const newProceeds = currentProceeds + proceeds
 
       console.log(`[executor] ${network}: updating provision ${provisionId} - remaining: ${currentRemaining.toString()} -> ${newRemaining.toString()}, proceeds: ${currentProceeds.toString()} -> ${newProceeds.toString()}`)
@@ -3057,8 +3066,14 @@ async function attributeFillsToProvisions(network = 'bsc') {
       if (updateError) {
         console.warn(`[executor] ${network}: error updating provision ${provisionId}:`, updateError.message)
       } else {
-        console.log(`[executor] ${network}: successfully attributed fill ${fill.fill_id} to provision ${provisionId}`)
+        console.log(`[executor] ${network}: successfully attributed fill ${fill.id} to provision ${provisionId}`)
         attributedCount++
+        
+        // Mark the fill as attributed to prevent duplicate processing
+        await supabase
+          .from('fills')
+          .update({ attributed_at: new Date().toISOString() })
+          .eq('id', fill.id)
       }
     }
 
@@ -3088,6 +3103,7 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
 
