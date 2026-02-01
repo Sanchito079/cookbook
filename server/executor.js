@@ -2409,18 +2409,38 @@ async function createOrdersFromProvisions(network = 'bsc') {
         .select('order_id, status, remaining')
         .eq('liquidity_provision_id', provision.id)
 
+      // Calculate total remaining from existing orders
+      let totalOrderRemaining = 0n
+      let hasOpenOrders = false
       if (existingOrders && existingOrders.length > 0) {
-        // Check if any orders are still open or partially filled
-        const hasOpenOrders = existingOrders.some(o => o.status === 'open' || o.status === 'partially_filled')
-        if (hasOpenOrders) {
-          console.log(`[executor] ${network}: skipping provision ${provision.id} - open orders already exist`)
-          continue
+        for (const order of existingOrders) {
+          const orderRemaining = toBN(order.remaining || '0')
+          totalOrderRemaining += orderRemaining
+          if (order.status === 'open' || order.status === 'partially_filled') {
+            hasOpenOrders = true
+          }
         }
-        // If all orders are filled, sum up remaining to see if we need new orders
-        const totalRemaining = existingOrders.reduce((sum, o) => sum + toBN(o.remaining || '0'), 0n)
-        if (totalRemaining > 0n) {
-          console.log(`[executor] ${network}: provision ${provision.id} has ${totalRemaining.toString()} remaining across filled orders`)
-        }
+        console.log(`[executor] ${network}: provision ${provision.id} has ${totalOrderRemaining.toString()} total remaining across ${existingOrders.length} orders`)
+      }
+
+      // Skip if there are open orders
+      if (hasOpenOrders) {
+        console.log(`[executor] ${network}: skipping provision ${provision.id} - open orders already exist`)
+        continue
+      }
+
+      // If all existing orders are filled but have remaining, don't create new orders
+      // The attributeFillsToProvisions function should update the provision's remaining_amount
+      if (totalOrderRemaining > 0n) {
+        console.log(`[executor] ${network}: skipping provision ${provision.id} - filled orders have ${totalOrderRemaining.toString()} remaining (waiting for update)`)
+        continue
+      }
+
+      // Use provision's remaining_amount as the source of truth
+      remaining = toBN(provision.remaining_amount)
+      if (remaining <= 0n) {
+        console.log(`[executor] ${network}: provision ${provision.id} has no remaining amount (${remaining.toString()}), skipping`)
+        continue
       }
 
       // Use pair_key to determine quote token
@@ -2899,49 +2919,83 @@ async function attributeFillsToProvisions(network = 'bsc') {
   console.log(`[executor] ${network}: attributing fills to provisions...`)
 
   try {
-    // Get recent fills for orders linked to provisions (expanded window to 1 hour)
-    const { data: fills } = await supabase
+    // Get all unfilled fills for orders linked to provisions (expanded window to 24 hours)
+    const oneDayAgo = new Date(Date.now() - 86400000).toISOString()
+    const { data: fills, error: fillsError } = await supabase
       .from('fills')
       .select('*, orders!inner(liquidity_provision_id, token_out)')
       .eq('network', network)
-      .gte('created_at', new Date(Date.now() - 3600000).toISOString()) // Last hour
+      .gte('created_at', oneDayAgo)
       .not('orders.liquidity_provision_id', 'is', null)
 
-    if (!fills || fills.length === 0) return
+    if (fillsError) {
+      console.warn(`[executor] ${network}: error fetching fills:`, fillsError.message)
+      return
+    }
+
+    if (!fills || fills.length === 0) {
+      console.log(`[executor] ${network}: no fills found to attribute`)
+      return
+    }
 
     console.log(`[executor] ${network}: found ${fills.length} fills to attribute`)
 
+    let attributedCount = 0
     for (const fill of fills) {
-      const provisionId = fill.orders.liquidity_provision_id
-      if (!provisionId) continue
+      const provisionId = fill.orders?.liquidity_provision_id
+      if (!provisionId) {
+        console.log(`[executor] ${network}: fill ${fill.fill_id} has no liquidity_provision_id`)
+        continue
+      }
 
-      const filledAmount = toBN(fill.amount_base)
-      const proceeds = toBN(fill.amount_quote)
+      const filledAmount = toBN(fill.amount_base || '0')
+      const proceeds = toBN(fill.amount_quote || '0')
+
+      console.log(`[executor] ${network}: processing fill ${fill.fill_id} - amount_base: ${filledAmount.toString()}, amount_quote: ${proceeds.toString()}`)
 
       // Update provision
-      const { data: provision } = await supabase
+      const { data: provision, error: provError } = await supabase
         .from('liquidity_provisions')
         .select('remaining_amount, proceeds_earned, proceeds_token')
         .eq('id', provisionId)
         .single()
 
-      if (provision) {
-        const newRemaining = toBN(provision.remaining_amount) - filledAmount
-        const newProceeds = toBN(provision.proceeds_earned) + proceeds
+      if (provError) {
+        console.warn(`[executor] ${network}: error fetching provision ${provisionId}:`, provError.message)
+        continue
+      }
 
-        await supabase
-          .from('liquidity_provisions')
-          .update({
-            remaining_amount: newRemaining.toString(),
-            proceeds_earned: newProceeds.toString(),
-            proceeds_token: provision.proceeds_token || fill.orders.token_out,
-            updated_at: new Date().toISOString()
-          })
-          .eq('id', provisionId)
+      if (!provision) {
+        console.warn(`[executor] ${network}: provision ${provisionId} not found`)
+        continue
+      }
 
-        console.log(`[executor] ${network}: attributed fill ${filledAmount.toString()} to provision ${provisionId}`)
+      const currentRemaining = toBN(provision.remaining_amount || '0')
+      const currentProceeds = toBN(provision.proceeds_earned || '0')
+      const newRemaining = currentRemaining - filledAmount
+      const newProceeds = currentProceeds + proceeds
+
+      console.log(`[executor] ${network}: updating provision ${provisionId} - remaining: ${currentRemaining.toString()} -> ${newRemaining.toString()}, proceeds: ${currentProceeds.toString()} -> ${newProceeds.toString()}`)
+
+      const { error: updateError } = await supabase
+        .from('liquidity_provisions')
+        .update({
+          remaining_amount: newRemaining.toString(),
+          proceeds_earned: newProceeds.toString(),
+          proceeds_token: provision.proceeds_token || fill.orders?.token_out,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', provisionId)
+
+      if (updateError) {
+        console.warn(`[executor] ${network}: error updating provision ${provisionId}:`, updateError.message)
+      } else {
+        console.log(`[executor] ${network}: successfully attributed fill ${fill.fill_id} to provision ${provisionId}`)
+        attributedCount++
       }
     }
+
+    console.log(`[executor] ${network}: attributed ${attributedCount} fills to provisions`)
   } catch (e) {
     console.warn(`[executor] ${network}: error attributing fills:`, e?.message || e)
   }
@@ -2967,6 +3021,7 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
 
