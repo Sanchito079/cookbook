@@ -3241,13 +3241,13 @@ app.post('/api/claim-deposit', async (req, res) => {
     // Get provider for network
     let provider
     if (network === 'base') {
-      provider = new ethers.JsonRpcProvider(process.env.EXECUTOR_RPC_URL_BASE || 'https://mainnet.base.org')
+      provider = new JsonRpcProvider(process.env.EXECUTOR_RPC_URL_BASE || 'https://mainnet.base.org')
     } else {
-      provider = new ethers.JsonRpcProvider(process.env.EXECUTOR_RPC_URL || 'https://bsc-dataseed.defibit.io')
+      provider = new JsonRpcProvider(process.env.EXECUTOR_RPC_URL || 'https://bsc-dataseed.defibit.io')
     }
 
     // Get token decimals
-    const tokenContract = new ethers.Contract(token_address, [
+    const tokenContract = new EthContract(token_address, [
       'function decimals() view returns (uint8)'
     ], provider)
     let decimals = 18
@@ -3258,7 +3258,7 @@ app.post('/api/claim-deposit', async (req, res) => {
     }
 
     // Get current balance of executor wallet
-    const balanceContract = new ethers.Contract(token_address, [
+    const balanceContract = new EthContract(token_address, [
       'function balanceOf(address) view returns (uint256)'
     ], provider)
     let balance = 0n
@@ -3580,7 +3580,6 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
-
 
 
 
