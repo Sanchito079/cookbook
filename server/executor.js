@@ -422,6 +422,10 @@ let settlementBase = null
 let busyBSC = false
 let busyBase = false
 
+// Cooldown tracking to avoid immediate re-matching causing micro-fills
+const EXECUTOR_COOLDOWN_MS = Number(process.env.EXECUTOR_COOLDOWN_MS || 5000)
+const cooldownUntil = new Map() // order_id -> epoch ms
+
 function makeProviderWithTimeout(url, timeoutMs = 60000) {
   try {
     const req = new FetchRequest(url)
@@ -1609,8 +1613,16 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   const baseDelivered = minOut(quoteIn, buy.amountIn, buy.amountOutMin)
   const newBuyRem = buyRemQuote - quoteIn
   const newSellRem = sellRemBase - baseOut
+
+  // Update remaining and set status appropriately
   await updateOrderRemaining(buyRow.order_id, newBuyRem, newBuyRem === 0n ? 'filled' : 'open', network)
   await updateOrderRemaining(sellRow.order_id, newSellRem, newSellRem === 0n ? 'filled' : 'open', network)
+
+  // Apply a short cooldown to both orders if not fully filled to avoid immediate re-match micro-fills
+  const nowMs = Date.now()
+  if (newBuyRem > 0n) cooldownUntil.set(buyRow.order_id, nowMs + EXECUTOR_COOLDOWN_MS)
+  if (newSellRem > 0n) cooldownUntil.set(sellRow.order_id, nowMs + EXECUTOR_COOLDOWN_MS)
+
   // No need to release explicitly; status is set by updateOrderRemaining
   return true
 }
@@ -1692,6 +1704,13 @@ async function runCrossChain() {
 }
 
 async function processOrders(rows, network = 'bsc') {
+  const nowTs = Date.now()
+  // Filter out orders currently on cooldown
+  rows = rows.filter(r => {
+    const until = cooldownUntil.get(r.order_id)
+    return !(until && until > nowTs)
+  })
+
   const byPair = new Map()
   for (const r of rows) {
     const base = (r.base || '').toLowerCase()
@@ -1714,7 +1733,7 @@ async function processOrders(rows, network = 'bsc') {
   console.log(`[executor] ${network}: organized into ${byPair.size} trading pairs`)
 
   let matchesThisCycle = 0
-  const maxMatchesPerCycle = 5
+  const maxMatchesPerCycle = 1
   for (const [pairKey, { base, quote, bids, asks }] of byPair.entries()) {
     console.log(`[executor] ${network}: pair ${pairKey} - bids: ${bids.length}, asks: ${asks.length}`)
 
@@ -2061,6 +2080,7 @@ async function runOnce(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
 
