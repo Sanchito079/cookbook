@@ -1086,16 +1086,13 @@ async function tryMatchPairCrossChain(base, quote, bids, asks) {
 
   // Enforce buyer's min base for the chosen quote
   const buyerMinBaseForQuoteIn = minOut(quoteNeededBySell, buy.amountIn, buy.amountOutMin)
-  if (buyerMinBaseForQuoteIn < baseOut) {
-    baseOut = buyerMinBaseForQuoteIn
-    if (baseOut <= 0n) return false
+  // Ensure buyer receives at least their minimum base for the quote being spent.
+  // If buyer's minimum exceeds baseOut, we cannot satisfy constraints at this size.
+  if (buyerMinBaseForQuoteIn > baseOut) {
+    // Try to reduce the quote to match the chosen baseOut and re-validate.
     quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-    if (quoteNeededBySell > buyRemQuote) {
-      baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin // floor
-      if (baseOut <= 0n) return false
-      quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-      if (quoteNeededBySell > buyRemQuote) return false
-    }
+    const buyerMinForAdjustedQuote = minOut(quoteNeededBySell, buy.amountIn, buy.amountOutMin)
+    if (buyerMinForAdjustedQuote > baseOut) return false
   }
 
   const quoteIn = quoteNeededBySell
@@ -1395,42 +1392,51 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   }
 
   // Cap by seller remaining and on-chain availabilities
+  const baseOutBudget = baseOut
   if (baseOut > sellRemBase) baseOut = sellRemBase
   if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
   if (baseOut > baseFromBuyAvail) baseOut = baseFromBuyAvail
+  const baseOutAfterCaps = baseOut
+  console.log(`[executor] ${network}: calc: baseOut budget=${baseOutBudget.toString()} afterCaps=${baseOutAfterCaps.toString()} sellRemBase=${sellRemBase.toString()} baseFromSellAvail=${baseFromSellAvail.toString()} baseFromBuyAvail=${baseFromBuyAvail.toString()}`)
   if (baseOut <= 0n) return false
 
   // Seller requires at least this much quote for that base, use ceil to avoid underpayment
   let quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
+  console.log(`[executor] ${network}: calc: quoteNeeded initial=${quoteNeededBySell.toString()} for baseOut=${baseOut.toString()}`)
 
   // If buyer can't cover, reduce baseOut using seller ratio inverted (floor), then recompute ceil quote
   if (quoteNeededBySell > buyRemQuote) {
+    const prevQuoteNeeded = quoteNeededBySell
+    const prevBaseOut = baseOut
     baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin // floor
+    console.log(`[executor] ${network}: adjust: buyer budget insufficient: quoteNeeded=${prevQuoteNeeded.toString()} > buyRemQuote=${buyRemQuote.toString()} . Shrinking baseOut ${prevBaseOut.toString()} -> ${baseOut.toString()}`)
     if (baseOut <= 0n) return false
+    const beforeCaps2 = baseOut
     if (baseOut > sellRemBase) baseOut = sellRemBase
     if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
     if (baseOut > baseFromBuyAvail) baseOut = baseFromBuyAvail
+    console.log(`[executor] ${network}: adjust: baseOut after caps=${baseOut.toString()} (preCaps=${beforeCaps2.toString()})`)
     if (baseOut <= 0n) return false
     quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
+    console.log(`[executor] ${network}: adjust: recomputed quoteNeeded=${quoteNeededBySell.toString()}`)
     if (quoteNeededBySell > buyRemQuote) return false
   }
 
   // Enforce buyer's min base for the chosen quote (floor)
   const buyerMinBaseForQuoteIn = minOut(quoteNeededBySell, buy.amountIn, buy.amountOutMin)
-  if (buyerMinBaseForQuoteIn < baseOut) {
-    baseOut = buyerMinBaseForQuoteIn
-    if (baseOut <= 0n) return false
+  // Ensure buyer receives at least their minimum base for the quote being spent.
+  // If buyer's minimum exceeds baseOut, we cannot satisfy constraints at this size.
+  if (buyerMinBaseForQuoteIn > baseOut) {
+    console.log(`[executor] ${network}: constraint: buyerMinBase=${buyerMinBaseForQuoteIn.toString()} > baseOut=${baseOut.toString()} - adjusting quote for fixed baseOut`)
+    // Try to reduce the quote to match the chosen baseOut and re-validate.
     quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-    if (quoteNeededBySell > buyRemQuote) {
-      // Final shrink to satisfy seller given buyer budget
-      baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin // floor
-      if (baseOut <= 0n) return false
-      quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-      if (quoteNeededBySell > buyRemQuote) return false
-    }
+    const buyerMinForAdjustedQuote = minOut(quoteNeededBySell, buy.amountIn, buy.amountOutMin)
+    console.log(`[executor] ${network}: constraint: adjusted quoteNeeded=${quoteNeededBySell.toString()} -> buyerMinForAdjustedQuote=${buyerMinForAdjustedQuote.toString()}`)
+    if (buyerMinForAdjustedQuote > baseOut) return false
   }
 
   const quoteIn = quoteNeededBySell
+  console.log(`[executor] ${network}: decision: proceed match baseOut=${baseOut.toString()} quoteIn=${quoteIn.toString()} buyRemQuote=${buyRemQuote.toString()} sellRemBase=${sellRemBase.toString()}`)
 
   // Preflight diagnostics (reuse diag)
   const pre = {
@@ -1662,8 +1668,6 @@ async function runCrossChain() {
 
     console.log(`[executor] cross-chain: organized into ${byPair.size} trading pairs`)
 
-    let matchesThisCycle = 0
-    const maxMatchesPerCycle = 20 // Increased to allow more fills per cycle
     for (const [pairKey, { base, quote, bids, asks }] of byPair.entries()) {
       console.log(`[executor] cross-chain: pair ${pairKey} - bids: ${bids.length}, asks: ${asks.length}`)
 
@@ -1673,93 +1677,20 @@ async function runCrossChain() {
       }
 
       console.log(`[executor] cross-chain: checking pair ${base}/${quote} for cross-chain matches`)
-      
-      // Continue matching the same pair until no more matches are possible
-      // This ensures maximum liquidity is filled per transaction cycle
-      let pairMatches = 0
-      const maxMatchesPerPair = 10 // Maximum matches per pair per cycle to prevent infinite loops
-      while (pairMatches < maxMatchesPerPair && matchesThisCycle < maxMatchesPerCycle) {
-        try {
-          const done = await tryMatchPairCrossChain(base, quote, bids, asks)
-          if (done) {
-            matchesThisCycle++
-            pairMatches++
-            console.log(`[executor] cross-chain: successfully matched cross-chain pair ${base}/${quote} (pair match ${pairMatches}/${maxMatchesPerPair}, total ${matchesThisCycle}/${maxMatchesPerCycle})`)
-            
-            // Refresh bids and asks from database to get updated remaining amounts
-            const refreshedRows = await fetchOpenOrdersCrossChain()
-            const refreshedByPair = new Map()
-            for (const r of refreshedRows) {
-              const rBase = (r.base || '').toLowerCase()
-              const rQuote = (r.quote || '').toLowerCase()
-              if (!rBase || !rQuote) continue
-              const rKey = `${rBase}|${rQuote}`
-              if (!refreshedByPair.has(rKey)) refreshedByPair.set(rKey, { base: rBase, quote: rQuote, bids: [], asks: [] })
-              const rGrp = refreshedByPair.get(rKey)
-              const rSide = classifyRowSide(rBase, rQuote, r)
-              if (rSide === 'ask') rGrp.asks.push(r)
-              else if (rSide === 'bid') rGrp.bids.push(r)
-            }
-            
-            // Update bids and asks for current pair with refreshed data
-            const refreshedPair = refreshedByPair.get(pairKey)
-            if (refreshedPair) {
-              bids.length = 0
-              asks.length = 0
-              bids.push(...refreshedPair.bids)
-              asks.push(...refreshedPair.asks)
-              
-              // Re-sort bids and asks
-              bids.sort((a, b) => {
-                const ainA = toBN(a.amount_in)
-                const aoutA = toBN(a.amount_out_min)
-                const ainB = toBN(b.amount_in)
-                const aoutB = toBN(b.amount_out_min)
-                const pA = ainA * 10n ** BigInt(18 + 18) / (aoutA * 10n ** BigInt(18))
-                const pB = ainB * 10n ** BigInt(18 + 18) / (aoutB * 10n ** BigInt(18))
-                if (pA > pB) return -1
-                if (pA < pB) return 1
-                return 0
-              })
-              asks.sort((a, b) => {
-                const ainA = toBN(a.amount_in)
-                const aoutA = toBN(a.amount_out_min)
-                const ainB = toBN(b.amount_in)
-                const aoutB = toBN(b.amount_out_min)
-                const pA = aoutA * 10n ** BigInt(18 + 18) / (ainA * 10n ** BigInt(18))
-                const pB = aoutB * 10n ** BigInt(18 + 18) / (ainB * 10n ** BigInt(18))
-                if (pA > pB) return 1
-                if (pA < pB) return -1
-                return 0
-              })
-              
-              // Check if we still have bids and asks
-              if (!bids.length || !asks.length) {
-                console.log(`[executor] cross-chain: no more bids or asks for pair ${base}/${quote} after match ${pairMatches}`)
-                break
-              }
-            } else {
-              console.log(`[executor] cross-chain: pair ${base}/${quote} no longer exists after match ${pairMatches}`)
-              break
-            }
-          } else {
-            console.log(`[executor] cross-chain: no more matches found for cross-chain pair ${base}/${quote} after ${pairMatches} match(es)`)
-            break
-          }
-        } catch (e) {
-          console.error(`[executor] cross-chain: match error for ${base}/${quote}:`, e?.message || e)
-          // Continue to next pair on error
-          break
+      try {
+        const done = await tryMatchPairCrossChain(base, quote, bids, asks)
+        if (done) {
+          console.log(`[executor] cross-chain: successfully matched cross-chain pair ${base}/${quote}`)
+          return // one match per tick
+        } else {
+          console.log(`[executor] cross-chain: no matches found for cross-chain pair ${base}/${quote}`)
         }
-      }
-      
-      if (matchesThisCycle >= maxMatchesPerCycle) {
-        console.log(`[executor] cross-chain: reached max matches per cycle (${maxMatchesPerCycle}), stopping`)
-        break
+      } catch (e) {
+        console.error(`[executor] cross-chain: match error for ${base}/${quote}:`, e?.message || e)
       }
     }
 
-    console.log(`[executor] cross-chain: execution cycle completed - ${matchesThisCycle} match(es)`)
+    console.log(`[executor] cross-chain: execution cycle completed - no matches found`)
 
   } catch (e) {
     console.error(`[executor] cross-chain: execution cycle failed:`, e?.message || e)
@@ -1789,7 +1720,7 @@ async function processOrders(rows, network = 'bsc') {
   console.log(`[executor] ${network}: organized into ${byPair.size} trading pairs`)
 
   let matchesThisCycle = 0
-  const maxMatchesPerCycle = 50 // Increased to allow more fills per cycle
+  const maxMatchesPerCycle = 5
   for (const [pairKey, { base, quote, bids, asks }] of byPair.entries()) {
     console.log(`[executor] ${network}: pair ${pairKey} - bids: ${bids.length}, asks: ${asks.length}`)
 
@@ -1799,86 +1730,20 @@ async function processOrders(rows, network = 'bsc') {
     }
 
     console.log(`[executor] ${network}: checking pair ${base}/${quote} for matches`)
-    
-    // Continue matching the same pair until no more matches are possible
-    // This ensures maximum liquidity is filled per transaction cycle
-    let pairMatches = 0
-    const maxMatchesPerPair = 20 // Maximum matches per pair per cycle to prevent infinite loops
-    while (pairMatches < maxMatchesPerPair && matchesThisCycle < maxMatchesPerCycle) {
-      try {
-        const done = await tryMatchPairOnce(base, quote, bids, asks, network)
-        if (done) {
-          matchesThisCycle++
-          pairMatches++
-          console.log(`[executor] ${network}: successfully matched pair ${base}/${quote} (pair match ${pairMatches}/${maxMatchesPerPair}, total ${matchesThisCycle}/${maxMatchesPerCycle})`)
-          
-          // Refresh bids and asks from database to get updated remaining amounts
-          // This ensures we're working with the latest order states
-          const refreshedRows = await fetchOpenOrdersAll(network)
-          const refreshedByPair = new Map()
-          for (const r of refreshedRows) {
-            const rBase = (r.base || '').toLowerCase()
-            const rQuote = (r.quote || '').toLowerCase()
-            if (!rBase || !rQuote) continue
-            const rKey = `${rBase}|${rQuote}`
-            if (!refreshedByPair.has(rKey)) refreshedByPair.set(rKey, { base: rBase, quote: rQuote, bids: [], asks: [] })
-            const rGrp = refreshedByPair.get(rKey)
-            const rSide = classifyRowSide(rBase, rQuote, r)
-            if (rSide === 'ask') rGrp.asks.push(r)
-            else if (rSide === 'bid') rGrp.bids.push(r)
-          }
-          
-          // Update bids and asks for current pair with refreshed data
-          const refreshedPair = refreshedByPair.get(pairKey)
-          if (refreshedPair) {
-            bids.length = 0
-            asks.length = 0
-            bids.push(...refreshedPair.bids)
-            asks.push(...refreshedPair.asks)
-            
-            // Re-sort bids and asks
-            bids.sort((a, b) => {
-              const pb = priceBid(b)
-              const pa = priceBid(a)
-              if (pb === null && pa === null) return 0
-              if (pb === null) return 1
-              if (pa === null) return -1
-              if (pb !== pa) return Number(pb - pa)
-              return new Date(a.created_at || a.updated_at) - new Date(b.created_at || b.updated_at)
-            })
-            asks.sort((a, b) => {
-              const pa = priceAsk(a)
-              const pb = priceAsk(b)
-              if (pa === null && pb === null) return 0
-              if (pa === null) return 1
-              if (pb === null) return -1
-              if (pa !== pb) return Number(pa - pb)
-              return new Date(a.created_at || a.updated_at) - new Date(b.created_at || b.updated_at)
-            })
-            
-            // Check if we still have bids and asks
-            if (!bids.length || !asks.length) {
-              console.log(`[executor] ${network}: no more bids or asks for pair ${base}/${quote} after match ${pairMatches}`)
-              break
-            }
-          } else {
-            console.log(`[executor] ${network}: pair ${base}/${quote} no longer exists after match ${pairMatches}`)
-            break
-          }
-        } else {
-          console.log(`[executor] ${network}: no more matches found for pair ${base}/${quote} after ${pairMatches} match(es)`)
+    try {
+      const done = await tryMatchPairOnce(base, quote, bids, asks, network)
+      if (done) {
+        matchesThisCycle++
+        console.log(`[executor] ${network}: successfully matched pair ${base}/${quote} (${matchesThisCycle}/${maxMatchesPerCycle})`)
+        if (matchesThisCycle >= maxMatchesPerCycle) {
+          console.log(`[executor] ${network}: reached max matches per cycle (${maxMatchesPerCycle}), stopping`)
           break
         }
-      } catch (e) {
-        console.error(`[executor] ${network}: match error for ${base}/${quote}:`, e?.message || e)
-        // Continue to next pair on error
-        break
+      } else {
+        console.log(`[executor] ${network}: no matches found for pair ${base}/${quote}`)
       }
-    }
-    
-    if (matchesThisCycle >= maxMatchesPerCycle) {
-      console.log(`[executor] ${network}: reached max matches per cycle (${maxMatchesPerCycle}), stopping`)
-      break
+    } catch (e) {
+      console.error(`[executor] ${network}: match error for ${base}/${quote}:`, e?.message || e)
     }
   }
 
@@ -1941,8 +1806,6 @@ async function processOrdersSolana(rows) {
 
   console.log(`[executor] solana: organized into ${byPair.size} trading pairs`)
 
-  let matchesThisCycle = 0
-  const maxMatchesPerCycle = 20 // Increased to allow more fills per cycle
   for (const [pairKey, { base, quote, bids, asks }] of byPair.entries()) {
     console.log(`[executor] solana: pair ${pairKey} - bids: ${bids.length}, asks: ${asks.length}`)
 
@@ -1952,102 +1815,18 @@ async function processOrdersSolana(rows) {
     }
 
     console.log(`[executor] solana: checking pair ${base}/${quote} for matches`)
-    
-    // Continue matching the same pair until no more matches are possible
-    // This ensures maximum liquidity is filled per transaction cycle
-    let pairMatches = 0
-    const maxMatchesPerPair = 10 // Maximum matches per pair per cycle to prevent infinite loops
-    while (pairMatches < maxMatchesPerPair && matchesThisCycle < maxMatchesPerCycle) {
-      try {
-        const done = await tryMatchPairSolana(base, quote, bids, asks)
-        if (done) {
-          matchesThisCycle++
-          pairMatches++
-          console.log(`[executor] solana: successfully matched pair ${base}/${quote} (pair match ${pairMatches}/${maxMatchesPerPair}, total ${matchesThisCycle}/${maxMatchesPerCycle})`)
-          
-          // Refresh bids and asks from database to get updated remaining amounts
-          const { data: refreshedRows, error } = await supabase
-            .from('orders')
-            .select('*')
-            .eq('network', 'solana')
-            .eq('status', 'open')
-            .gt('remaining', '0')
-            .order('updated_at', { ascending: true })
-            .limit(500)
-          
-          if (error || !refreshedRows) {
-            console.log(`[executor] solana: failed to refresh orders after match ${pairMatches}`)
-            break
-          }
-          
-          const refreshedByPair = new Map()
-          for (const r of refreshedRows) {
-            const rBase = (r.base || '').toLowerCase()
-            const rQuote = (r.quote || '').toLowerCase()
-            if (!rBase || !rQuote) continue
-            const rKey = `${rBase}|${rQuote}`
-            if (!refreshedByPair.has(rKey)) refreshedByPair.set(rKey, { base: rBase, quote: rQuote, bids: [], asks: [] })
-            const rGrp = refreshedByPair.get(rKey)
-            const rSide = classifyRowSide(rBase, rQuote, r)
-            if (rSide === 'ask') rGrp.asks.push(r)
-            else if (rSide === 'bid') rGrp.bids.push(r)
-          }
-          
-          // Update bids and asks for current pair with refreshed data
-          const refreshedPair = refreshedByPair.get(pairKey)
-          if (refreshedPair) {
-            bids.length = 0
-            asks.length = 0
-            bids.push(...refreshedPair.bids)
-            asks.push(...refreshedPair.asks)
-            
-            // Re-sort bids and asks
-            bids.sort((a, b) => {
-              const pb = priceBid(b)
-              const pa = priceBid(a)
-              if (pb === null && pa === null) return 0
-              if (pb === null) return 1
-              if (pa === null) return -1
-              if (pb !== pa) return Number(pb - pa)
-              return new Date(a.created_at || a.updated_at) - new Date(b.created_at || b.updated_at)
-            })
-            asks.sort((a, b) => {
-              const pa = priceAsk(a)
-              const pb = priceAsk(b)
-              if (pa === null && pb === null) return 0
-              if (pa === null) return 1
-              if (pb === null) return -1
-              if (pa !== pb) return Number(pa - pb)
-              return new Date(a.created_at || a.updated_at) - new Date(b.created_at || b.updated_at)
-            })
-            
-            // Check if we still have bids and asks
-            if (!bids.length || !asks.length) {
-              console.log(`[executor] solana: no more bids or asks for pair ${base}/${quote} after match ${pairMatches}`)
-              break
-            }
-          } else {
-            console.log(`[executor] solana: pair ${base}/${quote} no longer exists after match ${pairMatches}`)
-            break
-          }
-        } else {
-          console.log(`[executor] solana: no more matches found for pair ${base}/${quote} after ${pairMatches} match(es)`)
-          break
-        }
-      } catch (e) {
-        console.error(`[executor] solana: match error for ${base}/${quote}:`, e?.message || e)
-        // Continue to next pair on error
-        break
+    try {
+      const done = await tryMatchPairSolana(base, quote, bids, asks)
+      if (done) {
+        console.log(`[executor] solana: successfully matched pair ${base}/${quote}`)
+        return // one match per cycle
+      } else {
+        console.log(`[executor] solana: no matches found for pair ${base}/${quote}`)
       }
-    }
-    
-    if (matchesThisCycle >= maxMatchesPerCycle) {
-      console.log(`[executor] solana: reached max matches per cycle (${maxMatchesPerCycle}), stopping`)
-      break
+    } catch (e) {
+      console.error(`[executor] solana: match error for ${base}/${quote}:`, e?.message || e)
     }
   }
-  
-  console.log(`[executor] solana: execution cycle completed - ${matchesThisCycle} match(es)`)
 }
 
 async function tryMatchPairSolana(base, quote, bids, asks) {
@@ -2130,16 +1909,13 @@ async function tryMatchPairSolana(base, quote, bids, asks) {
   }
 
   const buyerMinBaseForQuoteIn = minOut(quoteNeededBySell, buy.amountIn, buy.amountOutMin)
-  if (buyerMinBaseForQuoteIn < baseOut) {
-    baseOut = buyerMinBaseForQuoteIn
-    if (baseOut <= 0n) return false
+  // Ensure buyer receives at least their minimum base for the quote being spent.
+  // If buyer's minimum exceeds baseOut, we cannot satisfy constraints at this size.
+  if (buyerMinBaseForQuoteIn > baseOut) {
+    // Try to reduce the quote to match the chosen baseOut and re-validate.
     quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-    if (quoteNeededBySell > buyRemQuote) {
-      baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin
-      if (baseOut <= 0n) return false
-      quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-      if (quoteNeededBySell > buyRemQuote) return false
-    }
+    const buyerMinForAdjustedQuote = minOut(quoteNeededBySell, buy.amountIn, buy.amountOutMin)
+    if (buyerMinForAdjustedQuote > baseOut) return false
   }
 
   const quoteIn = quoteNeededBySell
@@ -2288,6 +2064,8 @@ async function runOnce(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
+
 
 
 
