@@ -1481,6 +1481,22 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, time: Date.now() })
 })
 
+// Get executor wallet address for direct deposits
+app.get('/api/executor-address', (req, res) => {
+  try {
+    const network = (req.query.network || 'bsc').toString()
+    const EXECUTOR_PRIVATE_KEY = process.env.EXECUTOR_PRIVATE_KEY
+    if (!EXECUTOR_PRIVATE_KEY) {
+      return res.status(500).json({ error: 'EXECUTOR_PRIVATE_KEY not configured' })
+    }
+    const wallet = new Wallet(EXECUTOR_PRIVATE_KEY)
+    res.json({ executorAddress: wallet.address, network })
+  } catch (e) {
+    console.error('[api] executor-address error:', e?.message || e)
+    res.status(500).json({ error: 'Failed to get executor address' })
+  }
+})
+
 // Return token pairs strictly using markets search criteria
 app.get('/api/token-pairs', async (req, res) => {
   try {
@@ -3512,6 +3528,8 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
+
 
 
 
