@@ -2403,16 +2403,24 @@ async function createOrdersFromProvisions(network = 'bsc') {
       console.log(`[executor] ${network}: processing provision ${provision.id}, token=${tokenAddr}, remaining=${remaining.toString()}, minPrice=${minPrice}`)
 
       // Check if orders already exist for this provision to prevent duplicates
+      // Only create new orders if there are no existing orders OR all orders are filled
       const { data: existingOrders } = await supabase
         .from('orders')
-        .select('order_id')
+        .select('order_id, status, remaining')
         .eq('liquidity_provision_id', provision.id)
-        .eq('status', 'open')
-        .limit(1)
 
       if (existingOrders && existingOrders.length > 0) {
-        console.log(`[executor] ${network}: skipping provision ${provision.id} - orders already exist`)
-        continue
+        // Check if any orders are still open or partially filled
+        const hasOpenOrders = existingOrders.some(o => o.status === 'open' || o.status === 'partially_filled')
+        if (hasOpenOrders) {
+          console.log(`[executor] ${network}: skipping provision ${provision.id} - open orders already exist`)
+          continue
+        }
+        // If all orders are filled, sum up remaining to see if we need new orders
+        const totalRemaining = existingOrders.reduce((sum, o) => sum + toBN(o.remaining || '0'), 0n)
+        if (totalRemaining > 0n) {
+          console.log(`[executor] ${network}: provision ${provision.id} has ${totalRemaining.toString()} remaining across filled orders`)
+        }
       }
 
       // Use pair_key to determine quote token
@@ -2891,14 +2899,17 @@ async function attributeFillsToProvisions(network = 'bsc') {
   console.log(`[executor] ${network}: attributing fills to provisions...`)
 
   try {
-    // Get recent fills for custodial orders
+    // Get recent fills for orders linked to provisions (expanded window to 1 hour)
     const { data: fills } = await supabase
       .from('fills')
-      .select('*, orders!inner(liquidity_provision_id)')
+      .select('*, orders!inner(liquidity_provision_id, token_out)')
       .eq('network', network)
-      .gte('created_at', new Date(Date.now() - 60000).toISOString()) // Last minute
+      .gte('created_at', new Date(Date.now() - 3600000).toISOString()) // Last hour
+      .not('orders.liquidity_provision_id', 'is', null)
 
     if (!fills || fills.length === 0) return
+
+    console.log(`[executor] ${network}: found ${fills.length} fills to attribute`)
 
     for (const fill of fills) {
       const provisionId = fill.orders.liquidity_provision_id
@@ -2956,7 +2967,6 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
-
 
 
 
