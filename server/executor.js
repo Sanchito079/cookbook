@@ -4,7 +4,7 @@ import { fileURLToPath } from 'url'
 import crypto from 'crypto'
 import fetch from 'node-fetch'
 import { createClient } from '@supabase/supabase-js'
-import { Contract, JsonRpcProvider, Wallet, FetchRequest, verifyTypedData } from 'ethers'
+import { Contract, JsonRpcProvider, Wallet, FetchRequest } from 'ethers'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -21,17 +21,9 @@ const EXECUTOR_RPC_URL = process.env.EXECUTOR_RPC_URL
 const EXECUTOR_RPC_URL_BASE = process.env.EXECUTOR_RPC_URL_BASE
 const EXECUTOR_RPC_URLS = (process.env.EXECUTOR_RPC_URLS || '').split(',').map(s => s.trim()).filter(Boolean)
 const EXECUTOR_PRIVATE_KEY = process.env.EXECUTOR_PRIVATE_KEY
-const CUSTODIAL_PRIVATE_KEY = process.env.CUSTODIAL_PRIVATE_KEY
 const SETTLEMENT_ADDRESS_BSC = process.env.SETTLEMENT_ADDRESS_BSC || '0x7DBA6a1488356428C33cC9fB8Ef3c8462c8679d0'
 const SETTLEMENT_ADDRESS_BASE = process.env.SETTLEMENT_ADDRESS_BASE || '0xBBf7A39F053BA2B8F4991282425ca61F2D871f45'
-const CUSTODIAL_ADDRESS = '0x95c448c49F07B11F0201c4Df19E7a0DE7AEB2865'
-
-// Liquidity provision configuration
-// Tranche sizing for provisions: percentage of remaining (basis points), and minimum base tokens per tranche
-const PROVISION_TRANCHE_BPS = Number(process.env.PROVISION_TRANCHE_BPS || 2000) // default 20%
-const PROVISION_MIN_TRANCHE_BASE_TOKENS = Number(process.env.PROVISION_MIN_TRANCHE_BASE_TOKENS || 100) // default 100 tokens
-// Price update threshold to avoid frequent re-signs: minimum percent change to trigger update
-const PROVISION_PRICE_UPDATE_PCT = Number(process.env.PROVISION_PRICE_UPDATE_PCT || 1) // default 1%
+const CUSTODIAL_ADDRESS = '0x70c992e6a19c565430fa0c21933395ebf1e907c3'
 
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE
@@ -384,30 +376,6 @@ function classifyRowSide(base, quote, r) {
   return null
 }
 
-
-function sortOrdersByPriceTime(orders, isBid) {
-  return orders.sort((a, b) => {
-    const priceA = isBid ? priceBid(a) : priceAsk(a)
-    const priceB = isBid ? priceBid(b) : priceAsk(b)
-    
-    if (priceA === null && priceB === null) return 0
-    if (priceA === null) return 1
-    if (priceB === null) return -1
-    
-    // Compare prices using proper operators for BigInt
-    if (priceA !== priceB) {
-      // For bids: higher price first (return -1 if A < B)
-      // For asks: lower price first (return 1 if A > B)
-      return isBid ? -1 : 1
-    }
-    
-    // Price-time priority: earlier orders first
-    const timeA = new Date(a.created_at || a.updated_at)
-    const timeB = new Date(b.created_at || b.updated_at)
-    return timeA - timeB
-  })
-}
-
 function getNetworkForToken(address) {
   const addr = (address || '').toLowerCase()
   if (addr === '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c') return 'bsc' // WBNB
@@ -449,8 +417,6 @@ let providerBSC = null
 let providerBase = null
 let walletBSC = null
 let walletBase = null
-let custodialWalletBSC = null
-let custodialWalletBase = null
 let settlement = null
 let settlementBase = null
 let busyBSC = false
@@ -516,13 +482,6 @@ async function initProvidersAndWallets() {
         }
 
         const w = new Wallet(EXECUTOR_PRIVATE_KEY, prov)
-
-        // Create custodial wallet if private key is provided
-        let custodialW = null
-        if (CUSTODIAL_PRIVATE_KEY) {
-          custodialW = new Wallet(CUSTODIAL_PRIVATE_KEY, prov)
-          console.log(`[executor] ${network.name} custodial wallet: ${custodialW.address}`)
-        }
 
         // Assign to global variables
         if (network.name === 'BSC') {
@@ -638,7 +597,7 @@ async function fetchOpenOrdersAll(network = 'bsc') {
     .from('orders')
     .select('*')
     .eq('network', network)
-    .in('status', ['open', 'partially_filled'])
+    .eq('status', 'open')
     .gt('remaining', '0')
     .order('updated_at', { ascending: true })
     .limit(500)
@@ -651,7 +610,7 @@ async function fetchOpenOrdersCrossChain() {
     .from('cross_chain_orders')
     .select('*')
     .eq('network', 'crosschain')
-    .in('status', ['open', 'partially_filled'])
+    .eq('status', 'open')
     .gt('remaining', '0')
     .order('updated_at', { ascending: true })
     .limit(500)
@@ -858,23 +817,7 @@ async function updateOrderRemaining(orderId, newRemaining, newStatus, network = 
   try {
     const table = network === 'crosschain' ? 'cross_chain_orders' : 'orders'
     const patch = { remaining: newRemaining.toString(), updated_at: new Date().toISOString() }
-    
-    // Only update status if explicitly provided and it's not 'open' for partially filled orders
-    // Partially filled orders should remain 'processing' or become 'partially_filled'
-    if (newStatus) {
-      if (newStatus === 'open') {
-        // Don't downgrade from 'processing' to 'open' - this breaks reservation logic
-        // Instead, use 'partially_filled' for orders that still have remaining amount
-        if (newRemaining > 0n) {
-          patch.status = 'partially_filled'
-        } else {
-          patch.status = 'filled'
-        }
-      } else {
-        patch.status = newStatus
-      }
-    }
-    
+    if (newStatus) patch.status = newStatus
     const { error } = await supabase
       .from(table)
       .update(patch)
@@ -907,21 +850,16 @@ async function reserveOrder(orderId, network = 'bsc') {
   const nowIso = new Date().toISOString()
   const statusUpdate = network === 'crosschain' ? {} : { status: 'processing' }
   try {
-    // Allow reservation of orders that are 'open' or 'partially_filled'
     const { data, error } = await supabase
       .from(table)
       .update({ ...statusUpdate, updated_at: nowIso })
       .eq('order_id', orderId)
-      .in('status', ['open', 'partially_filled'])
+      .eq('status', 'open')
       .gt('remaining', '0')
       .select('order_id, status, remaining')
       .limit(1)
     if (error) throw error
-    const success = Array.isArray(data) && data.length === 1
-    if (!success) {
-      console.warn(`[executor] reserveOrder failed for ${orderId}: order not found, already reserved, or has no remaining`)
-    }
-    return success
+    return Array.isArray(data) && data.length === 1
   } catch (e) {
     console.warn('[executor] reserveOrder failed:', e?.message || e)
     return false
@@ -956,68 +894,8 @@ const ERC20_MIN_ABI = [
   { inputs: [{ name: 'owner', type: 'address' }, { name: 'spender', type: 'address' }], name: 'allowance', outputs: [{ type: 'uint256' }], stateMutability: 'view', type: 'function' },
   { inputs: [{ name: 'account', type: 'address' }], name: 'balanceOf', outputs: [{ type: 'uint256' }], stateMutability: 'view', type: 'function' },
   { inputs: [{ name: 'from', type: 'address' }, { name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }], name: 'transferFrom', outputs: [{ type: 'bool' }], stateMutability: 'nonpayable', type: 'function' },
-  { inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }], name: 'transfer', outputs: [{ type: 'bool' }], stateMutability: 'nonpayable', type: 'function' },
-  { inputs: [], name: 'decimals', outputs: [{ type: 'uint8' }], stateMutability: 'view', type: 'function' },
-  { inputs: [{ name: 'spender', type: 'address' }, { name: 'amount', type: 'uint256' }], name: 'approve', outputs: [{ type: 'bool' }], stateMutability: 'nonpayable', type: 'function' }
+  { inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }], name: 'transfer', outputs: [{ type: 'bool' }], stateMutability: 'nonpayable', type: 'function' }
 ]
-
-// Cache for token decimals
-const decimalsCache = new Map()
-
-// Function to fetch decimals from contract
-async function fetchTokenDecimals(tokenAddr, network = 'bsc') {
-  if (!tokenAddr) return 18
-  const addr = tokenAddr.toString().toLowerCase()
-  const cacheKey = `${network}:${addr}`
-
-  // Check cache
-  if (decimalsCache.has(cacheKey)) {
-    return decimalsCache.get(cacheKey)
-  }
-
-  try {
-    const provider = network === 'base' ? providerBase : providerBSC
-    if (!provider) return 18
-
-    const contract = new Contract(addr, [
-      { inputs: [], name: 'decimals', outputs: [{ type: 'uint8' }], stateMutability: 'view', type: 'function' }
-    ], provider)
-
-    const decimals = await contract.decimals()
-    const decimalsNum = Number(decimals)
-
-    // Cache result
-    decimalsCache.set(cacheKey, decimalsNum)
-    console.log(`[executor] Fetched decimals for ${addr} on ${network}: ${decimalsNum}`)
-    return decimalsNum
-  } catch (error) {
-    console.warn(`[executor] Failed to fetch decimals for ${addr} on ${network}:`, error.message)
-    // Fallback to DB or hardcoded
-    try {
-      if (supabase) {
-        const { data } = await supabase
-          .from('tokens')
-          .select('decimals')
-          .eq('address', addr)
-          .eq('network', network)
-          .single()
-        if (data?.decimals) {
-          decimalsCache.set(cacheKey, data.decimals)
-          return data.decimals
-        }
-      }
-    } catch {}
-
-    // Hardcoded fallbacks
-    if (addr === '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c') return 18 // WBNB
-    if (addr === '0x55d398326f99059ff775485246999027b3197955') return 18 // USDT BSC
-    if (addr === '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d') return 18 // USDC BSC
-    if (addr === '0x4200000000000000000000000000000000000006') return 18 // WETH Base
-    if (addr === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913') return 6 // USDC Base
-
-    return 18 // Default
-  }
-}
 
 async function preflightDiagnostics(buyRow, sellRow, network = 'bsc') {
   const buy = normalizeOrderJson(buyRow.order_json || buyRow.order || {})
@@ -1025,35 +903,15 @@ async function preflightDiagnostics(buyRow, sellRow, network = 'bsc') {
   const sigBuy = buyRow.signature || ''
   const sigSell = sellRow.signature || ''
 
-  // Recover signers off-chain to catch domain/field drift quickly
-  try {
-    const recBuy = await recoverOrderSigner(buy, sigBuy, network)
-    const recSell = await recoverOrderSigner(sell, sigSell, network)
-    console.log(`[executor] ${network}: recovered signers - buy: ${recBuy || 'n/a'}, sell: ${recSell || 'n/a'}`)
-    console.log(`[executor] ${network}: expected makers - buy: ${String(buy.maker).toLowerCase()}, sell: ${String(sell.maker).toLowerCase()}`)
-  } catch { /* best-effort debug */ }
-
   const settlementContract = network === 'base' ? settlementBase : settlement
   const settlementAddress = network === 'base' ? SETTLEMENT_ADDRESS_BASE : SETTLEMENT_ADDRESS_BSC
   const providerForNetwork = network === 'base' ? providerBase : providerBSC
 
   const [sigBuyOk, sigSellOk, availBuy, availSell] = await Promise.all([
-    settlementContract.verifySignature(buy, sigBuy).catch((e) => {
-      console.warn(`[executor] ${network}: buy signature verification failed:`, e?.message || e)
-      return false
-    }),
-    settlementContract.verifySignature(sell, sigSell).catch((e) => {
-      console.warn(`[executor] ${network}: sell signature verification failed:`, e?.message || e)
-      return false
-    }),
-    settlementContract.availableToFill(buy).catch((e) => {
-      console.warn(`[executor] ${network}: buy availableToFill failed:`, e?.message || e)
-      return 0n
-    }),
-    settlementContract.availableToFill(sell).catch((e) => {
-      console.warn(`[executor] ${network}: sell availableToFill failed:`, e?.message || e)
-      return 0n
-    })
+    settlementContract.verifySignature(buy, sigBuy).catch(() => false),
+    settlementContract.verifySignature(sell, sigSell).catch(() => false),
+    settlementContract.availableToFill(buy).catch(() => 0n),
+    settlementContract.availableToFill(sell).catch(() => 0n)
   ])
 
   const buyerErc = new Contract(buy.tokenIn, ERC20_MIN_ABI, providerForNetwork)
@@ -1145,10 +1003,6 @@ async function tryMatchPairCrossChain(base, quote, bids, asks) {
     console.log(`[executor] cross-chain: no best bid or ask available for ${base}/${quote}`)
     return false
   }
-
-  // Store original indices for removal from in-memory arrays (AFTER sorting)
-  const bestBidIndex = bids.findIndex(b => b.order_id === bestBid.order_id)
-  const bestAskIndex = asks.findIndex(a => a.order_id === bestAsk.order_id)
 
   // Skip self-trading
   if (bestBid.maker === bestAsk.maker) {
@@ -1397,30 +1251,6 @@ async function tryMatchPairCrossChain(base, quote, bids, asks) {
     await updateOrderRemaining(buyRow.order_id, newBuyRem, newBuyRem === 0n ? 'filled' : 'open', buyRow.network)
     await updateOrderRemaining(sellRow.order_id, newSellRem, newSellRem === 0n ? 'filled' : 'open', sellRow.network)
 
-    // Remove matched orders from in-memory arrays to prevent re-matching
-    if (bestBidIndex >= 0 && bestBidIndex < bids.length) {
-      if (newBuyRem === 0n) {
-        // Fully filled - remove from array
-        bids.splice(bestBidIndex, 1)
-        console.log(`[executor] cross-chain: removed fully filled buy order ${buyRow.order_id} from in-memory bids`)
-      } else {
-        // Partially filled - update remaining amount in array
-        bids[bestBidIndex].remaining = newBuyRem.toString()
-        console.log(`[executor] cross-chain: updated partially filled buy order ${buyRow.order_id} remaining to ${newBuyRem.toString()}`)
-      }
-    }
-    if (bestAskIndex >= 0 && bestAskIndex < asks.length) {
-      if (newSellRem === 0n) {
-        // Fully filled - remove from array
-        asks.splice(bestAskIndex, 1)
-        console.log(`[executor] cross-chain: removed fully filled sell order ${sellRow.order_id} from in-memory asks`)
-      } else {
-        // Partially filled - update remaining amount in array
-        asks[bestAskIndex].remaining = newSellRem.toString()
-        console.log(`[executor] cross-chain: updated partially filled sell order ${sellRow.order_id} remaining to ${newSellRem.toString()}`)
-      }
-    }
-
     return true
 
   } catch (e) {
@@ -1467,21 +1297,34 @@ async function tryMatchPairCrossChain(base, quote, bids, asks) {
 async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   console.log(`[executor] ${network}: sorting ${bids.length} bids and ${asks.length} asks for ${base}/${quote}`)
 
-  // Sort orders with price-time priority
-  const sortedBids = sortOrdersByPriceTime(bids, true)
-  const sortedAsks = sortOrdersByPriceTime(asks, false)
+  bids.sort((a, b) => {
+    const pb = priceBid(b)
+    const pa = priceBid(a)
+    if (pb === null && pa === null) return 0
+    if (pb === null) return 1
+    if (pa === null) return -1
+    if (pb !== pa) return Number(pb - pa)
+    // same price, earlier time first
+    return new Date(a.created_at || a.updated_at) - new Date(b.created_at || b.updated_at)
+  }) // highest bid first, then earliest time
+  asks.sort((a, b) => {
+    const pa = priceAsk(a)
+    const pb = priceAsk(b)
+    if (pa === null && pb === null) return 0
+    if (pa === null) return 1
+    if (pb === null) return -1
+    if (pa !== pb) return Number(pa - pb)
+    // same price, earlier time first
+    return new Date(a.created_at || a.updated_at) - new Date(b.created_at || b.updated_at)
+  }) // lowest ask first, then earliest time
 
-  const bestBid = sortedBids[0]
-  const bestAsk = sortedAsks[0]
+  const bestBid = bids[0]
+  const bestAsk = asks[0]
 
   if (!bestBid || !bestAsk) {
     console.log(`[executor] ${network}: no best bid or ask available for ${base}/${quote}`)
     return false
   }
-
-  // Store original indices for removal from in-memory arrays
-  const bestBidIndex = bids.findIndex(b => b.order_id === bestBid.order_id)
-  const bestAskIndex = asks.findIndex(a => a.order_id === bestAsk.order_id)
 
   // Skip self-trading
   if (bestBid.maker === bestAsk.maker) {
@@ -1540,127 +1383,87 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
     return false
   }
 
-  // PROFESSIONAL MAX-FILL: compute single-shot max at execution price (ask price)
-  const execPrice = pAsk // quote per base, 1e18 scaled
+  // Convert availBuy (in quote for buy order) to base capacity via buy ratio (floor)
+  const baseFromBuyAvail = minOut(diag.availBuy, buy.amountIn, buy.amountOutMin)
+  const baseFromSellAvail = diag.availSell // already base
 
-  // Buyer max base by quote budget at exec price
-  const maxBaseByBuyer = (buyRemQuote * 10n ** 18n) / execPrice
-  // Seller max base by remaining
-  const maxBaseBySeller = sellRemBase
-
-  // On-chain capacities converted consistently
-  const baseFromSellAvail = diag.availSell
-  const baseFromBuyAvail = (diag.availBuy * 10n ** 18n) / execPrice
-
-  // Candidate baseOut is min of all caps
-  let baseOut = maxBaseByBuyer
-  if (baseFromBuyAvail < baseOut) baseOut = baseFromBuyAvail
-  if (baseFromSellAvail < baseOut) baseOut = baseFromSellAvail
-  if (maxBaseBySeller < baseOut) baseOut = maxBaseBySeller
-
-  // Compute quote needed at exec price
-  let quoteIn = (baseOut * execPrice) / 10n ** 18n
-
-  // Enforce strict all-or-nothing: if baseOut is not equal to full max by any clamp, reject
-  // Determine the true max across all constraints
-  const trueMax = [maxBaseByBuyer, baseFromBuyAvail, baseFromSellAvail, maxBaseBySeller].reduce((m, v) => (v < m ? v : m))
-
+  // Start strictly from buyer's quote budget in base units (floor)
+  let baseOut = minOut(buyRemQuote, buy.amountIn, buy.amountOutMin)
   if (baseOut <= 0n) {
-    console.log(`[executor] ${network}: SKIP max-fill: no possible size`, { maxBaseByBuyer: maxBaseByBuyer.toString(), baseFromBuyAvail: baseFromBuyAvail.toString(), baseFromSellAvail: baseFromSellAvail.toString(), maxBaseBySeller: maxBaseBySeller.toString() })
+    console.log('[executor] skip: buyer budget insufficient', { buyRemQuote: buyRemQuote.toString(), buyId: buyRow.order_id })
     return false
   }
 
-  // Enforce minOuts once at the candidate size
-  // Buyer: for quoteIn must receive at least min base (buy.amountOutMin scaled by proportion of original)
-  const buyerMinBaseForQuote = minOut(quoteIn, buy.amountIn, buy.amountOutMin)
-  if (baseOut < buyerMinBaseForQuote) {
-    // Apply 1-wei rounding buffer for buyer minOut
-    if (baseOut + 1n >= buyerMinBaseForQuote) {
-      console.log(`[executor] ${network}: rounding-buffer: buyer minOut satisfied with +1 wei`, { baseOut: baseOut.toString(), buyerMinBaseForQuote: buyerMinBaseForQuote.toString() })
-    } else {
-      console.log(`[executor] ${network}: SKIP max-fill: buyer minOut not satisfied`, { baseOut: baseOut.toString(), buyerMinBaseForQuote: buyerMinBaseForQuote.toString() })
-      return false
-    }
-  }
-  // Seller: for baseOut must receive at least min quote
-  const sellerMinQuoteForBase = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-  // Always snap seller side if needed (raise quoteIn and adjust baseOut), then re-check caps
-  if (quoteIn < sellerMinQuoteForBase) {
-    console.log(`[executor] ${network}: snapping: raising quoteIn to sellerMinQuoteForBase`, { quoteIn: quoteIn.toString(), sellerMin: sellerMinQuoteForBase.toString() })
-    quoteIn = sellerMinQuoteForBase
-    // Adjust baseOut down so buyer still meets minOut for the lifted quote
-    const buyerMinBaseForNewQuote = minOut(quoteIn, buy.amountIn, buy.amountOutMin)
-    if (baseOut > buyerMinBaseForNewQuote) baseOut = buyerMinBaseForNewQuote
-    // Buyer budget must still cover quoteIn
-    if (quoteIn > buyRemQuote) {
-      console.log(`[executor] ${network}: SKIP after seller snap: quote exceeds buyer budget`, { quoteIn: quoteIn.toString(), buyRemQuote: buyRemQuote.toString() })
-      return false
-    }
-    // Re-cap baseOut against all capacities
-    if (baseOut > maxBaseBySeller) baseOut = maxBaseBySeller
+  // Cap by seller remaining and on-chain availabilities
+  if (baseOut > sellRemBase) baseOut = sellRemBase
+  if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
+  if (baseOut > baseFromBuyAvail) baseOut = baseFromBuyAvail
+  if (baseOut <= 0n) return false
+
+  // Seller requires at least this much quote for that base, use ceil to avoid underpayment
+  let quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
+
+  // If buyer can't cover, reduce baseOut using seller ratio inverted (floor), then recompute ceil quote
+  if (quoteNeededBySell > buyRemQuote) {
+    baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin // floor
+    if (baseOut <= 0n) return false
+    if (baseOut > sellRemBase) baseOut = sellRemBase
     if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
-    const baseFromBuyAvailAfter = (diag.availBuy * 10n ** 18n) / execPrice
-    if (baseOut > baseFromBuyAvailAfter) baseOut = baseFromBuyAvailAfter
-    if (baseOut <= 0n) {
-      console.log(`[executor] ${network}: SKIP after seller snap: no feasible baseOut`)
-      return false
+    if (baseOut > baseFromBuyAvail) baseOut = baseFromBuyAvail
+    if (baseOut <= 0n) return false
+    quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
+    if (quoteNeededBySell > buyRemQuote) return false
+  }
+
+  // Enforce buyer's min base for the chosen quote (floor)
+  const buyerMinBaseForQuoteIn = minOut(quoteNeededBySell, buy.amountIn, buy.amountOutMin)
+  if (buyerMinBaseForQuoteIn < baseOut) {
+    baseOut = buyerMinBaseForQuoteIn
+    if (baseOut <= 0n) return false
+    quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
+    if (quoteNeededBySell > buyRemQuote) {
+      // Final shrink to satisfy seller given buyer budget
+      baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin // floor
+      if (baseOut <= 0n) return false
+      quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
+      if (quoteNeededBySell > buyRemQuote) return false
     }
   }
 
-  // Ensure buyer-side minOut as well, snapping baseOut up if necessary and adjusting quoteIn
-  const buyerMinBaseForQuote2 = minOut(quoteIn, buy.amountIn, buy.amountOutMin)
-  if (baseOut < buyerMinBaseForQuote2) {
-    console.log(`[executor] ${network}: snapping: raising baseOut to buyerMinBaseForQuote`, { baseOut: baseOut.toString(), buyerMin: buyerMinBaseForQuote2.toString() })
-    baseOut = buyerMinBaseForQuote2
-    const minQuoteForThisBase = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-    if (quoteIn < minQuoteForThisBase) quoteIn = minQuoteForThisBase
-    if (quoteIn > buyRemQuote) {
-      console.log(`[executor] ${network}: SKIP after buyer snap: quote exceeds buyer budget`, { quoteIn: quoteIn.toString(), buyRemQuote: buyRemQuote.toString() })
-      return false
-    }
-    if (baseOut > maxBaseBySeller) baseOut = maxBaseBySeller
-    if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
-    const baseFromBuyAvailAfter2 = (diag.availBuy * 10n ** 18n) / execPrice
-    if (baseOut > baseFromBuyAvailAfter2) baseOut = baseFromBuyAvailAfter2
-    if (baseOut <= 0n) {
-      console.log(`[executor] ${network}: SKIP after buyer snap: no feasible baseOut`)
-      return false
-    }
-  }
+  const quoteIn = quoteNeededBySell
 
-  // Final safety: recompute strict minOuts with snapped params
-  const buyerMinBaseFinal = minOut(quoteIn, buy.amountIn, buy.amountOutMin)
-  if (baseOut < buyerMinBaseFinal) {
-    console.log(`[executor] ${network}: SKIP final check: buyer minOut not satisfied after snap`, { baseOut: baseOut.toString(), buyerMinBaseFinal: buyerMinBaseFinal.toString() })
-    return false
-  }
-  const sellerMinQuoteFinal = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
-  if (quoteIn < sellerMinQuoteFinal) {
-    console.log(`[executor] ${network}: SKIP final check: seller minOut not satisfied after snap`, { quoteIn: quoteIn.toString(), sellerMinQuoteFinal: sellerMinQuoteFinal.toString() })
-    return false
-  }
-
-  // If any cap reduced trueMax to less than seller's entire remaining or buyer's entire budget, we still consider it max fill for this moment.
-  // To adhere to "fill the max available and wait till next order", we proceed exactly once with this baseOut and do not loop.
-
+  // Preflight diagnostics (reuse diag)
   const pre = {
     pair: `${base}/${quote}`,
-    mode: 'max-fill',
-    execPrice1e18: execPrice.toString(),
-    pBid1e18: pBid?.toString?.(),
-    pAsk1e18: pAsk?.toString?.(),
-    caps: {
-      maxBaseByBuyer: maxBaseByBuyer.toString(),
-      maxBaseBySeller: maxBaseBySeller.toString(),
-      baseFromBuyAvail: baseFromBuyAvail.toString(),
-      baseFromSellAvail: baseFromSellAvail.toString(),
-      chosenBaseOut: baseOut.toString(),
-      chosenQuoteIn: quoteIn.toString()
-    },
+    sigBuyOk: !!diag.sigBuyOk,
+    sigSellOk: !!diag.sigSellOk,
+    availBuy: diag.availBuy.toString(),
+    availSell: diag.availSell.toString(),
+    buyerAllowance: diag.buyerAllowance.toString(),
+    buyerBalance: diag.buyerBalance.toString(),
+    sellerAllowance: diag.sellerAllowance.toString(),
+    sellerBalance: diag.sellerBalance.toString(),
+    amountQuote: quoteIn.toString(),
+    amountBase: baseOut.toString(),
+    buyId: buyRow.order_id,
+    sellId: sellRow.order_id,
+    bidPrice1e18: pBid?.toString?.(),
+    askPrice1e18: pAsk?.toString?.()
+  }
+  console.log(`[executor] ${network}: preflight diagnostics for ${base}/${quote}:`, pre)
+
+  // Human-friendly price (quote per base) for logs only
+  const humanBid = Number(pBid) / 1e18
+  const humanAsk = Number(pAsk) / 1e18
+  console.log('[executor] matching', {
+    pair: `${base}/${quote}`,
+    bidPrice: humanBid,
+    askPrice: humanAsk,
+    quoteIn: quoteIn.toString(),
+    baseOut: baseOut.toString(),
     buyId: buyRow.order_id,
     sellId: sellRow.order_id
-  }
-  console.log(`[executor] ${network}: MAX-FILL preflight`, pre)
+  })
 
   // Reserve both orders atomically to avoid duplicate execution
   let lockedBuy = false, lockedSell = false
@@ -1670,18 +1473,18 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   if (!lockedSell) { console.log(`[executor] ${network}: failed to reserve sell order ${sellRow.order_id}`); await releaseOrder(buyRow.order_id, network, 'open'); return false }
 
   try {
-    console.log(`[executor] ${network}: attempting MAX-FILL match for ${base}/${quote}`, { baseOut: baseOut.toString(), quoteIn: quoteIn.toString() })
+    console.log(`[executor] ${network}: attempting to match orders for ${base}/${quote}`)
     const settlementContract = network === 'base' ? settlementBase : settlement
     const tx = await settlementContract.matchOrders(buy, sigBuy, sell, sigSell, baseOut, quoteIn)
     console.log(`[executor] ${network}: match tx sent: ${tx.hash}`)
     const receipt = await tx.wait()
     console.log(`[executor] ${network}: match tx confirmed in block ${receipt.blockNumber}`)
-
     // Persist fill record for UI consumption
     try {
-      const netForDb = buyRow.network || network || 'bsc'
+      // Insert into fills table
+      const network = buyRow.network || 'bsc'
       await supabase.from('fills').insert({
-        network: netForDb,
+        network: network,
         buy_order_id: buyRow.order_id,
         sell_order_id: sellRow.order_id,
         amount_base: baseOut.toString(),
@@ -1696,10 +1499,11 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
       const quoteAddr = (buyRow.quote_address || sellRow.quote_address || '').toLowerCase()
       const pair = baseAddr && quoteAddr ? `${baseAddr}/${quoteAddr}` : 'unknown'
 
-      // Determine decimals for human price
+      // Determine decimals for human price: DB lookup first, then canonical overrides (cannot be overridden)
       let baseDec = 18
       let quoteDec = 18
       try {
+        // 1) Fetch from tokens table if available
         const decRows = []
         if (baseAddr) decRows.push({ addr: baseAddr, role: 'base' })
         if (quoteAddr) decRows.push({ addr: quoteAddr, role: 'quote' })
@@ -1707,7 +1511,7 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
           const { data: t } = await supabase
             .from('tokens')
             .select('address,decimals')
-            .eq('network', netForDb)
+            .eq('network', network)
             .in('address', decRows.map(x => x.addr))
           if (t && Array.isArray(t)) {
             for (const row of t) {
@@ -1717,20 +1521,36 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
             }
           }
         }
-        if (netForDb === 'base') {
-          if (baseAddr === '0x4200000000000000000000000000000000000006') baseDec = 18
-          if (quoteAddr === '0x4200000000000000000000000000000000000006') quoteDec = 18
-          if (baseAddr === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913') baseDec = 6
-          if (quoteAddr === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913') quoteDec = 6
+        // 2) Apply canonical overrides last to avoid bad DB values
+        if (network === 'base') {
+          if (baseAddr === '0x4200000000000000000000000000000000000006') baseDec = 18 // WETH
+          if (quoteAddr === '0x4200000000000000000000000000000000000006') quoteDec = 18 // WETH
+          if (baseAddr === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913') baseDec = 6  // USDC (unlikely base)
+          if (quoteAddr === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913') quoteDec = 6 // USDC
+          if (quoteAddr === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913' && quoteDec !== 6) {
+            console.warn('[executor] WARNING: USDC on Base detected with non-6 decimals from DB; forcing to 6')
+          }
         }
       } catch {}
-
+      // Compute human price = (quote/10^qDec) / (base/10^bDec)
       const qFloat = Number(quoteIn)
       const bFloat = Number(baseOut)
       const priceHuman = (qFloat / Math.pow(10, quoteDec)) / (bFloat / Math.pow(10, baseDec))
-      await supabase.from('trades').insert({
-        network: netForDb,
+      console.log('[executor] inserting trade', {
+        network,
         pair,
+        baseAddr,
+        quoteAddr,
+        baseDec,
+        quoteDec,
+        amountBase: baseOut.toString(),
+        amountQuote: quoteIn.toString(),
+        priceHuman
+      })
+
+      await supabase.from('trades').insert({
+        network: network,
+        pair: pair,
         base_address: baseAddr,
         quote_address: quoteAddr,
         amount_base: baseOut.toString(),
@@ -1741,17 +1561,23 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
         created_at: new Date().toISOString()
       })
 
+      // Broadcast real-time update to clients
       try {
-        const INDEXER_BASE = 'https://cookbook-hjnhgq.fly.dev'
+      const INDEXER_BASE = 'https://cookbook-hjnhgq.fly.dev'
         await fetch(`${INDEXER_BASE}/api/broadcast`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            network: netForDb,
+            network,
             base: baseAddr,
             quote: quoteAddr,
             type: 'new_fill',
-            data: { amount_base: baseOut.toString(), amount_quote: quoteIn.toString(), price: priceHuman, tx_hash: receipt.hash || tx.hash }
+            data: {
+              amount_base: baseOut.toString(),
+              amount_quote: quoteIn.toString(),
+              price: priceHuman,
+              tx_hash: receipt.hash || tx.hash
+            }
           })
         })
       } catch (broadcastErr) {
@@ -1763,33 +1589,29 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   } catch (e) {
     const sel = decodeRevertSelector(e?.data)
     console.error('[executor] match revert:', sel || 'unknown', 'selector', (e?.data ? e.data.slice(0,10) : 'n/a'))
-    console.error('[executor] context:', { mode: 'max-fill', base, quote })
+    console.error('[executor] context:', pre)
+    // Provide extra hints on common reasons
+    if (sel === 'PriceTooLow') {
+      console.error('[executor] hint: prices not mutually compatible at chosen size; check min constraints and crossing condition pBid >= pAsk')
+    } else if (sel === 'Overfill') {
+      console.error('[executor] hint: baseOut exceeded on-chain availableToFill; try reducing size or requery availabilities')
+    } else if (sel === 'InvalidOrder') {
+      console.error('[executor] hint: order may be expired, cancelled, or minNonce bumped')
+    } else if (sel === 'BadSignature') {
+      console.error('[executor] hint: signature does not match order digest/domain')
+    }
+    // Release locks on failure
     try { if (lockedBuy) await releaseOrder(buyRow.order_id, network, 'open') } catch {}
     try { if (lockedSell) await releaseOrder(sellRow.order_id, network, 'open') } catch {}
     throw e
   }
 
+  const baseDelivered = minOut(quoteIn, buy.amountIn, buy.amountOutMin)
   const newBuyRem = buyRemQuote - quoteIn
   const newSellRem = sellRemBase - baseOut
   await updateOrderRemaining(buyRow.order_id, newBuyRem, newBuyRem === 0n ? 'filled' : 'open', network)
   await updateOrderRemaining(sellRow.order_id, newSellRem, newSellRem === 0n ? 'filled' : 'open', network)
-
-  if (newBuyRem === 0n && bestBidIndex !== -1) {
-    bids.splice(bestBidIndex, 1)
-    console.log(`[executor] ${network}: removed fully filled buy order ${buyRow.order_id} from in-memory bids`)
-  } else if (bestBidIndex !== -1) {
-    bids[bestBidIndex].remaining = newBuyRem.toString()
-    console.log(`[executor] ${network}: updated partially filled buy order ${buyRow.order_id} remaining to ${newBuyRem.toString()}`)
-  }
-
-  if (newSellRem === 0n && bestAskIndex !== -1) {
-    asks.splice(bestAskIndex, 1)
-    console.log(`[executor] ${network}: removed fully filled sell order ${sellRow.order_id} from in-memory asks`)
-  } else if (bestAskIndex !== -1) {
-    asks[bestAskIndex].remaining = newSellRem.toString()
-    console.log(`[executor] ${network}: updated partially filled sell order ${sellRow.order_id} remaining to ${newSellRem.toString()}`)
-  }
-
+  // No need to release explicitly; status is set by updateOrderRemaining
   return true
 }
 
@@ -1849,18 +1671,13 @@ async function runCrossChain() {
       }
 
       console.log(`[executor] cross-chain: checking pair ${base}/${quote} for cross-chain matches`)
-      
-      // Continue matching until no more matches are possible
-      let matchCount = 0
-      const maxMatchesPerPair = 10 // Safety limit to prevent infinite loops
-      
-      // Single-shot per pair per cycle for cross-chain
       try {
         const done = await tryMatchPairCrossChain(base, quote, bids, asks)
         if (done) {
-          console.log(`[executor] cross-chain: MAX-FILL completed for ${base}/${quote} — waiting next cycle`)
+          console.log(`[executor] cross-chain: successfully matched cross-chain pair ${base}/${quote}`)
+          return // one match per tick
         } else {
-          console.log(`[executor] cross-chain: no match (or not max-fillable) for ${base}/${quote} — skipping`)
+          console.log(`[executor] cross-chain: no matches found for cross-chain pair ${base}/${quote}`)
         }
       } catch (e) {
         console.error(`[executor] cross-chain: match error for ${base}/${quote}:`, e?.message || e)
@@ -1897,8 +1714,7 @@ async function processOrders(rows, network = 'bsc') {
   console.log(`[executor] ${network}: organized into ${byPair.size} trading pairs`)
 
   let matchesThisCycle = 0
-  const maxMatchesPerCycle = 50 // Increased to allow more matches per cycle
-  
+  const maxMatchesPerCycle = 5
   for (const [pairKey, { base, quote, bids, asks }] of byPair.entries()) {
     console.log(`[executor] ${network}: pair ${pairKey} - bids: ${bids.length}, asks: ${asks.length}`)
 
@@ -1908,23 +1724,20 @@ async function processOrders(rows, network = 'bsc') {
     }
 
     console.log(`[executor] ${network}: checking pair ${base}/${quote} for matches`)
-    
-    // Single-shot max-fill per pair per cycle
     try {
       const done = await tryMatchPairOnce(base, quote, bids, asks, network)
       if (done) {
         matchesThisCycle++
-        console.log(`[executor] ${network}: MAX-FILL completed for ${base}/${quote} — waiting next cycle`)
+        console.log(`[executor] ${network}: successfully matched pair ${base}/${quote} (${matchesThisCycle}/${maxMatchesPerCycle})`)
+        if (matchesThisCycle >= maxMatchesPerCycle) {
+          console.log(`[executor] ${network}: reached max matches per cycle (${maxMatchesPerCycle}), stopping`)
+          break
+        }
       } else {
-        console.log(`[executor] ${network}: no match (or not max-fillable) for ${base}/${quote} — skipping`)
+        console.log(`[executor] ${network}: no matches found for pair ${base}/${quote}`)
       }
     } catch (e) {
       console.error(`[executor] ${network}: match error for ${base}/${quote}:`, e?.message || e)
-    }
-    
-    if (matchesThisCycle >= maxMatchesPerCycle) {
-      console.log(`[executor] ${network}: reached max matches per cycle (${maxMatchesPerCycle}), stopping`)
-      break
     }
   }
 
@@ -2076,31 +1889,33 @@ async function tryMatchPairSolana(base, quote, bids, asks) {
     return false
   }
 
-      // Cap amounts
-      // PROFESSIONAL FILL ALGORITHM - SINGLE CALCULATION
-      // 1) execution price = maker price (ask price)
-      const execPrice = pAsk  // quote per base, 1e18 scaled
+  // Cap amounts
+  let baseOut = minOut(buyRemQuote, buy.amountIn, buy.amountOutMin)
+  if (baseOut > sellRemBase) baseOut = sellRemBase
+  if (baseOut <= 0n) return false
 
-      // 2) max base buyer can afford
-      const maxBaseByBuyer = (buyRemQuote * BigInt(1000000000000000000)) / execPrice
+  let quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
+  if (quoteNeededBySell > buyRemQuote) {
+    baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin
+    if (baseOut <= 0n) return false
+    quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
+    if (quoteNeededBySell > buyRemQuote) return false
+  }
 
-      // 3) max base seller can sell
-      const maxBaseBySeller = sellRemBase
-
-      // 4) final fill - maximum possible fill
-      let baseOut = maxBaseByBuyer < maxBaseBySeller ? maxBaseByBuyer : maxBaseBySeller
-
+  const buyerMinBaseForQuoteIn = minOut(quoteNeededBySell, buy.amountIn, buy.amountOutMin)
+  if (buyerMinBaseForQuoteIn < baseOut) {
+    baseOut = buyerMinBaseForQuoteIn
+    if (baseOut <= 0n) return false
+    quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
+    if (quoteNeededBySell > buyRemQuote) {
+      baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin
       if (baseOut <= 0n) return false
+      quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
+      if (quoteNeededBySell > buyRemQuote) return false
+    }
+  }
 
-      // 5) quote used
-      const quoteIn = (baseOut * execPrice) / BigInt(1000000000000000000)
-
-      // 6) enforce minOut ONCE - reject if constraints not met
-      // buyer constraint
-      if (baseOut < buy.amountOutMin) return false
-
-      // seller constraint
-      if (quoteIn < sell.amountOutMin) return false
+  const quoteIn = quoteNeededBySell
 
   // Use Jupiter to get quote and check if it meets the requirements
   try {
@@ -2197,17 +2012,6 @@ async function runOnce(network = 'bsc') {
   }
 
   try {
-    // Check for new custodial deposits
-    await checkCustodialDeposits(network)
-
-    // Create orders from liquidity provisions
-    await createOrdersFromProvisions(network)
-    
-    // Update prices for existing custodial orders
-    // IMPORTANT: Run AFTER createOrdersFromProvisions to avoid race condition
-    // where new orders are being cancelled immediately after creation
-    await updateCustodialOrderPrices(network)
-
     // First check conditional orders (using current market prices)
     console.log(`[executor] ${network}: checking conditional orders...`)
     const triggeredOrderIds = await checkAndTriggerConditionalOrders(network)
@@ -2224,9 +2028,6 @@ async function runOnce(network = 'bsc') {
       console.log(`[executor] ${network}: no open orders found`)
     }
 
-    // Attribute fills to provisions
-    await attributeFillsToProvisions(network)
-
     console.log(`[executor] ${network}: execution cycle completed`)
 
   } catch (e) {
@@ -2237,849 +2038,6 @@ async function runOnce(network = 'bsc') {
     } else {
       busyBSC = false
     }
-  }
-}
-
-// =============================
-// LIQUIDITY PROVISION FUNCTIONS
-// =============================
-
-  async function checkCustodialDeposits(network = 'bsc') {
-    if (!supabase) return
-
-    console.log(`[executor] ${network}: checking deposits...`)
-
-    try {
-      // Get all tokens that have provisions in the database for this network
-      // Include both claimed provisions AND pending_claim provisions to detect new deposits
-      const { data: existingProvisions } = await supabase
-        .from('liquidity_provisions')
-        .select('token_address')
-        .eq('network', network)
-
-      // Get unique token addresses from existing provisions (already filtered by network)
-      const tokensFromDb = [...new Set(existingProvisions?.map(p => p.token_address) || [])]
-
-      // Only check tokens that have provisions in the database
-      // This prevents creating provisions for tokens that happen to have a balance but weren't intentionally deposited
-      const tokensToCheck = tokensFromDb
-
-      for (const tokenAddr of tokensToCheck) {
-        // Get current balance
-        const tokenContract = new Contract(tokenAddr, ERC20_MIN_ABI, provider)
-        const balance = await tokenContract.balanceOf(wallet.address).catch(() => 0n)
-        const balanceStr = balance.toString()
-
-        // Get sum of remaining amounts in provisions (including pending_claim to prevent duplicates)
-        const { data: provisions } = await supabase
-          .from('liquidity_provisions')
-          .select('remaining_amount')
-          .eq('network', network)
-          .eq('token_address', tokenAddr)
-
-        const totalRemaining = provisions?.reduce((sum, p) => sum + toBN(p.remaining_amount), 0n) || 0n
-
-        if (toBN(balanceStr) > totalRemaining) {
-          const excess = toBN(balanceStr) - totalRemaining
-          console.log(`[executor] ${network}: detected deposit of ${excess.toString()} ${tokenAddr} to executor wallet`)
-
-          // Check if provision already exists for this token/network (any depositor)
-          const { data: existingProvision } = await supabase
-            .from('liquidity_provisions')
-            .select('id, pair_key, amount_deposited, remaining_amount')
-            .eq('network', network)
-            .eq('token_address', tokenAddr)
-            .single()
-
-          if (existingProvision) {
-            // Update existing provision with detected deposit amount
-            const newAmountDeposited = toBN(existingProvision.amount_deposited || '0') + excess
-            const newRemaining = toBN(existingProvision.remaining_amount || '0') + excess
-            const { error: updateError } = await supabase
-              .from('liquidity_provisions')
-              .update({
-                amount_deposited: newAmountDeposited.toString(),
-                remaining_amount: newRemaining.toString(),
-                updated_at: new Date().toISOString()
-              })
-              .eq('id', existingProvision.id)
-
-            if (updateError) {
-              console.warn(`[executor] ${network}: error updating provision:`, updateError.message)
-            } else {
-              console.log(`[executor] ${network}: updated provision ${existingProvision.id} with ${excess.toString()} ${tokenAddr}`)
-            }
-          } else {
-            // Create pending provision without pair_key - user will provide it when claiming
-            const { error: insertError } = await supabase.from('liquidity_provisions').insert({
-              network,
-              depositor: 'pending_claim',
-              token_address: tokenAddr,
-              amount_deposited: excess.toString(),
-              min_price_per_token: '0', // Will be set on claim
-              remaining_amount: excess.toString(),
-              pair_key: null // Will be set on claim
-            })
-
-            if (insertError) {
-              console.warn(`[executor] ${network}: error creating provision:`, insertError.message)
-            } else {
-              console.log(`[executor] ${network}: created pending provision for ${excess.toString()} ${tokenAddr}`)
-            }
-          }
-        }
-      }
-    } catch (e) {
-      console.warn(`[executor] ${network}: error checking deposits:`, e?.message || e)
-    }
-  }
-
-async function createOrdersFromProvisions(network = 'bsc') {
-  const wallet = network === 'base' ? walletBase : walletBSC
-  if (!supabase || !wallet) return
-
-  console.log(`[executor] ${network}: creating orders from liquidity provisions...`)
-
-  try {
-    // Get provisions with remaining amount (excluding pending_claim - only claimed provisions)
-    const { data: provisions } = await supabase
-      .from('liquidity_provisions')
-      .select('*')
-      .eq('network', network)
-      .gt('remaining_amount', '0')
-      .neq('depositor', 'pending_claim')
-
-    if (!provisions || provisions.length === 0) {
-      console.log(`[executor] ${network}: no provisions with remaining amount found`)
-      return
-    }
-
-    console.log(`[executor] ${network}: found ${provisions.length} provisions to process`)
-
-    // Get recent prices for pairs
-    const pairPrices = new Map()
-    for (const p of provisions) {
-      // Skip provisions without pair_key (not yet claimed)
-      if (!p.pair_key) {
-        console.log(`[executor] ${network}: skipping provision ${p.id} - no pair_key set`)
-        continue
-      }
-
-      if (pairPrices.has(p.pair_key)) continue
-
-      const [base, quote] = p.pair_key.split('/')
-      const { data: trades } = await supabase
-        .from('trades')
-        .select('price')
-        .eq('network', network)
-        .eq('base_address', base)
-        .eq('quote_address', quote)
-        .order('created_at', { ascending: false })
-        .limit(10)
-
-      if (trades && trades.length > 0) {
-        const avgPrice = trades.reduce((sum, t) => sum + Number(t.price), 0) / trades.length
-        pairPrices.set(p.pair_key, avgPrice)
-      }
-    }
-
-    for (const provision of provisions) {
-      // Skip provisions without pair_key (not yet claimed)
-      if (!provision.pair_key) {
-        console.log(`[executor] ${network}: skipping provision ${provision.id} - no pair_key set`)
-        continue
-      }
-
-      // Skip provisions that are still pending_claim (not yet claimed by user)
-      if (provision.depositor === 'pending_claim') {
-        console.log(`[executor] ${network}: skipping provision ${provision.id} - still pending_claim`)
-        continue
-      }
-
-      const tokenAddr = provision.token_address
-      let remaining = toBN(provision.remaining_amount)
-      const minPrice = Number(provision.min_price_per_token || '0')
-
-      console.log(`[executor] ${network}: processing provision ${provision.id}, token=${tokenAddr}, remaining=${remaining.toString()}, minPrice=${minPrice}`)
-
-      // Check if orders already exist for this provision to prevent duplicates
-      // Only create new orders if there are no existing orders OR all orders are filled
-      const { data: existingOrders } = await supabase
-        .from('orders')
-        .select('order_id, status, remaining')
-        .eq('liquidity_provision_id', provision.id)
-
-      // Calculate total remaining from existing orders
-      let totalOrderRemaining = 0n
-      let hasOpenOrders = false
-      if (existingOrders && existingOrders.length > 0) {
-        for (const order of existingOrders) {
-          const orderRemaining = toBN(order.remaining || '0')
-          totalOrderRemaining += orderRemaining
-          if (order.status === 'open' || order.status === 'partially_filled') {
-            hasOpenOrders = true
-          }
-        }
-        console.log(`[executor] ${network}: provision ${provision.id} has ${totalOrderRemaining.toString()} total remaining across ${existingOrders.length} orders`)
-      }
-
-      // Skip if there are open orders
-      if (hasOpenOrders) {
-        console.log(`[executor] ${network}: skipping provision ${provision.id} - open orders already exist`)
-        continue
-      }
-
-      // If all existing orders are filled but have remaining, don't create new orders
-      // The attributeFillsToProvisions function should update the provision's remaining_amount
-      if (totalOrderRemaining > 0n) {
-        console.log(`[executor] ${network}: skipping provision ${provision.id} - filled orders have ${totalOrderRemaining.toString()} remaining (waiting for update)`)
-        continue
-      }
-
-      // Use provision's remaining_amount as the source of truth
-      remaining = toBN(provision.remaining_amount)
-      if (remaining <= 0n) {
-        console.log(`[executor] ${network}: provision ${provision.id} has no remaining amount (${remaining.toString()}), skipping`)
-        continue
-      }
-
-      // Use pair_key to determine quote token
-      // Handle both / and _ separators for backward compatibility
-      const separator = provision.pair_key.includes('/') ? '/' : '_'
-      const [baseAddr, quoteAddr] = provision.pair_key.split(separator)
-      if (baseAddr.toLowerCase() !== tokenAddr.toLowerCase()) {
-        console.log(`[executor] ${network}: provision pair_key mismatch for ${provision.id}`)
-        console.log(`[executor] ${network}: expected base=${tokenAddr}, got base=${baseAddr}, pair_key=${provision.pair_key}`)
-        continue
-      }
-
-      // Get current market price
-      let currentPrice = pairPrices.get(provision.pair_key) || 0
-
-      // For provisions with no price data, use min_price as the price
-      // This respects the user's minimum price setting
-      if (currentPrice === 0) {
-        // Use min_price as the price when no market data exists
-        // This allows orders to be created even for new tokens with no trading history
-        currentPrice = Number(minPrice)
-        console.log(`[executor] ${network}: no market price for ${provision.pair_key}, using min_price = ${currentPrice}`)
-      }
-
-      // Skip if price is too low (below min_price)
-      if (currentPrice < Number(minPrice)) {
-        console.log(`[executor] ${network}: skipping provision ${provision.id} - price ${currentPrice} < min ${minPrice}`)
-        continue
-      }
-
-      // Get decimals
-      const inDecimals = await fetchTokenDecimals(tokenAddr, network)
-      const outDecimals = await fetchTokenDecimals(quoteAddr, network)
-      
-      // Calculate tranche amount to sell from provision
-      // tranche = max(minTranche, remaining * BPS/10000), capped by remaining
-      const bps = Math.max(1, Math.min(10000, Math.floor(PROVISION_TRANCHE_BPS || 2000)))
-      let tranche = (remaining * BigInt(bps)) / 10000n
-      const minTranche = BigInt(Math.max(1, Math.floor(PROVISION_MIN_TRANCHE_BASE_TOKENS || 1))) * (10n ** BigInt(inDecimals))
-      if (tranche < minTranche) tranche = minTranche
-      if (tranche > remaining) tranche = remaining
-      const amountIn = tranche
-      console.log(`[executor] ${network}: provision ${provision.id} tranche sizing -> remaining=${remaining.toString()}, trancheBps=${bps}, minTrancheBaseTokens=${PROVISION_MIN_TRANCHE_BASE_TOKENS}, amountIn=${amountIn.toString()}`)
-      // Calculate minimum output amount: amountIn * price, adjusted for decimals
-      // price is quote per base (e.g., 0.5 USDT per ASTER)
-      // amountIn is in base token units (e.g., 1 ASTER = 10^18)
-      // amountOutMin should be in quote token units (e.g., 0.5 USDT = 0.5 * 10^18)
-      const amountOutMin = (amountIn * BigInt(Math.floor(currentPrice * 10 ** outDecimals))) / (10n ** BigInt(inDecimals))
-
-      // IMPORTANT: Tokens are already in executor wallet (deposited directly by user)
-      // No transfer needed from custodial wallet
-
-      // IMPORTANT: Approve the settlement contract to transfer tokens from the executor wallet
-      // The settlement contract needs approval to transfer tokens from the maker (executor wallet)
-      const settlementAddress = network === 'base' ? SETTLEMENT_ADDRESS_BASE : SETTLEMENT_ADDRESS_BSC
-      console.log(`[executor] ${network}: approving settlement contract to transfer tokens`)
-      try {
-        const tokenContract = new Contract(tokenAddr, ERC20_MIN_ABI, wallet)
-        const allowance = await tokenContract.allowance(wallet.address, settlementAddress)
-        if (allowance < amountIn) {
-          console.log(`[executor] ${network}: current allowance ${allowance.toString()} < needed ${amountIn.toString()}, approving...`)
-          const approveTx = await tokenContract.approve(settlementAddress, amountIn)
-          await approveTx.wait()
-          console.log(`[executor] ${network}: approval completed, tx hash: ${approveTx.hash}`)
-        } else {
-          console.log(`[executor] ${network}: sufficient allowance already exists: ${allowance.toString()}`)
-        }
-      } catch (approveError) {
-        console.warn(`[executor] ${network}: failed to approve settlement contract:`, approveError?.message || approveError)
-        console.warn(`[executor] ${network}: skipping order creation for provision ${provision.id}`)
-        continue
-      }
-
-      // Create order
-      // IMPORTANT: Use executor wallet address as maker, not CUSTODIAL_ADDRESS
-      // The signature is signed by the executor wallet, so the maker must match
-      // The contract's verifySignature checks that the signature was signed by the maker address
-      // IMPORTANT: Use strings for consistency with regular orders (frontend signs with strings)
-      const order = {
-        maker: wallet.address,
-        tokenIn: tokenAddr,
-        tokenOut: quoteAddr,
-        amountIn: amountIn.toString(),
-        amountOutMin: amountOutMin.toString(),
-        expiration: (Math.floor(Date.now() / 1000) + 86400 * 7).toString(), // 7 days
-        nonce: Date.now().toString(),
-        receiver: '0x0000000000000000000000000000000000000000',
-        salt: Math.floor(Math.random() * 1000000).toString()
-      }
-
-      // Sign order
-      const signature = await signOrder(order, wallet, network)
-
-      // Validate signature recovers to executor wallet to prevent bad rows
-      try {
-        const recovered = await recoverOrderSigner(order, signature, network)
-        if (recovered !== wallet.address.toLowerCase()) {
-          console.warn(`[executor] ${network}: signature recovery mismatch for provision ${provision.id}: recovered ${recovered}, expected ${wallet.address.toLowerCase()}`)
-          console.warn(`[executor] ${network}: skipping order creation to avoid unverifiable custodial order`)
-          continue
-        }
-      } catch { /* best-effort */ }
-
-      // Insert order
-      const orderId = crypto.randomUUID()
-      const orderHash = crypto.createHash('sha1').update(JSON.stringify({
-        network,
-        maker: order.maker.toLowerCase(),
-        nonce: order.nonce,
-        tokenIn: order.tokenIn.toLowerCase(),
-        tokenOut: order.tokenOut.toLowerCase(),
-        salt: order.salt
-      })).digest('hex')
-
-      console.log(`[executor] ${network}: inserting order ${orderId} for provision ${provision.id}, amountIn=${order.amountIn}, amountOutMin=${order.amountOutMin}`)
-
-      // DEBUG: Log order details before insertion
-      console.log(`[executor] ${network}: DEBUG - Creating new order from provision:`, {
-        orderId: orderId,
-        provisionId: provision.id,
-        maker: order.maker,
-        tokenIn: order.tokenIn,
-        tokenOut: order.tokenOut,
-        amountIn: order.amountIn,
-        amountOutMin: order.amountOutMin,
-        price: currentPrice.toString(),
-        nonce: order.nonce,
-        status: 'open',
-        side: 'ask',
-        source: 'custodial',
-        liquidity_provision_id: provision.id,
-        owner_min_price: provision.min_price_per_token
-      })
-
-      const { error: insertError } = await supabase.from('orders').insert({
-        network,
-        order_id: orderId,
-        order_hash: orderHash,
-        maker: order.maker,
-        token_in: order.tokenIn,
-        token_out: order.tokenOut,
-        amount_in: order.amountIn,
-        amount_out_min: order.amountOutMin,
-        remaining: order.amountIn,
-        price: currentPrice.toString(),
-        side: 'ask',
-        base: tokenAddr,
-        quote: quoteAddr,
-        base_address: tokenAddr,
-        quote_address: quoteAddr,
-        pair: `${tokenAddr}/${quoteAddr}`,
-        nonce: order.nonce,
-        receiver: order.receiver,
-        salt: order.salt,
-        signature,
-        order_json: order,
-        expiration: new Date(Number(order.expiration) * 1000).toISOString(),
-        status: 'open',
-        source: 'custodial',
-        liquidity_provision_id: provision.id,
-        owner_min_price: provision.min_price_per_token,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      })
-
-      if (insertError) {
-        console.warn(`[executor] ${network}: error inserting order ${orderId}:`, insertError.message)
-      } else {
-        // DEBUG: Log order details after successful insertion
-        console.log(`[executor] ${network}: DEBUG - Order inserted successfully:`, {
-          orderId: orderId,
-          provisionId: provision.id,
-          status: 'open',
-          price: currentPrice.toString(),
-          amountIn: order.amountIn,
-          amountOutMin: order.amountOutMin
-        })
-        console.log(`[executor] ${network}: created custodial order ${orderId} for provision ${provision.id}`)
-        
-        // DEBUG: Verify order status in database after insertion
-        try {
-          const { data: verifyOrder, error: verifyError } = await supabase
-            .from('orders')
-            .select('order_id, status, price, amount_in, amount_out_min')
-            .eq('order_id', orderId)
-            .single()
-          
-          if (verifyError) {
-            console.warn(`[executor] ${network}: DEBUG - Error verifying order ${orderId}:`, verifyError.message)
-          } else {
-            console.log(`[executor] ${network}: DEBUG - Verified order in database:`, {
-              orderId: verifyOrder.order_id,
-              status: verifyOrder.status,
-              price: verifyOrder.price,
-              amount_in: verifyOrder.amount_in,
-              amount_out_min: verifyOrder.amount_out_min
-            })
-            
-            // Check if status was changed after insertion
-            if (verifyOrder.status !== 'open') {
-              console.error(`[executor] ${network}: DEBUG - ERROR: Order status changed from 'open' to '${verifyOrder.status}' after insertion!`)
-            }
-          }
-        } catch (verifyErr) {
-          console.warn(`[executor] ${network}: DEBUG - Exception verifying order ${orderId}:`, verifyErr?.message || verifyErr)
-        }
-      }
-    }
-  } catch (e) {
-    console.warn(`[executor] ${network}: error creating orders from provisions:`, e?.message || e)
-  }
-}
-
-async function signOrder(order, wallet, network) {
-  const settlementContract = network === 'base' ? settlementBase : settlement
-  if (!settlementContract) throw new Error('Settlement contract not available')
-
-  // Get domain separator from contract
-  const domainSeparator = await settlementContract.DOMAIN_SEPARATOR().catch(() => null)
-  const orderTypehash = await settlementContract.ORDER_TYPEHASH().catch(() => null)
-
-  if (!domainSeparator || !orderTypehash) {
-    throw new Error('Could not get domain/order typehash from contract')
-  }
-
-  // Use contract's domain for signing
-  const domain = {
-    name: 'MinimalOrderBook',
-    version: '1',
-    chainId: network === 'base' ? 8453 : 56,
-    verifyingContract: network === 'base' ? SETTLEMENT_ADDRESS_BASE : SETTLEMENT_ADDRESS_BSC
-  }
-
-  const types = {
-    Order: [
-      { name: 'maker', type: 'address' },
-      { name: 'tokenIn', type: 'address' },
-      { name: 'tokenOut', type: 'address' },
-      { name: 'amountIn', type: 'uint256' },
-      { name: 'amountOutMin', type: 'uint256' },
-      { name: 'expiration', type: 'uint256' },
-      { name: 'nonce', type: 'uint256' },
-      { name: 'receiver', type: 'address' },
-      { name: 'salt', type: 'uint256' }
-    ]
-  }
-
-  // IMPORTANT: Convert order values to BigInts before signing to match uint256 types
-  const orderForSigning = {
-    maker: order.maker,
-    tokenIn: order.tokenIn,
-    tokenOut: order.tokenOut,
-    amountIn: BigInt(order.amountIn),
-    amountOutMin: BigInt(order.amountOutMin),
-    expiration: BigInt(order.expiration),
-    nonce: BigInt(order.nonce),
-    receiver: order.receiver,
-    salt: BigInt(order.salt)
-  }
-
-  const signature = await wallet.signTypedData(domain, types, orderForSigning)
-  return signature
-}
-
-// Helpers to reconstruct domain and recover signer for debugging/validation
-function getEip712Domain(network) {
-  return {
-    name: 'MinimalOrderBook',
-    version: '1',
-    chainId: network === 'base' ? 8453 : 56,
-    verifyingContract: network === 'base' ? SETTLEMENT_ADDRESS_BASE : SETTLEMENT_ADDRESS_BSC
-  }
-}
-
-const EIP712_ORDER_TYPES = {
-  Order: [
-    { name: 'maker', type: 'address' },
-    { name: 'tokenIn', type: 'address' },
-    { name: 'tokenOut', type: 'address' },
-    { name: 'amountIn', type: 'uint256' },
-    { name: 'amountOutMin', type: 'uint256' },
-    { name: 'expiration', type: 'uint256' },
-    { name: 'nonce', type: 'uint256' },
-    { name: 'receiver', type: 'address' },
-    { name: 'salt', type: 'uint256' }
-  ]
-}
-
-async function recoverOrderSigner(order, signature, network) {
-  try {
-    if (!signature || signature.length < 10) return ''
-    // IMPORTANT: Convert order fields to BigInts to match uint256 types in EIP712 types
-    // This must match exactly how the frontend signs orders (with BigInt values)
-    const norm = {
-      maker: order.maker,
-      tokenIn: order.tokenIn,
-      tokenOut: order.tokenOut,
-      amountIn: BigInt(order.amountIn?.toString?.() ?? String(order.amountIn)),
-      amountOutMin: BigInt(order.amountOutMin?.toString?.() ?? String(order.amountOutMin)),
-      expiration: BigInt(order.expiration?.toString?.() ?? String(order.expiration)),
-      nonce: BigInt(order.nonce?.toString?.() ?? String(order.nonce)),
-      receiver: order.receiver || '0x0000000000000000000000000000000000000000',
-      salt: BigInt(order.salt?.toString?.() ?? String(order.salt))
-    }
-    const addr = verifyTypedData(getEip712Domain(network), EIP712_ORDER_TYPES, norm, signature)
-    return (addr || '').toLowerCase()
-  } catch (e) {
-    console.warn('[executor] recoverOrderSigner failed:', e?.message || e)
-    return ''
-  }
-}
-
-async function updateCustodialOrderPrices(network = 'bsc') {
-  if (!supabase) return
-
-  console.log(`[executor] ${network}: updating custodial order prices...`)
-
-  try {
-    // Get custodial orders
-    const { data: orders } = await supabase
-      .from('orders')
-      .select('*, liquidity_provisions!inner(min_price_per_token)')
-      .eq('network', network)
-      .eq('source', 'custodial')
-      .eq('status', 'open')
-
-    if (!orders || orders.length === 0) return
-
-    // Group by pair
-    const pairs = new Map()
-    for (const order of orders) {
-      const pair = `${order.token_in}/${order.token_out}`.toLowerCase()
-      if (!pairs.has(pair)) pairs.set(pair, [])
-      pairs.get(pair).push(order)
-    }
-
-    // Get latest prices
-    for (const [pair, pairOrders] of pairs.entries()) {
-      const [base, quote] = pair.split('/')
-      const { data: trades } = await supabase
-        .from('trades')
-        .select('price')
-        .eq('network', network)
-        .eq('base_address', base)
-        .eq('quote_address', quote)
-        .order('created_at', { ascending: false })
-        .limit(20)
-
-      if (!trades || trades.length === 0) continue
-
-      const latestPrice = Number(trades[0].price)
-      const avgPrice = trades.reduce((sum, t) => sum + Number(t.price), 0) / trades.length
-
-      // Use weighted average towards recent
-      const newPrice = (latestPrice * 0.7) + (avgPrice * 0.3)
-
-      for (const order of pairOrders) {
-        const minPrice = Number(order.liquidity_provisions.min_price_per_token)
-        if (newPrice <= minPrice) continue
-
-        // Skip price updates for orders that were just created (within the last 30 seconds)
-        // This prevents orders from being updated immediately after creation due to minor price fluctuations
-        const orderCreatedAt = new Date(order.created_at)
-        const timeSinceCreation = Date.now() - orderCreatedAt.getTime()
-        if (timeSinceCreation < 30000) {
-          console.log(`[executor] ${network}: skipping price update for order ${order.order_id} (created ${timeSinceCreation}ms ago)`)
-          continue
-        }
-
-        // Threshold: only update if price moved sufficiently to avoid churn
-        const currentPriceNum = Number(order.price || '0')
-        if (currentPriceNum > 0) {
-          const diffPct = Math.abs(newPrice - currentPriceNum) / currentPriceNum * 100
-          if (diffPct < PROVISION_PRICE_UPDATE_PCT) {
-            console.log(`[executor] ${network}: skipping price update for order ${order.order_id} (change ${diffPct.toFixed(4)}% < ${PROVISION_PRICE_UPDATE_PCT}%)`)
-            continue
-          }
-        }
-
-        // Update existing order in place instead of cancelling and creating new one
-        // This keeps the order 'open' and just updates the price, amountOutMin, nonce, and signature
-        const inDecimals = await fetchTokenDecimals(order.token_in, network)
-        const outDecimals = await fetchTokenDecimals(order.token_out, network)
-        const amountIn = toBN(order.amount_in)
-        // Calculate minimum output amount: amountIn * price, adjusted for decimals
-        const newAmountOutMin = (amountIn * BigInt(Math.floor(newPrice * 10 ** outDecimals))) / (10n ** BigInt(inDecimals))
-        
-        // Force maker to executor wallet (normalize legacy rows)
-        const wallet = network === 'base' ? walletBase : walletBSC
-        const execMaker = wallet.address
-
-        // Create updated order object with new price, incremented nonce, and enforced maker
-        const updatedOrder = {
-          maker: execMaker,
-          tokenIn: order.order_json.tokenIn,
-          tokenOut: order.order_json.tokenOut,
-          amountIn: order.order_json.amountIn,
-          amountOutMin: newAmountOutMin.toString(),
-          expiration: order.order_json.expiration,
-          nonce: (Number(order.nonce) + 1).toString(),
-          receiver: order.order_json.receiver,
-          salt: order.order_json.salt,
-          status: 'open',
-          updated_at: new Date().toISOString()
-        }
-
-        const signature = await signOrder(updatedOrder, wallet, network)
-
-        const newOrderHash = crypto.createHash('sha1').update(JSON.stringify({
-          network,
-          maker: updatedOrder.maker.toLowerCase(),
-          nonce: updatedOrder.nonce,
-          tokenIn: updatedOrder.tokenIn.toLowerCase(),
-          tokenOut: updatedOrder.tokenOut.toLowerCase(),
-          salt: updatedOrder.salt
-        })).digest('hex')
-
-        // Atomically update order: maker (column), order_json.maker, amounts, nonce, signature, hash, and display price
-        const { error: updateError } = await supabase
-          .from('orders')
-          .update({
-            maker: execMaker.toLowerCase(),
-            amount_out_min: newAmountOutMin.toString(),
-            price: newPrice.toString(),
-            nonce: updatedOrder.nonce,
-            signature,
-            order_json: updatedOrder,
-            order_hash: newOrderHash,
-            updated_at: new Date().toISOString()
-          })
-          .eq('order_id', order.order_id)
-
-        if (updateError) {
-          console.warn(`[executor] ${network}: error updating order ${order.order_id}:`, updateError.message)
-        } else {
-          console.log(`[executor] ${network}: updated price for custodial order ${order.order_id} from ${order.price} to ${newPrice}`)
-          
-          // DEBUG: Verify order status in database after update
-          try {
-            const { data: verifyOrder, error: verifyError } = await supabase
-              .from('orders')
-              .select('order_id, status, price, amount_in, amount_out_min')
-              .eq('order_id', order.order_id)
-              .single()
-            
-            if (verifyError) {
-              console.warn(`[executor] ${network}: DEBUG - Error verifying order ${order.order_id}:`, verifyError.message)
-            } else {
-              console.log(`[executor] ${network}: DEBUG - Verified order in database:`, {
-                orderId: verifyOrder.order_id,
-                status: verifyOrder.status,
-                price: verifyOrder.price,
-                amount_in: verifyOrder.amount_in,
-                amount_out_min: verifyOrder.amount_out_min
-              })
-              
-              // Check if status was changed after update
-              if (verifyOrder.status !== 'open') {
-                console.error(`[executor] ${network}: DEBUG - ERROR: Order status changed from 'open' to '${verifyOrder.status}' after update!`)
-              }
-            }
-          } catch (verifyErr) {
-            console.warn(`[executor] ${network}: DEBUG - Exception verifying order ${order.order_id}:`, verifyErr?.message || verifyErr)
-          }
-        }
-      }
-    }
-  } catch (e) {
-    console.warn(`[executor] ${network}: error updating custodial prices:`, e?.message || e)
-  }
-}
-
-async function attributeFillsToProvisions(network = 'bsc') {
-  if (!supabase) return
-
-  console.log(`[executor] ${network}: attributing fills to provisions...`)
-
-  try {
-    // Get all unattributed fills from the last 24 hours
-    const oneDayAgo = new Date(Date.now() - 86400000).toISOString()
-    const { data: fills, error: fillsError } = await supabase
-      .from('fills')
-      .select('*')
-      .eq('network', network)
-      .gte('created_at', oneDayAgo)
-      .is('attributed_at', null)
-      .order('created_at', { ascending: true })
-
-    if (fillsError) {
-      console.warn(`[executor] ${network}: error fetching fills:`, fillsError.message)
-      return
-    }
-
-    if (!fills || fills.length === 0) {
-      console.log(`[executor] ${network}: no fills found to attribute`)
-      return
-    }
-
-    // Debug: Also query orders with liquidity_provision_id to see which provisions have orders
-    const { data: provisionOrders } = await supabase
-      .from('orders')
-      .select('order_id, liquidity_provision_id, status, remaining, network')
-      .eq('network', network)
-      .not('liquidity_provision_id', 'is', null)
-
-    console.log(`[executor] ${network}: found ${fills.length} fills to process`)
-    console.log(`[executor] ${network}: found ${provisionOrders?.length || 0} orders with liquidity_provision_id`)
-    
-    // Debug: Also query provisions with remaining_amount > 0
-    const { data: activeProvisions } = await supabase
-      .from('liquidity_provisions')
-      .select('id, depositor, token_address, remaining_amount, proceeds_earned, pair_key')
-      .eq('network', network)
-      .gt('remaining_amount', '0')
-      .neq('depositor', 'pending_claim')
-
-    if (activeProvisions && activeProvisions.length > 0) {
-      console.log(`[executor] ${network}: found ${activeProvisions.length} active provisions with remaining_amount > 0:`)
-      for (const p of activeProvisions) {
-        console.log(`[executor] ${network}:   provision ${p.id}: remaining=${p.remaining_amount}, token=${p.token_address}, pair=${p.pair_key}`)
-      }
-    }
-    
-    // Log the provision orders for debugging
-    if (provisionOrders && provisionOrders.length > 0) {
-      console.log(`[executor] ${network}: provision orders:`, provisionOrders.map(o => ({
-        order_id: o.order_id,
-        provision_id: o.liquidity_provision_id,
-        status: o.status,
-        remaining: o.remaining
-      })))
-    }
-
-    let attributedCount = 0
-    for (const fill of fills) {
-      console.log(`[executor] ${network}: processing fill ${fill.id}, buy_order_id: ${fill.buy_order_id}, sell_order_id: ${fill.sell_order_id}`)
-      
-      // Find the order by matching fill's buy_order_id or sell_order_id with order's order_id
-      let query = supabase
-        .from('orders')
-        .select('order_id, liquidity_provision_id, token_out')
-
-      // Build OR conditions to match fill's order IDs against order's order_id
-      const orConditions = []
-      if (fill.buy_order_id) {
-        orConditions.push(`order_id.eq.${fill.buy_order_id}`)
-      }
-      if (fill.sell_order_id) {
-        orConditions.push(`order_id.eq.${fill.sell_order_id}`)
-      }
-      
-      if (orConditions.length > 0) {
-        query = query.or(orConditions.join(','))
-      }
-      
-      const { data: orders, error: orderError } = await query.limit(1)
-
-      if (orderError) {
-        console.warn(`[executor] ${network}: error fetching order for fill ${fill.id}:`, orderError.message)
-        continue
-      }
-
-      if (!orders || orders.length === 0) {
-        console.log(`[executor] ${network}: fill ${fill.id} has no linked order (checked buy=${fill.buy_order_id}, sell=${fill.sell_order_id})`)
-        continue
-      }
-
-      const order = orders[0]
-      console.log(`[executor] ${network}: fill ${fill.id} found order ${order.order_id} with liquidity_provision_id: ${order.liquidity_provision_id}`)
-      
-      const provisionId = order.liquidity_provision_id
-      if (!provisionId) {
-        console.log(`[executor] ${network}: fill ${fill.id} order ${order.order_id} is a regular trade (no liquidity_provision_id), skipping`)
-        continue
-      }
-
-      const filledAmount = toBN(fill.amount_base || '0')
-      const proceeds = toBN(fill.amount_quote || '0')
-
-      console.log(`[executor] ${network}: processing fill ${fill.id} - buy_order: ${fill.buy_order_id}, sell_order: ${fill.sell_order_id}, amount_base: ${filledAmount.toString()}, amount_quote: ${proceeds.toString()}, provision: ${provisionId}`)
-
-      // Update provision
-      const { data: provision, error: provError } = await supabase
-        .from('liquidity_provisions')
-        .select('remaining_amount, proceeds_earned, proceeds_token')
-        .eq('id', provisionId)
-        .single()
-
-      if (provError) {
-        console.warn(`[executor] ${network}: error fetching provision ${provisionId}:`, provError.message)
-        continue
-      }
-
-      if (!provision) {
-        console.warn(`[executor] ${network}: provision ${provisionId} not found`)
-        continue
-      }
-
-      const currentRemaining = toBN(provision.remaining_amount || '0')
-      const currentProceeds = toBN(provision.proceeds_earned || '0')
-      
-      // Calculate new values, but don't let remaining go below 0
-      // If fill amount exceeds remaining, cap the deduction
-      let newRemaining = currentRemaining - filledAmount
-      if (newRemaining < 0n) {
-        console.warn(`[executor] ${network}: fill amount ${filledAmount.toString()} exceeds remaining ${currentRemaining.toString()}, capping at 0`)
-        newRemaining = 0n
-      }
-      const newProceeds = currentProceeds + proceeds
-
-      console.log(`[executor] ${network}: updating provision ${provisionId} - remaining: ${currentRemaining.toString()} -> ${newRemaining.toString()}, proceeds: ${currentProceeds.toString()} -> ${newProceeds.toString()}`)
-
-      const { error: updateError } = await supabase
-        .from('liquidity_provisions')
-        .update({
-          remaining_amount: newRemaining.toString(),
-          proceeds_earned: newProceeds.toString(),
-          proceeds_token: provision.proceeds_token || order.token_out,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', provisionId)
-
-      if (updateError) {
-        console.warn(`[executor] ${network}: error updating provision ${provisionId}:`, updateError.message)
-      } else {
-        console.log(`[executor] ${network}: successfully attributed fill ${fill.id} to provision ${provisionId}`)
-        attributedCount++
-        
-        // Mark the fill as attributed to prevent duplicate processing
-        await supabase
-          .from('fills')
-          .update({ attributed_at: new Date().toISOString() })
-          .eq('id', fill.id)
-      }
-    }
-
-    console.log(`[executor] ${network}: attributed ${attributedCount} fills to provisions`)
-  } catch (e) {
-    console.warn(`[executor] ${network}: error attributing fills:`, e?.message || e)
   }
 }
 
@@ -3103,7 +2061,6 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
-
 
 
 
