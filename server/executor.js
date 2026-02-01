@@ -444,14 +444,6 @@ function normalizeOrderJson(obj) {
   return o
 }
 
-let supabase = null
-let providerBSC = null
-let providerBase = null
-let walletBSC = null
-let walletBase = null
-let custodialWalletBSC = null
-let custodialWalletBase = null
-let settlement = null
 let settlementBase = null
 let busyBSC = false
 let busyBase = false
@@ -517,22 +509,11 @@ async function initProvidersAndWallets() {
 
         const w = new Wallet(EXECUTOR_PRIVATE_KEY, prov)
 
-        // Create custodial wallet if private key is provided
-        let custodialW = null
-        if (CUSTODIAL_PRIVATE_KEY) {
-          custodialW = new Wallet(CUSTODIAL_PRIVATE_KEY, prov)
-          console.log(`[executor] ${network.name} custodial wallet: ${custodialW.address}`)
-        }
 
         // Assign to global variables
         if (network.name === 'BSC') {
           providerBSC = prov
-          walletBSC = w
-          custodialWalletBSC = custodialW
-        } else if (network.name === 'Base') {
           providerBase = prov
-          walletBase = w
-          custodialWalletBase = custodialW
         }
 
         console.log(`[executor] ${network.name} connected successfully. wallet: ${w.address}, chainId: ${chainId}`)
@@ -1191,7 +1172,6 @@ async function tryMatchPairCrossChain(base, quote, bids, asks) {
     return false
   }
 
-  const custodialAddress = CUSTODIAL_ADDRESS
 
   // Check buyer's allowance and balance on buy network (quote token)
   const buyerErcQuote = new Contract(buy.tokenIn, ERC20_MIN_ABI, buyProvider)
@@ -1692,52 +1672,6 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
         block_number: receipt.blockNumber,
         created_at: new Date().toISOString()
       })
-
-      // Update liquidity_provisions accounting if this fill involves a custodial provision order
-      // We assume provision-backed orders are on the ask side (selling base for quote)
-      const nowIso = new Date().toISOString()
-      const provisionId = sellRow.liquidity_provision_id || sellRow.source_liquidity_provision_id
-      if ((sellRow.source === 'custodial' || sellRow.source === 'liquidity_provision') && provisionId) {
-        try {
-          // Fetch current remaining_amount and proceeds_earned
-          const { data: provRows, error: provErr } = await supabase
-            .from('liquidity_provisions')
-            .select('id, remaining_amount, proceeds_earned')
-            .eq('id', provisionId)
-            .limit(1)
-          if (!provErr && Array.isArray(provRows) && provRows.length === 1) {
-            const prov = provRows[0]
-            const curRemaining = toBN(prov.remaining_amount || '0')
-            const curProceeds = toBN(prov.proceeds_earned || '0')
-            // amount_base decreases remaining; amount_quote increases proceeds
-            let newRemaining = curRemaining - baseOut
-            if (newRemaining < 0n) newRemaining = 0n
-            const newProceeds = curProceeds + quoteIn
-
-            const { error: updErr } = await supabase
-              .from('liquidity_provisions')
-              .update({
-                remaining_amount: newRemaining.toString(),
-                proceeds_earned: newProceeds.toString(),
-                last_fill_at: nowIso,
-                updated_at: nowIso
-              })
-              .eq('id', provisionId)
-              .limit(1)
-            if (updErr) {
-              console.warn('[executor] failed to update liquidity_provisions after fill:', updErr?.message || updErr)
-            } else {
-              console.log(`[executor] updated provision ${provisionId} remaining -> ${newRemaining.toString()}, proceeds -> ${newProceeds.toString()}`)
-            }
-          } else if (provErr) {
-            console.warn('[executor] error fetching provision to update:', provErr?.message || provErr)
-          }
-        } catch (e) {
-          console.warn('[executor] provision update exception:', e?.message || e)
-        }
-      }
-
-      // Also insert enriched trade data for market stats
 
       // Also insert enriched trade data for market stats
       const baseAddr = (buyRow.base_address || sellRow.base_address || '').toLowerCase()
@@ -2295,11 +2229,6 @@ async function runOnce(network = 'bsc') {
 async function checkCustodialDeposits(network = 'bsc') {
   if (!supabase) return
 
-  console.log(`[executor] ${network}: checking custodial deposits...`)
-
-  try {
-    // Get custodial address
-    const custodialAddr = CUSTODIAL_ADDRESS.toLowerCase()
 
     // Get provider for network
     const provider = network === 'base' ? providerBase : providerBSC
@@ -2319,11 +2248,9 @@ async function checkCustodialDeposits(network = 'bsc') {
     // This prevents creating provisions for tokens that happen to have a balance but weren't intentionally deposited
     const tokensToCheck = tokensFromDb
 
+  try {
     for (const tokenAddr of tokensToCheck) {
-      // Get current balance
-      const tokenContract = new Contract(tokenAddr, ERC20_MIN_ABI, provider)
-      const balance = await tokenContract.balanceOf(custodialAddr).catch(() => 0n)
-      const balanceStr = balance.toString()
+      // Get current balance of executor wallet
 
       // Get sum of remaining amounts in provisions (including pending_claim to prevent duplicates)
       const { data: provisions } = await supabase
@@ -2335,8 +2262,6 @@ async function checkCustodialDeposits(network = 'bsc') {
       const totalRemaining = provisions?.reduce((sum, p) => sum + toBN(p.remaining_amount), 0n) || 0n
 
       if (toBN(balanceStr) > totalRemaining) {
-        const excess = toBN(balanceStr) - totalRemaining
-        console.log(`[executor] ${network}: detected deposit of ${excess.toString()} ${tokenAddr} to custodial`)
 
         // Check if provision already exists for this token/network (any depositor)
         const { data: existingProvision } = await supabase
@@ -2385,13 +2310,12 @@ async function checkCustodialDeposits(network = 'bsc') {
       }
     }
   } catch (e) {
-    console.warn(`[executor] ${network}: error checking custodial deposits:`, e?.message || e)
+    console.warn(`[executor] ${network}: error checking executor wallet deposits:`, e?.message || e)
   }
 }
 
 async function createOrdersFromProvisions(network = 'bsc') {
   const wallet = network === 'base' ? walletBase : walletBSC
-  const custodialWallet = network === 'base' ? custodialWalletBase : custodialWalletBSC
   if (!supabase || !wallet) return
 
   console.log(`[executor] ${network}: creating orders from liquidity provisions...`)
@@ -2518,23 +2442,6 @@ async function createOrdersFromProvisions(network = 'bsc') {
       // amountOutMin should be in quote token units (e.g., 0.5 USDT = 0.5 * 10^18)
       const amountOutMin = (amountIn * BigInt(Math.floor(currentPrice * 10 ** outDecimals))) / (10n ** BigInt(inDecimals))
 
-      // IMPORTANT: Transfer tokens from custodial wallet to executor wallet before creating order
-      // The order's maker is the executor wallet, so the executor wallet must have the tokens
-      // The contract will try to transfer tokens from the maker address during order execution
-      console.log(`[executor] ${network}: transferring ${amountIn.toString()} tokens from custodial to executor wallet`)
-      try {
-        if (!custodialWallet) {
-          throw new Error('Custodial wallet not available. Please set CUSTODIAL_PRIVATE_KEY in .env')
-        }
-        const tokenContract = new Contract(tokenAddr, ERC20_MIN_ABI, custodialWallet)
-        const tx = await tokenContract.transfer(wallet.address, amountIn)
-        await tx.wait()
-        console.log(`[executor] ${network}: token transfer completed, tx hash: ${tx.hash}`)
-      } catch (transferError) {
-        console.warn(`[executor] ${network}: failed to transfer tokens from custodial to executor wallet:`, transferError?.message || transferError)
-        console.warn(`[executor] ${network}: skipping order creation for provision ${provision.id}`)
-        continue
-      }
 
       // IMPORTANT: Approve the settlement contract to transfer tokens from the executor wallet
       // The settlement contract needs approval to transfer tokens from the maker (executor wallet)
