@@ -1693,6 +1693,52 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
         created_at: new Date().toISOString()
       })
 
+      // Update liquidity_provisions accounting if this fill involves a custodial provision order
+      // We assume provision-backed orders are on the ask side (selling base for quote)
+      const nowIso = new Date().toISOString()
+      const provisionId = sellRow.liquidity_provision_id || sellRow.source_liquidity_provision_id
+      if ((sellRow.source === 'custodial' || sellRow.source === 'liquidity_provision') && provisionId) {
+        try {
+          // Fetch current remaining_amount and proceeds_earned
+          const { data: provRows, error: provErr } = await supabase
+            .from('liquidity_provisions')
+            .select('id, remaining_amount, proceeds_earned')
+            .eq('id', provisionId)
+            .limit(1)
+          if (!provErr && Array.isArray(provRows) && provRows.length === 1) {
+            const prov = provRows[0]
+            const curRemaining = toBN(prov.remaining_amount || '0')
+            const curProceeds = toBN(prov.proceeds_earned || '0')
+            // amount_base decreases remaining; amount_quote increases proceeds
+            let newRemaining = curRemaining - baseOut
+            if (newRemaining < 0n) newRemaining = 0n
+            const newProceeds = curProceeds + quoteIn
+
+            const { error: updErr } = await supabase
+              .from('liquidity_provisions')
+              .update({
+                remaining_amount: newRemaining.toString(),
+                proceeds_earned: newProceeds.toString(),
+                last_fill_at: nowIso,
+                updated_at: nowIso
+              })
+              .eq('id', provisionId)
+              .limit(1)
+            if (updErr) {
+              console.warn('[executor] failed to update liquidity_provisions after fill:', updErr?.message || updErr)
+            } else {
+              console.log(`[executor] updated provision ${provisionId} remaining -> ${newRemaining.toString()}, proceeds -> ${newProceeds.toString()}`)
+            }
+          } else if (provErr) {
+            console.warn('[executor] error fetching provision to update:', provErr?.message || provErr)
+          }
+        } catch (e) {
+          console.warn('[executor] provision update exception:', e?.message || e)
+        }
+      }
+
+      // Also insert enriched trade data for market stats
+
       // Also insert enriched trade data for market stats
       const baseAddr = (buyRow.base_address || sellRow.base_address || '').toLowerCase()
       const quoteAddr = (buyRow.quote_address || sellRow.quote_address || '').toLowerCase()
