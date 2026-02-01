@@ -26,6 +26,62 @@ const SETTLEMENT_ADDRESS_BSC = process.env.SETTLEMENT_ADDRESS_BSC || '0x7DBA6a14
 const SETTLEMENT_ADDRESS_BASE = process.env.SETTLEMENT_ADDRESS_BASE || '0xBBf7A39F053BA2B8F4991282425ca61F2D871f45'
 const CUSTODIAL_ADDRESS = '0x6E11b5c17258C3F3ea684881Da4bB591C4C7bE05'
 
+// One-route normalization mode: re-sign provision-backed orders with executor maker
+const ONE_ROUTE_MODE = true
+
+function getExecutorWallet(network) {
+  return network === 'base' ? walletBase : walletBSC
+}
+
+async function normalizeProvisionOrderRow(row, network) {
+  try {
+    if (!ONE_ROUTE_MODE || !row) return row
+    const src = String(row.source || row.tag || '').toLowerCase()
+    const lpBacked = src === 'custodial' || src === 'liquidity_provision'
+    if (!lpBacked) return row
+
+    const execWallet = getExecutorWallet(network)
+    const execAddr = execWallet?.address?.toLowerCase?.()
+    const makerNow = (row.maker || row.maker_address || '').toLowerCase()
+    if (!execAddr || makerNow === execAddr) return row
+
+    let o = row.order_json || row.order || null
+    if (typeof o === 'string') { try { o = JSON.parse(o) } catch { o = null } }
+    if (!o) return row
+
+    const updatedOrder = {
+      ...o,
+      maker: execAddr,
+      nonce: (BigInt(o.nonce || 0) + 1n).toString()
+    }
+
+    const signature = await signOrder(updatedOrder, execWallet, network)
+
+    try {
+      const { error: err } = await supabase
+        .from('orders')
+        .update({
+          maker: execAddr,
+          maker_address: execAddr,
+          signature,
+          order_json: updatedOrder,
+          order_hash: null,
+          updated_at: new Date().toISOString()
+        })
+        .eq('order_id', row.order_id)
+        .limit(1)
+      if (err) console.error('[ONE_ROUTE] DB update error:', err)
+    } catch (e) {
+      console.error('[ONE_ROUTE] DB update threw:', e?.message || e)
+    }
+
+    return { ...row, maker: execAddr, maker_address: execAddr, signature, order_json: updatedOrder }
+  } catch (e) {
+    console.error('[ONE_ROUTE] normalize failed:', e?.message || e)
+    return row
+  }
+}
+
 // Liquidity provision configuration
 // Tranche sizing for provisions: percentage of remaining (basis points), and minimum base tokens per tranche
 const PROVISION_TRANCHE_BPS = Number(process.env.PROVISION_TRANCHE_BPS || 2000) // default 20%
@@ -444,6 +500,14 @@ function normalizeOrderJson(obj) {
   return o
 }
 
+let supabase = null
+let providerBSC = null
+let providerBase = null
+let walletBSC = null
+let walletBase = null
+let custodialWalletBSC = null
+let custodialWalletBase = null
+let settlement = null
 let settlementBase = null
 let busyBSC = false
 let busyBase = false
@@ -509,11 +573,22 @@ async function initProvidersAndWallets() {
 
         const w = new Wallet(EXECUTOR_PRIVATE_KEY, prov)
 
+        // Create custodial wallet if private key is provided
+        let custodialW = null
+        if (CUSTODIAL_PRIVATE_KEY) {
+          custodialW = new Wallet(CUSTODIAL_PRIVATE_KEY, prov)
+          console.log(`[executor] ${network.name} custodial wallet: ${custodialW.address}`)
+        }
 
         // Assign to global variables
         if (network.name === 'BSC') {
           providerBSC = prov
+          walletBSC = w
+          custodialWalletBSC = custodialW
+        } else if (network.name === 'Base') {
           providerBase = prov
+          walletBase = w
+          custodialWalletBase = custodialW
         }
 
         console.log(`[executor] ${network.name} connected successfully. wallet: ${w.address}, chainId: ${chainId}`)
@@ -1172,6 +1247,7 @@ async function tryMatchPairCrossChain(base, quote, bids, asks) {
     return false
   }
 
+  const custodialAddress = CUSTODIAL_ADDRESS
 
   // Check buyer's allowance and balance on buy network (quote token)
   const buyerErcQuote = new Contract(buy.tokenIn, ERC20_MIN_ABI, buyProvider)
@@ -1508,6 +1584,26 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   }
 
   // Query contract-side availability (skip if unfillable)
+  // One-route normalization for provision-backed orders (mutates in-place)
+  try {
+    const nb = await normalizeProvisionOrderRow(buyRow, network)
+    if (nb && nb !== buyRow) {
+      buyRow.maker = nb.maker
+      buyRow.maker_address = nb.maker_address || nb.maker
+      buyRow.signature = nb.signature
+      buyRow.order_json = nb.order_json
+    }
+    const ns = await normalizeProvisionOrderRow(sellRow, network)
+    if (ns && ns !== sellRow) {
+      sellRow.maker = ns.maker
+      sellRow.maker_address = ns.maker_address || ns.maker
+      sellRow.signature = ns.signature
+      sellRow.order_json = ns.order_json
+    }
+  } catch (e) {
+    console.warn('[ONE_ROUTE] normalization skipped:', e?.message || e)
+  }
+
   console.log(`[executor] ${network}: running preflight diagnostics for ${base}/${quote}`)
   const diag = await preflightDiagnostics(buyRow, sellRow, network)
 
@@ -2229,6 +2325,11 @@ async function runOnce(network = 'bsc') {
 async function checkCustodialDeposits(network = 'bsc') {
   if (!supabase) return
 
+  console.log(`[executor] ${network}: checking custodial deposits...`)
+
+  try {
+    // Get custodial address
+    const custodialAddr = CUSTODIAL_ADDRESS.toLowerCase()
 
     // Get provider for network
     const provider = network === 'base' ? providerBase : providerBSC
@@ -2248,9 +2349,11 @@ async function checkCustodialDeposits(network = 'bsc') {
     // This prevents creating provisions for tokens that happen to have a balance but weren't intentionally deposited
     const tokensToCheck = tokensFromDb
 
-  try {
     for (const tokenAddr of tokensToCheck) {
-      // Get current balance of executor wallet
+      // Get current balance
+      const tokenContract = new Contract(tokenAddr, ERC20_MIN_ABI, provider)
+      const balance = await tokenContract.balanceOf(custodialAddr).catch(() => 0n)
+      const balanceStr = balance.toString()
 
       // Get sum of remaining amounts in provisions (including pending_claim to prevent duplicates)
       const { data: provisions } = await supabase
@@ -2262,6 +2365,8 @@ async function checkCustodialDeposits(network = 'bsc') {
       const totalRemaining = provisions?.reduce((sum, p) => sum + toBN(p.remaining_amount), 0n) || 0n
 
       if (toBN(balanceStr) > totalRemaining) {
+        const excess = toBN(balanceStr) - totalRemaining
+        console.log(`[executor] ${network}: detected deposit of ${excess.toString()} ${tokenAddr} to custodial`)
 
         // Check if provision already exists for this token/network (any depositor)
         const { data: existingProvision } = await supabase
@@ -2310,12 +2415,13 @@ async function checkCustodialDeposits(network = 'bsc') {
       }
     }
   } catch (e) {
-    console.warn(`[executor] ${network}: error checking executor wallet deposits:`, e?.message || e)
+    console.warn(`[executor] ${network}: error checking custodial deposits:`, e?.message || e)
   }
 }
 
 async function createOrdersFromProvisions(network = 'bsc') {
   const wallet = network === 'base' ? walletBase : walletBSC
+  const custodialWallet = network === 'base' ? custodialWalletBase : custodialWalletBSC
   if (!supabase || !wallet) return
 
   console.log(`[executor] ${network}: creating orders from liquidity provisions...`)
@@ -2442,6 +2548,23 @@ async function createOrdersFromProvisions(network = 'bsc') {
       // amountOutMin should be in quote token units (e.g., 0.5 USDT = 0.5 * 10^18)
       const amountOutMin = (amountIn * BigInt(Math.floor(currentPrice * 10 ** outDecimals))) / (10n ** BigInt(inDecimals))
 
+      // IMPORTANT: Transfer tokens from custodial wallet to executor wallet before creating order
+      // The order's maker is the executor wallet, so the executor wallet must have the tokens
+      // The contract will try to transfer tokens from the maker address during order execution
+      console.log(`[executor] ${network}: transferring ${amountIn.toString()} tokens from custodial to executor wallet`)
+      try {
+        if (!custodialWallet) {
+          throw new Error('Custodial wallet not available. Please set CUSTODIAL_PRIVATE_KEY in .env')
+        }
+        const tokenContract = new Contract(tokenAddr, ERC20_MIN_ABI, custodialWallet)
+        const tx = await tokenContract.transfer(wallet.address, amountIn)
+        await tx.wait()
+        console.log(`[executor] ${network}: token transfer completed, tx hash: ${tx.hash}`)
+      } catch (transferError) {
+        console.warn(`[executor] ${network}: failed to transfer tokens from custodial to executor wallet:`, transferError?.message || transferError)
+        console.warn(`[executor] ${network}: skipping order creation for provision ${provision.id}`)
+        continue
+      }
 
       // IMPORTANT: Approve the settlement contract to transfer tokens from the executor wallet
       // The settlement contract needs approval to transfer tokens from the maker (executor wallet)
@@ -2934,6 +3057,7 @@ async function attributeFillsToProvisions(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
 
