@@ -897,6 +897,72 @@ const ERC20_MIN_ABI = [
   { inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }], name: 'transfer', outputs: [{ type: 'bool' }], stateMutability: 'nonpayable', type: 'function' }
 ]
 
+// Cached token decimals helper and min-fill calculations
+const tokenDecimalsCache = new Map()
+
+async function getTokenDecimalsCached(address, network = 'bsc') {
+  try {
+    const key = `${network}:${(address || '').toLowerCase()}`
+    if (tokenDecimalsCache.has(key)) return tokenDecimalsCache.get(key)
+
+    let dec = null
+    try {
+      const { data: t } = await supabase
+        .from('tokens')
+        .select('address,decimals')
+        .eq('network', network)
+        .eq('address', (address || '').toLowerCase())
+        .limit(1)
+      if (Array.isArray(t) && t.length) {
+        const row = t[0]
+        if (row && row.decimals != null) dec = Number(row.decimals)
+      }
+    } catch {}
+
+    // Hardcoded known tokens as fallback
+    const addr = (address || '').toLowerCase()
+    if (dec == null) {
+      if (addr === '0x55d398326f99059ff775485246999027b3197955') dec = 6 // BSC USDT
+      else if (addr === '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c') dec = 18 // BSC WBNB
+      else if (addr === '0x4200000000000000000000000000000000000006') dec = 18 // Base WETH
+      else if (addr === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913') dec = 6  // Base USDC
+      else dec = 18
+    }
+
+    tokenDecimalsCache.set(key, dec)
+    return dec
+  } catch { return 18 }
+}
+
+function minUnitsForDecimals(decimals, fractionDigits) {
+  const d = Math.max(0, Number(decimals) - Number(fractionDigits))
+  let x = 1n
+  for (let i = 0; i < d; i++) x *= 10n
+  return x
+}
+
+async function getMinFillUnits(address, network, fractionDigitsDefault = 2) {
+  const dec = await getTokenDecimalsCached(address, network)
+  // Default: 0.01 unit for quote (2 digits). Callers choose fractionDigits.
+  return minUnitsForDecimals(dec, fractionDigitsDefault)
+}
+
+async function fetchOrderRow(orderId, network = 'bsc') {
+  try {
+    const table = network === 'crosschain' ? 'cross_chain_orders' : 'orders'
+    const { data, error } = await supabase
+      .from(table)
+      .select('*')
+      .eq('order_id', orderId)
+      .limit(1)
+    if (error) throw error
+    if (Array.isArray(data) && data.length) return data[0]
+  } catch (e) {
+    console.warn('[executor] fetchOrderRow failed:', e?.message || e)
+  }
+  return null
+}
+
 async function preflightDiagnostics(buyRow, sellRow, network = 'bsc') {
   const buy = normalizeOrderJson(buyRow.order_json || buyRow.order || {})
   const sell = normalizeOrderJson(sellRow.order_json || sellRow.order || {})
@@ -1436,6 +1502,36 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   }
 
   const quoteIn = quoteNeededBySell
+
+  // Dust/min-fill guard: prevent micro-fills
+  try {
+    const baseDec = await getTokenDecimalsCached(base, network)
+    const quoteDec = await getTokenDecimalsCached(quote, network)
+    // Policy: require at least 0.01 quote token and 1e-6 base token as a minimum chunk size
+    const minQuoteFill = minUnitsForDecimals(quoteDec, 2) // 0.01 quote unit
+    const minBaseFill = minUnitsForDecimals(baseDec, 6)  // 0.000001 base unit
+
+    if (quoteIn < minQuoteFill || baseOut < minBaseFill) {
+      console.log(`[executor] ${network}: below dust thresholds -> skip match. quoteIn=${quoteIn.toString()} (min=${minQuoteFill.toString()}), baseOut=${baseOut.toString()} (min=${minBaseFill.toString()})`)
+      // Finalize tiny remainders to stop repeated attempts
+      try {
+        if (buyRemQuote < minQuoteFill) {
+          console.log(`[executor] ${network}: closing buy order ${buyRow.order_id} due to dust remainder ${buyRemQuote.toString()} < ${minQuoteFill.toString()}`)
+          await updateOrderRemaining(buyRow.order_id, 0n, 'filled', network)
+        }
+        if (sellRemBase < minBaseFill) {
+          console.log(`[executor] ${network}: closing sell order ${sellRow.order_id} due to dust remainder ${sellRemBase.toString()} < ${minBaseFill.toString()}`)
+          await updateOrderRemaining(sellRow.order_id, 0n, 'filled', network)
+        }
+      } catch (e) {
+        console.warn('[executor] dust finalization failed:', e?.message || e)
+      }
+      return false
+    }
+  } catch (e) {
+    console.warn('[executor] dust guard error (continuing):', e?.message || e)
+  }
+
   console.log(`[executor] ${network}: decision: proceed match baseOut=${baseOut.toString()} quoteIn=${quoteIn.toString()} buyRemQuote=${buyRemQuote.toString()} sellRemBase=${sellRemBase.toString()}`)
 
   // Preflight diagnostics (reuse diag)
@@ -1474,9 +1570,42 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   // Reserve both orders atomically to avoid duplicate execution
   let lockedBuy = false, lockedSell = false
   lockedBuy = await reserveOrder(buyRow.order_id, network)
-  if (!lockedBuy) { console.log(`[executor] ${network}: failed to reserve buy order ${buyRow.order_id}`); return false }
+  if (!lockedBuy) {
+    console.log(`[executor] ${network}: failed to reserve buy order ${buyRow.order_id}`)
+    // Reconcile: if order remainder is now dust or zero, close it to avoid retries
+    try {
+      const freshBuy = await fetchOrderRow(buyRow.order_id, network)
+      if (freshBuy) {
+        const freshRemaining = toBN(freshBuy.remaining || 0)
+        const qDec = await getTokenDecimalsCached(quote, network)
+        const minQ = minUnitsForDecimals(qDec, 2)
+        if (freshRemaining === 0n || freshRemaining < minQ) {
+          console.log(`[executor] ${network}: reconciling buy ${buyRow.order_id} -> close (remaining=${freshRemaining.toString()})`)
+          await updateOrderRemaining(buyRow.order_id, 0n, 'filled', network)
+        }
+      }
+    } catch {}
+    return false
+  }
   lockedSell = await reserveOrder(sellRow.order_id, network)
-  if (!lockedSell) { console.log(`[executor] ${network}: failed to reserve sell order ${sellRow.order_id}`); await releaseOrder(buyRow.order_id, network, 'open'); return false }
+  if (!lockedSell) {
+    console.log(`[executor] ${network}: failed to reserve sell order ${sellRow.order_id}`)
+    await releaseOrder(buyRow.order_id, network, 'open')
+    // Reconcile seller dust
+    try {
+      const freshSell = await fetchOrderRow(sellRow.order_id, network)
+      if (freshSell) {
+        const freshRemaining = toBN(freshSell.remaining || 0)
+        const bDec = await getTokenDecimalsCached(base, network)
+        const minB = minUnitsForDecimals(bDec, 6)
+        if (freshRemaining === 0n || freshRemaining < minB) {
+          console.log(`[executor] ${network}: reconciling sell ${sellRow.order_id} -> close (remaining=${freshRemaining.toString()})`)
+          await updateOrderRemaining(sellRow.order_id, 0n, 'filled', network)
+        }
+      }
+    } catch {}
+    return false
+  }
 
   try {
     console.log(`[executor] ${network}: attempting to match orders for ${base}/${quote}`)
