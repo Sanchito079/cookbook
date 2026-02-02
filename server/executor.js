@@ -1512,19 +1512,57 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
     const minBaseFill = minUnitsForDecimals(baseDec, 6)  // 0.000001 base unit
 
     if (quoteIn < minQuoteFill || baseOut < minBaseFill) {
-      console.log(`[executor] ${network}: below dust thresholds -> skip match. quoteIn=${quoteIn.toString()} (min=${minQuoteFill.toString()}), baseOut=${baseOut.toString()} (min=${minBaseFill.toString()})`)
-      // Finalize tiny remainders to stop repeated attempts
+      console.log(`[executor] ${network}: below min-fill -> finalize limiting side. quoteIn=${quoteIn.toString()} (min=${minQuoteFill.toString()}), baseOut=${baseOut.toString()} (min=${minBaseFill.toString()})`)
+
+      // Decide limiting side: if baseOut hit sellRemBase or baseFromSellAvail, seller is limiting.
+      // If quoteIn hit buyRemQuote or baseFromBuyAvail via minOut, buyer is limiting.
       try {
-        if (buyRemQuote < minQuoteFill) {
-          console.log(`[executor] ${network}: closing buy order ${buyRow.order_id} due to dust remainder ${buyRemQuote.toString()} < ${minQuoteFill.toString()}`)
+        let closedAny = false
+        // Heuristics to determine which side was the binding constraint
+        // We recompute some caps to detect which equality held.
+        const baseFromBuyAvail_local = minOut(diag.availBuy, buy.amountIn, buy.amountOutMin)
+        const baseFromSellAvail_local = diag.availSell
+
+        // If baseOut equals sellRemBase or baseFromSellAvail, seller limited
+        const sellerLimited = (baseOut === sellRemBase) || (baseOut === baseFromSellAvail_local)
+        // If quoteIn is very close to buyRemQuote or baseOut equals baseFromBuyAvail, buyer limited
+        const buyerLimited = (quoteIn >= buyRemQuote) || (baseOut === baseFromBuyAvail_local)
+
+        if (sellerLimited && !buyerLimited) {
+          console.log(`[executor] ${network}: seller limiting -> closing sell order ${sellRow.order_id}`)
+          await updateOrderRemaining(sellRow.order_id, 0n, 'filled', network)
+          closedAny = true
+        } else if (buyerLimited && !sellerLimited) {
+          console.log(`[executor] ${network}: buyer limiting -> closing buy order ${buyRow.order_id}`)
           await updateOrderRemaining(buyRow.order_id, 0n, 'filled', network)
+          closedAny = true
+        } else {
+          // Ambiguous: close both to guarantee no retries
+          console.log(`[executor] ${network}: ambiguous limiter -> closing both orders ${buyRow.order_id} and ${sellRow.order_id}`)
+          await updateOrderRemaining(buyRow.order_id, 0n, 'filled', network)
+          await updateOrderRemaining(sellRow.order_id, 0n, 'filled', network)
+          closedAny = true
+        }
+
+        // As a safety, if their remainders are below thresholds, close both anyway
+        if (buyRemQuote < minQuoteFill) {
+          console.log(`[executor] ${network}: also closing buy order ${buyRow.order_id} due to dust remainder ${buyRemQuote.toString()} < ${minQuoteFill.toString()}`)
+          await updateOrderRemaining(buyRow.order_id, 0n, 'filled', network)
+          closedAny = true
         }
         if (sellRemBase < minBaseFill) {
-          console.log(`[executor] ${network}: closing sell order ${sellRow.order_id} due to dust remainder ${sellRemBase.toString()} < ${minBaseFill.toString()}`)
+          console.log(`[executor] ${network}: also closing sell order ${sellRow.order_id} due to dust remainder ${sellRemBase.toString()} < ${minBaseFill.toString()}`)
+          await updateOrderRemaining(sellRow.order_id, 0n, 'filled', network)
+          closedAny = true
+        }
+
+        if (!closedAny) {
+          console.log(`[executor] ${network}: min-fill guard triggered but no side conclusively limiting; closing both orders to prevent reprocessing.`)
+          await updateOrderRemaining(buyRow.order_id, 0n, 'filled', network)
           await updateOrderRemaining(sellRow.order_id, 0n, 'filled', network)
         }
       } catch (e) {
-        console.warn('[executor] dust finalization failed:', e?.message || e)
+        console.warn('[executor] min-fill finalization failed:', e?.message || e)
       }
       return false
     }
