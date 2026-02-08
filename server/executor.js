@@ -813,8 +813,8 @@ async function checkAndTriggerConditionalOrders(network = 'bsc') {
   return triggeredOrderIds
 }
 
-// Calculate dynamic price for liquidity orders based on remaining amount
-function calculateDynamicPrice(order, remainingAmount) {
+// Calculate dynamic price for liquidity orders based on remaining amount AND market price
+async function calculateDynamicPrice(order, remainingAmount, marketPrice = null) {
   if (!order.is_liquidity_order || !order.initial_price) {
     return null
   }
@@ -834,6 +834,9 @@ function calculateDynamicPrice(order, remainingAmount) {
   const params = order.price_curve_params || {}
   const slope = parseFloat(params.slope) || 0.01 // Default 1% price change per 100% sold
   const curveType = order.price_curve_type || 'linear'
+  
+  // Get max price deviation from params (default 5% to prevent arbitrage)
+  const maxDeviation = parseFloat(params.maxDeviation) || 0.05
 
   let newPrice = initialPrice
 
@@ -844,9 +847,58 @@ function calculateDynamicPrice(order, remainingAmount) {
   } else if (curveType === 'exponential') {
     // Exponential price curve
     newPrice = initialPrice * Math.pow(1 + slope, soldPercentage * 10)
+  } else if (curveType === 'market_tracking') {
+    // Market tracking mode: price follows market price within deviation bounds
+    if (marketPrice && marketPrice > 0) {
+      // Ensure price stays within max deviation of market price
+      const minPrice = marketPrice * (1 - maxDeviation)
+      const maxPrice = marketPrice * (1 + maxDeviation)
+      
+      // Calculate base price from curve
+      const basePrice = initialPrice * (1 + (soldPercentage * slope))
+      
+      // Clamp to market price range
+      newPrice = Math.max(minPrice, Math.min(maxPrice, basePrice))
+    } else {
+      // Fallback to linear if no market price
+      newPrice = initialPrice * (1 + (soldPercentage * slope))
+    }
   }
 
   return newPrice
+}
+
+// Fetch current market price for a token pair from recent trades
+async function getMarketPrice(baseAddress, quoteAddress, network = 'bsc') {
+  try {
+    const { data: recentTrades } = await supabase
+      .from('trades')
+      .select('price')
+      .eq('network', network)
+      .eq('base_address', baseAddress.toLowerCase())
+      .eq('quote_address', quoteAddress.toLowerCase())
+      .order('created_at', { ascending: false })
+      .limit(10)
+    
+    if (!recentTrades || recentTrades.length === 0) {
+      return null
+    }
+    
+    // Calculate average price from recent trades
+    const prices = recentTrades.map(t => parseFloat(t.price)).filter(p => p > 0)
+    if (prices.length === 0) return null
+    
+    // Use median to reduce impact of outliers
+    prices.sort((a, b) => a - b)
+    const medianPrice = prices.length % 2 === 0 
+      ? prices[Math.floor(prices.length / 2)]
+      : (prices[prices.length / 2 - 1] + prices[prices.length / 2]) / 2
+    
+    return medianPrice
+  } catch (e) {
+    console.error('[executor] Error fetching market price:', e)
+    return null
+  }
 }
 
 // Update prices for liquidity orders based on remaining amounts
@@ -877,10 +929,32 @@ async function updateLiquidityOrderPrices(network = 'bsc') {
 
     console.log(`[executor] ${network}: Found ${liquidityOrders.length} liquidity orders`)
 
+    // Fetch market prices for all unique pairs
+    const uniquePairs = new Map()
+    for (const order of liquidityOrders) {
+      const pairKey = `${order.base_address}_${order.quote_address}`
+      if (!uniquePairs.has(pairKey)) {
+        uniquePairs.set(pairKey, { base: order.base_address, quote: order.quote_address })
+      }
+    }
+
+    // Fetch market prices for each unique pair
+    const marketPrices = new Map()
+    for (const [pairKey, pair] of uniquePairs) {
+      const marketPrice = await getMarketPrice(pair.base, pair.quote, network)
+      if (marketPrice) {
+        marketPrices.set(pairKey, marketPrice)
+        console.log(`[executor] ${network}: Market price for ${pair.base}/${pair.quote}: ${marketPrice}`)
+      }
+    }
+
     let updatedCount = 0
     for (const order of liquidityOrders) {
       const currentPrice = parseFloat(order.price)
-      const newPrice = calculateDynamicPrice(order, order.remaining)
+      const pairKey = `${order.base_address}_${order.quote_address}`
+      const marketPrice = marketPrices.get(pairKey)
+      
+      const newPrice = calculateDynamicPrice(order, order.remaining, marketPrice)
 
       if (newPrice && Math.abs(newPrice - currentPrice) > 0.000001) {
         // Update the order with new price
@@ -896,7 +970,7 @@ async function updateLiquidityOrderPrices(network = 'bsc') {
         if (updateError) {
           console.error(`[executor] Failed to update price for order ${order.order_id}:`, updateError)
         } else {
-          console.log(`[executor] ${network}: Updated price for liquidity order ${order.order_id}: ${currentPrice} -> ${newPrice}`)
+          console.log(`[executor] ${network}: Updated price for liquidity order ${order.order_id}: ${currentPrice} -> ${newPrice} (market: ${marketPrice})`)
           updatedCount++
         }
       }
