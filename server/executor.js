@@ -1,5 +1,3 @@
-import dotenv from 'dotenv'
-import path from 'path'
 import { fileURLToPath } from 'url'
 import crypto from 'crypto'
 import fetch from 'node-fetch'
@@ -35,6 +33,13 @@ const REWARD_CONFIG = {
   enabled: String(process.env.REWARD_SYSTEM_ENABLED || 'true').toLowerCase() === 'true',
   minVolumeUsd: parseFloat(process.env.REWARD_MIN_VOLUME_USD || '0.1') // Minimum $0.1 volume to earn rewards
 }
+
+console.log('[executor] Reward System Configuration:', {
+  enabled: REWARD_CONFIG.enabled,
+  makerRate: REWARD_CONFIG.makerRate,
+  takerRate: REWARD_CONFIG.takerRate,
+  minVolumeUsd: REWARD_CONFIG.minVolumeUsd
+})
 
 // Settlement ABI (from user-provided ABI to align custom errors and events)
 const SETTLEMENT_ABI = [
@@ -1025,7 +1030,21 @@ async function updateOrderStatus(orderId, newStatus, network = 'bsc') {
 
 // Calculate and award rewards for a trade
 async function awardTradeRewards(network, makerAddress, takerAddress, volumeUsd, baseToken, quoteToken, amountBase, amountQuote, txHash) {
+  console.log(`[rewards] ${network}: awardTradeRewards called with:`, {
+    makerAddress,
+    takerAddress,
+    volumeUsd,
+    baseToken,
+    quoteToken,
+    amountBase,
+    amountQuote,
+    txHash,
+    rewardEnabled: REWARD_CONFIG.enabled,
+    supabaseExists: !!supabase
+  })
+
   if (!REWARD_CONFIG.enabled || !supabase) {
+    console.log(`[rewards] ${network}: Reward system disabled or supabase not available, skipping`)
     return { makerPoints: 0, takerPoints: 0 }
   }
 
@@ -1039,114 +1058,142 @@ async function awardTradeRewards(network, makerAddress, takerAddress, volumeUsd,
     const makerPoints = volumeUsd * REWARD_CONFIG.makerRate
     const takerPoints = volumeUsd * REWARD_CONFIG.takerRate
     const nowIso = new Date().toISOString()
-
+    
     console.log(`[rewards] ${network}: Awarding rewards - Maker: ${makerAddress} gets ${makerPoints} points, Taker: ${takerAddress} gets ${takerPoints} points`)
-
-    // Update maker rewards (upsert)
-    const { error: makerError } = await supabase
-      .from('user_rewards')
-      .upsert({
-        user_address: makerAddress.toLowerCase(),
-        network,
-        total_volume_usd: volumeUsd,
-        maker_volume_usd: volumeUsd,
-        total_trades: 1,
-        maker_trades: 1,
-        reward_points: makerPoints,
-        maker_reward_points: makerPoints,
-        updated_at: nowIso
-      }, {
-        onConflict: 'network,user_address',
-        ignoreDuplicates: false
-      })
-
-    if (makerError) {
-      // If upsert fails, try increment approach
-      try {
-        await supabase.rpc('increment_user_rewards', {
-          p_network: network,
-          p_user_address: makerAddress.toLowerCase(),
-          p_volume_usd: volumeUsd,
-          p_reward_points: makerPoints,
-          p_is_maker: true
-        })
-      } catch (rpcError) {
-        // Fallback: manual increment
-        const { data: existing } = await supabase
+    
+    // Update maker rewards - use manual increment approach for reliability
+    try {
+      const { data: existingMaker, error: fetchMakerError } = await supabase
+        .from('user_rewards')
+        .select('*')
+        .eq('network', network)
+        .eq('user_address', makerAddress.toLowerCase())
+        .single()
+      
+      if (fetchMakerError && fetchMakerError.code !== 'PGRST116') {
+        console.error('[rewards] Error fetching maker rewards:', fetchMakerError)
+        throw fetchMakerError
+      }
+      
+      if (existingMaker) {
+        // Update existing record
+        console.log(`[rewards] ${network}: Updating existing maker record for ${makerAddress}`)
+        const { error: updateMakerError } = await supabase
           .from('user_rewards')
-          .select('*')
+          .update({
+            total_volume_usd: Number(existingMaker.total_volume_usd || 0) + volumeUsd,
+            maker_volume_usd: Number(existingMaker.maker_volume_usd || 0) + volumeUsd,
+            total_trades: (existingMaker.total_trades || 0) + 1,
+            maker_trades: (existingMaker.maker_trades || 0) + 1,
+            reward_points: Number(existingMaker.reward_points || 0) + makerPoints,
+            maker_reward_points: Number(existingMaker.maker_reward_points || 0) + makerPoints,
+            updated_at: nowIso
+          })
           .eq('network', network)
           .eq('user_address', makerAddress.toLowerCase())
-          .single()
-
-        if (existing) {
-          await supabase
-            .from('user_rewards')
-            .update({
-              total_volume_usd: Number(existing.total_volume_usd || 0) + volumeUsd,
-              maker_volume_usd: Number(existing.maker_volume_usd || 0) + volumeUsd,
-              total_trades: (existing.total_trades || 0) + 1,
-              maker_trades: (existing.maker_trades || 0) + 1,
-              reward_points: Number(existing.reward_points || 0) + makerPoints,
-              maker_reward_points: Number(existing.maker_reward_points || 0) + makerPoints,
-              updated_at: nowIso
-            })
-            .eq('network', network)
-            .eq('user_address', makerAddress.toLowerCase())
+        
+        if (updateMakerError) {
+          console.error('[rewards] Error updating maker rewards:', updateMakerError)
+          throw updateMakerError
         }
+        console.log(`[rewards] ${network}: Successfully updated maker rewards for ${makerAddress}`)
+      } else {
+        // Insert new record
+        console.log(`[rewards] ${network}: Inserting new maker record for ${makerAddress}`)
+        const { error: insertMakerError } = await supabase
+          .from('user_rewards')
+          .insert({
+            user_address: makerAddress.toLowerCase(),
+            network,
+            total_volume_usd: volumeUsd,
+            maker_volume_usd: volumeUsd,
+            total_trades: 1,
+            maker_trades: 1,
+            reward_points: makerPoints,
+            maker_reward_points: makerPoints,
+            created_at: nowIso,
+            updated_at: nowIso
+          })
+        
+        if (insertMakerError) {
+          console.error('[rewards] Error inserting maker rewards:', insertMakerError)
+          throw insertMakerError
+        }
+        console.log(`[rewards] ${network}: Successfully inserted maker rewards for ${makerAddress}`)
       }
+    } catch (makerErr) {
+      console.error('[rewards] Failed to update maker rewards:', makerErr?.message || makerErr)
+      throw makerErr
     }
 
-    // Update taker rewards (upsert)
-    const { error: takerError } = await supabase
-      .from('user_rewards')
-      .upsert({
-        user_address: takerAddress.toLowerCase(),
-        network,
-        total_volume_usd: volumeUsd,
-        taker_volume_usd: volumeUsd,
-        total_trades: 1,
-        taker_trades: 1,
-        reward_points: takerPoints,
-        taker_reward_points: takerPoints,
-        updated_at: nowIso
-      }, {
-        onConflict: 'network,user_address',
-        ignoreDuplicates: false
-      })
-
-    if (takerError) {
-      // Fallback: manual increment
-      try {
-        const { data: existing } = await supabase
+    // Update taker rewards - use manual increment approach for reliability
+    try {
+      const { data: existingTaker, error: fetchTakerError } = await supabase
+        .from('user_rewards')
+        .select('*')
+        .eq('network', network)
+        .eq('user_address', takerAddress.toLowerCase())
+        .single()
+      
+      if (fetchTakerError && fetchTakerError.code !== 'PGRST116') {
+        console.error('[rewards] Error fetching taker rewards:', fetchTakerError)
+        throw fetchTakerError
+      }
+      
+      if (existingTaker) {
+        // Update existing record
+        console.log(`[rewards] ${network}: Updating existing taker record for ${takerAddress}`)
+        const { error: updateTakerError } = await supabase
           .from('user_rewards')
-          .select('*')
+          .update({
+            total_volume_usd: Number(existingTaker.total_volume_usd || 0) + volumeUsd,
+            taker_volume_usd: Number(existingTaker.taker_volume_usd || 0) + volumeUsd,
+            total_trades: (existingTaker.total_trades || 0) + 1,
+            taker_trades: (existingTaker.taker_trades || 0) + 1,
+            reward_points: Number(existingTaker.reward_points || 0) + takerPoints,
+            taker_reward_points: Number(existingTaker.taker_reward_points || 0) + takerPoints,
+            updated_at: nowIso
+          })
           .eq('network', network)
           .eq('user_address', takerAddress.toLowerCase())
-          .single()
-
-        if (existing) {
-          await supabase
-            .from('user_rewards')
-            .update({
-              total_volume_usd: Number(existing.total_volume_usd || 0) + volumeUsd,
-              taker_volume_usd: Number(existing.taker_volume_usd || 0) + volumeUsd,
-              total_trades: (existing.total_trades || 0) + 1,
-              taker_trades: (existing.taker_trades || 0) + 1,
-              reward_points: Number(existing.reward_points || 0) + takerPoints,
-              taker_reward_points: Number(existing.taker_reward_points || 0) + takerPoints,
-              updated_at: nowIso
-            })
-            .eq('network', network)
-            .eq('user_address', takerAddress.toLowerCase())
+        
+        if (updateTakerError) {
+          console.error('[rewards] Error updating taker rewards:', updateTakerError)
+          throw updateTakerError
         }
-      } catch (e) {
-        console.warn('[rewards] Failed to update taker rewards:', e?.message || e)
+        console.log(`[rewards] ${network}: Successfully updated taker rewards for ${takerAddress}`)
+      } else {
+        // Insert new record
+        console.log(`[rewards] ${network}: Inserting new taker record for ${takerAddress}`)
+        const { error: insertTakerError } = await supabase
+          .from('user_rewards')
+          .insert({
+            user_address: takerAddress.toLowerCase(),
+            network,
+            total_volume_usd: volumeUsd,
+            taker_volume_usd: volumeUsd,
+            total_trades: 1,
+            taker_trades: 1,
+            reward_points: takerPoints,
+            taker_reward_points: takerPoints,
+            created_at: nowIso,
+            updated_at: nowIso
+          })
+        
+        if (insertTakerError) {
+          console.error('[rewards] Error inserting taker rewards:', insertTakerError)
+          throw insertTakerError
+        }
+        console.log(`[rewards] ${network}: Successfully inserted taker rewards for ${takerAddress}`)
       }
+    } catch (takerErr) {
+      console.error('[rewards] Failed to update taker rewards:', takerErr?.message || takerErr)
+      throw takerErr
     }
 
     // Record reward history for maker
     const makerHistoryId = crypto.randomUUID()
+    console.log(`[rewards] ${network}: Recording maker history with ID: ${makerHistoryId}`)
     await supabase
       .from('reward_history')
       .insert({
@@ -1164,10 +1211,12 @@ async function awardTradeRewards(network, makerAddress, takerAddress, volumeUsd,
         amount_quote: amountQuote,
         created_at: nowIso
       })
+      .then(() => console.log(`[rewards] ${network}: Successfully recorded maker history for ${makerAddress}`))
       .catch(e => console.warn('[rewards] Failed to record maker history:', e?.message || e))
 
     // Record reward history for taker
     const takerHistoryId = crypto.randomUUID()
+    console.log(`[rewards] ${network}: Recording taker history with ID: ${takerHistoryId}`)
     await supabase
       .from('reward_history')
       .insert({
@@ -1185,6 +1234,7 @@ async function awardTradeRewards(network, makerAddress, takerAddress, volumeUsd,
         amount_quote: amountQuote,
         created_at: nowIso
       })
+      .then(() => console.log(`[rewards] ${network}: Successfully recorded taker history for ${takerAddress}`))
       .catch(e => console.warn('[rewards] Failed to record taker history:', e?.message || e))
 
     console.log(`[rewards] ${network}: Successfully awarded rewards for trade ${txHash?.slice(0, 10)}...`)
@@ -2109,11 +2159,21 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
 
       // Award rewards to maker and taker
       try {
+        console.log('[executor] Starting reward calculation for trade...')
         // Determine maker and taker (the order that was placed first is the maker)
         const buyCreated = new Date(buyRow.created_at || 0).getTime()
         const sellCreated = new Date(sellRow.created_at || 0).getTime()
         const makerAddress = buyCreated <= sellCreated ? buyRow.user_address : sellRow.user_address
         const takerAddress = buyCreated <= sellCreated ? sellRow.user_address : buyRow.user_address
+
+        console.log('[executor] Trade participants:', {
+          buyAddress: buyRow.user_address,
+          sellAddress: sellRow.user_address,
+          buyCreated: new Date(buyRow.created_at).toISOString(),
+          sellCreated: new Date(sellRow.created_at).toISOString(),
+          makerAddress,
+          takerAddress
+        })
 
         // Calculate volume in USD (use quote amount if it's a stablecoin)
         let volumeUsd = 0
@@ -2125,11 +2185,25 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
         if (stablecoins.includes(quoteAddr)) {
           // Quote is stablecoin, use quote amount directly
           volumeUsd = Number(quoteIn) / Math.pow(10, quoteDec)
+          console.log('[executor] Quote is stablecoin, volumeUsd:', volumeUsd)
         } else {
           // Estimate USD value using price (price = quote/base, so base * price = quote value)
           // If we don't have USD price, use a rough estimate
           volumeUsd = (Number(baseOut) / Math.pow(10, baseDec)) * priceHuman
+          console.log('[executor] Quote is not stablecoin, estimated volumeUsd:', volumeUsd, 'price:', priceHuman)
         }
+
+        console.log('[executor] Calling awardTradeRewards with:', {
+          network,
+          makerAddress,
+          takerAddress,
+          volumeUsd,
+          baseAddr,
+          quoteAddr,
+          amountBase: Number(baseOut) / Math.pow(10, baseDec),
+          amountQuote: Number(quoteIn) / Math.pow(10, quoteDec),
+          txHash: receipt.hash || tx.hash
+        })
 
         await awardTradeRewards(
           network,
@@ -2143,7 +2217,8 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
           receipt.hash || tx.hash
         )
       } catch (rewardErr) {
-        console.warn('[executor] failed to award rewards:', rewardErr?.message || rewardErr)
+        console.error('[executor] failed to award rewards:', rewardErr?.message || rewardErr)
+        console.error('[executor] reward error stack:', rewardErr?.stack)
       }
 
       // Broadcast real-time update to clients
