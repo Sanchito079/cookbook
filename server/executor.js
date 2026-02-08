@@ -28,6 +28,14 @@ const CUSTODIAL_ADDRESS = '0x70c992e6a19c565430fa0c21933395ebf1e907c3'
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE
 
+// Reward system configuration
+const REWARD_CONFIG = {
+  makerRate: parseFloat(process.env.REWARD_MAKER_RATE || '0.001'), // 0.1% of volume for makers
+  takerRate: parseFloat(process.env.REWARD_TAKER_RATE || '0.0005'), // 0.05% of volume for takers
+  enabled: String(process.env.REWARD_SYSTEM_ENABLED || 'true').toLowerCase() === 'true',
+  minVolumeUsd: parseFloat(process.env.REWARD_MIN_VOLUME_USD || '0.1') // Minimum $0.1 volume to earn rewards
+}
+
 // Settlement ABI (from user-provided ABI to align custom errors and events)
 const SETTLEMENT_ABI = [
   // custom errors
@@ -1013,6 +1021,202 @@ async function updateOrderStatus(orderId, newStatus, network = 'bsc') {
   }
 }
 
+// ==================== REWARD SYSTEM ====================
+
+// Calculate and award rewards for a trade
+async function awardTradeRewards(network, makerAddress, takerAddress, volumeUsd, baseToken, quoteToken, amountBase, amountQuote, txHash) {
+  if (!REWARD_CONFIG.enabled || !supabase) {
+    return { makerPoints: 0, takerPoints: 0 }
+  }
+
+  try {
+    // Skip if volume is too low
+    if (volumeUsd < REWARD_CONFIG.minVolumeUsd) {
+      console.log(`[rewards] ${network}: Volume ${volumeUsd} below minimum ${REWARD_CONFIG.minVolumeUsd}, skipping rewards`)
+      return { makerPoints: 0, takerPoints: 0 }
+    }
+
+    const makerPoints = volumeUsd * REWARD_CONFIG.makerRate
+    const takerPoints = volumeUsd * REWARD_CONFIG.takerRate
+    const nowIso = new Date().toISOString()
+
+    console.log(`[rewards] ${network}: Awarding rewards - Maker: ${makerAddress} gets ${makerPoints} points, Taker: ${takerAddress} gets ${takerPoints} points`)
+
+    // Update maker rewards (upsert)
+    const { error: makerError } = await supabase
+      .from('user_rewards')
+      .upsert({
+        user_address: makerAddress.toLowerCase(),
+        network,
+        total_volume_usd: volumeUsd,
+        maker_volume_usd: volumeUsd,
+        total_trades: 1,
+        maker_trades: 1,
+        reward_points: makerPoints,
+        maker_reward_points: makerPoints,
+        updated_at: nowIso
+      }, {
+        onConflict: 'network,user_address',
+        ignoreDuplicates: false
+      })
+
+    if (makerError) {
+      // If upsert fails, try increment approach
+      try {
+        await supabase.rpc('increment_user_rewards', {
+          p_network: network,
+          p_user_address: makerAddress.toLowerCase(),
+          p_volume_usd: volumeUsd,
+          p_reward_points: makerPoints,
+          p_is_maker: true
+        })
+      } catch (rpcError) {
+        // Fallback: manual increment
+        const { data: existing } = await supabase
+          .from('user_rewards')
+          .select('*')
+          .eq('network', network)
+          .eq('user_address', makerAddress.toLowerCase())
+          .single()
+
+        if (existing) {
+          await supabase
+            .from('user_rewards')
+            .update({
+              total_volume_usd: Number(existing.total_volume_usd || 0) + volumeUsd,
+              maker_volume_usd: Number(existing.maker_volume_usd || 0) + volumeUsd,
+              total_trades: (existing.total_trades || 0) + 1,
+              maker_trades: (existing.maker_trades || 0) + 1,
+              reward_points: Number(existing.reward_points || 0) + makerPoints,
+              maker_reward_points: Number(existing.maker_reward_points || 0) + makerPoints,
+              updated_at: nowIso
+            })
+            .eq('network', network)
+            .eq('user_address', makerAddress.toLowerCase())
+        }
+      }
+    }
+
+    // Update taker rewards (upsert)
+    const { error: takerError } = await supabase
+      .from('user_rewards')
+      .upsert({
+        user_address: takerAddress.toLowerCase(),
+        network,
+        total_volume_usd: volumeUsd,
+        taker_volume_usd: volumeUsd,
+        total_trades: 1,
+        taker_trades: 1,
+        reward_points: takerPoints,
+        taker_reward_points: takerPoints,
+        updated_at: nowIso
+      }, {
+        onConflict: 'network,user_address',
+        ignoreDuplicates: false
+      })
+
+    if (takerError) {
+      // Fallback: manual increment
+      try {
+        const { data: existing } = await supabase
+          .from('user_rewards')
+          .select('*')
+          .eq('network', network)
+          .eq('user_address', takerAddress.toLowerCase())
+          .single()
+
+        if (existing) {
+          await supabase
+            .from('user_rewards')
+            .update({
+              total_volume_usd: Number(existing.total_volume_usd || 0) + volumeUsd,
+              taker_volume_usd: Number(existing.taker_volume_usd || 0) + volumeUsd,
+              total_trades: (existing.total_trades || 0) + 1,
+              taker_trades: (existing.taker_trades || 0) + 1,
+              reward_points: Number(existing.reward_points || 0) + takerPoints,
+              taker_reward_points: Number(existing.taker_reward_points || 0) + takerPoints,
+              updated_at: nowIso
+            })
+            .eq('network', network)
+            .eq('user_address', takerAddress.toLowerCase())
+        }
+      } catch (e) {
+        console.warn('[rewards] Failed to update taker rewards:', e?.message || e)
+      }
+    }
+
+    // Record reward history for maker
+    const makerHistoryId = crypto.randomUUID()
+    await supabase
+      .from('reward_history')
+      .insert({
+        id: makerHistoryId,
+        network,
+        user_address: makerAddress.toLowerCase(),
+        trade_id: txHash,
+        role: 'maker',
+        volume_usd: volumeUsd,
+        reward_points: makerPoints,
+        reward_rate: REWARD_CONFIG.makerRate,
+        base_token: baseToken,
+        quote_token: quoteToken,
+        amount_base: amountBase,
+        amount_quote: amountQuote,
+        created_at: nowIso
+      })
+      .catch(e => console.warn('[rewards] Failed to record maker history:', e?.message || e))
+
+    // Record reward history for taker
+    const takerHistoryId = crypto.randomUUID()
+    await supabase
+      .from('reward_history')
+      .insert({
+        id: takerHistoryId,
+        network,
+        user_address: takerAddress.toLowerCase(),
+        trade_id: txHash,
+        role: 'taker',
+        volume_usd: volumeUsd,
+        reward_points: takerPoints,
+        reward_rate: REWARD_CONFIG.takerRate,
+        base_token: baseToken,
+        quote_token: quoteToken,
+        amount_base: amountBase,
+        amount_quote: amountQuote,
+        created_at: nowIso
+      })
+      .catch(e => console.warn('[rewards] Failed to record taker history:', e?.message || e))
+
+    console.log(`[rewards] ${network}: Successfully awarded rewards for trade ${txHash?.slice(0, 10)}...`)
+
+    return { makerPoints, takerPoints }
+  } catch (e) {
+    console.error('[rewards] Error awarding trade rewards:', e?.message || e)
+    return { makerPoints: 0, takerPoints: 0 }
+  }
+}
+
+// Get user rewards
+async function getUserRewards(userAddress, network = null) {
+  try {
+    let query = supabase
+      .from('user_rewards')
+      .select('*')
+      .eq('user_address', userAddress.toLowerCase())
+
+    if (network) {
+      query = query.eq('network', network)
+    }
+
+    const { data, error } = await query
+    if (error) throw error
+    return data || []
+  } catch (e) {
+    console.error('[rewards] Error getting user rewards:', e?.message || e)
+    return []
+  }
+}
+
 // Reservation helpers to ensure idempotent execution across executors
 async function reserveOrder(orderId, network = 'bsc') {
   const table = network === 'crosschain' ? 'cross_chain_orders' : 'orders'
@@ -1902,6 +2106,45 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
         block_number: receipt.blockNumber,
         created_at: new Date().toISOString()
       })
+
+      // Award rewards to maker and taker
+      try {
+        // Determine maker and taker (the order that was placed first is the maker)
+        const buyCreated = new Date(buyRow.created_at || 0).getTime()
+        const sellCreated = new Date(sellRow.created_at || 0).getTime()
+        const makerAddress = buyCreated <= sellCreated ? buyRow.user_address : sellRow.user_address
+        const takerAddress = buyCreated <= sellCreated ? sellRow.user_address : buyRow.user_address
+
+        // Calculate volume in USD (use quote amount if it's a stablecoin)
+        let volumeUsd = 0
+        const stablecoins = [
+          '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', // USDC on Base
+          '0x55d398326f99059ff775485246999027b3197955', // USDT on BSC
+          '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d', // USDC on BSC
+        ]
+        if (stablecoins.includes(quoteAddr)) {
+          // Quote is stablecoin, use quote amount directly
+          volumeUsd = Number(quoteIn) / Math.pow(10, quoteDec)
+        } else {
+          // Estimate USD value using price (price = quote/base, so base * price = quote value)
+          // If we don't have USD price, use a rough estimate
+          volumeUsd = (Number(baseOut) / Math.pow(10, baseDec)) * priceHuman
+        }
+
+        await awardTradeRewards(
+          network,
+          makerAddress,
+          takerAddress,
+          volumeUsd,
+          baseAddr,
+          quoteAddr,
+          Number(baseOut) / Math.pow(10, baseDec),
+          Number(quoteIn) / Math.pow(10, quoteDec),
+          receipt.hash || tx.hash
+        )
+      } catch (rewardErr) {
+        console.warn('[executor] failed to award rewards:', rewardErr?.message || rewardErr)
+      }
 
       // Broadcast real-time update to clients
       try {
