@@ -3087,6 +3087,109 @@ app.get('/test/watchcount', async (req, res) => {
 })
 
 
+// ===== Rewards System =====
+
+// Get user rewards
+app.get('/api/rewards/:address', async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) return res.status(503).json({ error: 'database disabled' })
+    
+    const address = req.params.address?.toLowerCase()
+    const network = req.query.network || null
+    
+    if (!address) {
+      return res.status(400).json({ error: 'Address required' })
+    }
+
+    let query = supabase
+      .from('user_rewards')
+      .select('*')
+      .eq('user_address', address)
+
+    if (network) {
+      query = query.eq('network', network)
+    }
+
+    const { data, error } = await query
+    if (error) throw error
+
+    // Calculate totals across all networks
+    const totals = (data || []).reduce((acc, row) => {
+      acc.totalVolumeUsd += Number(row.total_volume_usd || 0)
+      acc.makerVolumeUsd += Number(row.maker_volume_usd || 0)
+      acc.takerVolumeUsd += Number(row.taker_volume_usd || 0)
+      acc.totalTrades += Number(row.total_trades || 0)
+      acc.makerTrades += Number(row.maker_trades || 0)
+      acc.takerTrades += Number(row.taker_trades || 0)
+      acc.rewardPoints += Number(row.reward_points || 0)
+      acc.makerRewardPoints += Number(row.maker_reward_points || 0)
+      acc.takerRewardPoints += Number(row.taker_reward_points || 0)
+      return acc
+    }, {
+      totalVolumeUsd: 0,
+      makerVolumeUsd: 0,
+      takerVolumeUsd: 0,
+      totalTrades: 0,
+      makerTrades: 0,
+      takerTrades: 0,
+      rewardPoints: 0,
+      makerRewardPoints: 0,
+      takerRewardPoints: 0
+    })
+
+    return res.json({
+      address,
+      network,
+      byNetwork: data || [],
+      totals
+    })
+  } catch (e) {
+    console.error('[rewards] Error fetching rewards:', e?.message || e)
+    return res.status(500).json({ error: e?.message || String(e) })
+  }
+})
+
+// Get user reward history
+app.get('/api/rewards/:address/history', async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) return res.status(503).json({ error: 'database disabled' })
+    
+    const address = req.params.address?.toLowerCase()
+    const network = req.query.network || null
+    const limit = parseInt(req.query.limit) || 50
+    const offset = parseInt(req.query.offset) || 0
+    
+    if (!address) {
+      return res.status(400).json({ error: 'Address required' })
+    }
+
+    let query = supabase
+      .from('reward_history')
+      .select('*')
+      .eq('user_address', address)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1)
+
+    if (network) {
+      query = query.eq('network', network)
+    }
+
+    const { data, error } = await query
+    if (error) throw error
+
+    return res.json({
+      address,
+      network,
+      limit,
+      offset,
+      history: data || []
+    })
+  } catch (e) {
+    console.error('[rewards] Error fetching reward history:', e?.message || e)
+    return res.status(500).json({ error: e?.message || String(e) })
+  }
+})
+
 // Endpoint for broadcasting updates (called by executor)
 app.post('/api/broadcast', (req, res) => {
   const { network, base, quote, type, data } = req.body
