@@ -813,6 +813,101 @@ async function checkAndTriggerConditionalOrders(network = 'bsc') {
   return triggeredOrderIds
 }
 
+// Calculate dynamic price for liquidity orders based on remaining amount
+function calculateDynamicPrice(order, remainingAmount) {
+  if (!order.is_liquidity_order || !order.initial_price) {
+    return null
+  }
+
+  const initialPrice = parseFloat(order.initial_price)
+  const totalAmount = parseFloat(order.amount_in)
+  const remaining = parseFloat(remainingAmount)
+  
+  if (totalAmount <= 0 || remaining <= 0) {
+    return initialPrice
+  }
+
+  // Calculate percentage sold
+  const soldPercentage = (totalAmount - remaining) / totalAmount
+  
+  // Get price curve parameters
+  const params = order.price_curve_params || {}
+  const slope = parseFloat(params.slope) || 0.01 // Default 1% price change per 100% sold
+  const curveType = order.price_curve_type || 'linear'
+
+  let newPrice = initialPrice
+
+  if (curveType === 'linear') {
+    // Linear price increase/decrease based on sold percentage
+    // Price increases as more tokens are sold (for sell orders)
+    newPrice = initialPrice * (1 + (soldPercentage * slope))
+  } else if (curveType === 'exponential') {
+    // Exponential price curve
+    newPrice = initialPrice * Math.pow(1 + slope, soldPercentage * 10)
+  }
+
+  return newPrice
+}
+
+// Update prices for liquidity orders based on remaining amounts
+async function updateLiquidityOrderPrices(network = 'bsc') {
+  try {
+    console.log(`[executor] ${network}: Checking liquidity orders for price updates...`)
+
+    // Fetch open liquidity orders
+    const { data: liquidityOrders, error } = await supabase
+      .from('orders')
+      .select('*')
+      .eq('network', network)
+      .eq('is_liquidity_order', true)
+      .eq('status', 'open')
+      .gt('remaining', '0')
+      .order('updated_at', { ascending: true })
+      .limit(100)
+
+    if (error) {
+      console.error('[executor] Error fetching liquidity orders:', error)
+      return
+    }
+
+    if (!liquidityOrders || liquidityOrders.length === 0) {
+      console.log(`[executor] ${network}: No liquidity orders to update`)
+      return
+    }
+
+    console.log(`[executor] ${network}: Found ${liquidityOrders.length} liquidity orders`)
+
+    let updatedCount = 0
+    for (const order of liquidityOrders) {
+      const currentPrice = parseFloat(order.price)
+      const newPrice = calculateDynamicPrice(order, order.remaining)
+
+      if (newPrice && Math.abs(newPrice - currentPrice) > 0.000001) {
+        // Update the order with new price
+        const { error: updateError } = await supabase
+          .from('orders')
+          .update({
+            price: String(newPrice),
+            updated_at: new Date().toISOString()
+          })
+          .eq('order_id', order.order_id)
+          .eq('network', network)
+
+        if (updateError) {
+          console.error(`[executor] Failed to update price for order ${order.order_id}:`, updateError)
+        } else {
+          console.log(`[executor] ${network}: Updated price for liquidity order ${order.order_id}: ${currentPrice} -> ${newPrice}`)
+          updatedCount++
+        }
+      }
+    }
+
+    console.log(`[executor] ${network}: Updated prices for ${updatedCount} liquidity orders`)
+  } catch (e) {
+    console.error('[executor] Error updating liquidity order prices:', e?.message || e)
+  }
+}
+
 async function updateOrderRemaining(orderId, newRemaining, newStatus, network = 'bsc') {
   try {
     const table = network === 'crosschain' ? 'cross_chain_orders' : 'orders'
@@ -2197,6 +2292,9 @@ async function runOnce(network = 'bsc') {
     } else {
       console.log(`[executor] ${network}: no open orders found`)
     }
+
+    // Update prices for liquidity orders
+    await updateLiquidityOrderPrices(network)
 
     console.log(`[executor] ${network}: execution cycle completed`)
 
