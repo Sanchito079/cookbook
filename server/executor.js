@@ -1,3 +1,5 @@
+import dotenv from 'dotenv'
+import path from 'path'
 import { fileURLToPath } from 'url'
 import crypto from 'crypto'
 import fetch from 'node-fetch'
@@ -2161,14 +2163,15 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
       try {
         console.log('[executor] Starting reward calculation for trade...')
         // Determine maker and taker (the order that was placed first is the maker)
+        // Note: orders table uses 'maker' field for the user address
         const buyCreated = new Date(buyRow.created_at || 0).getTime()
         const sellCreated = new Date(sellRow.created_at || 0).getTime()
-        const makerAddress = buyCreated <= sellCreated ? buyRow.user_address : sellRow.user_address
-        const takerAddress = buyCreated <= sellCreated ? sellRow.user_address : buyRow.user_address
+        const makerAddress = buyCreated <= sellCreated ? buyRow.maker : sellRow.maker
+        const takerAddress = buyCreated <= sellCreated ? sellRow.maker : buyRow.maker
 
         console.log('[executor] Trade participants:', {
-          buyAddress: buyRow.user_address,
-          sellAddress: sellRow.user_address,
+          buyAddress: buyRow.maker,
+          sellAddress: sellRow.maker,
           buyCreated: new Date(buyRow.created_at).toISOString(),
           sellCreated: new Date(sellRow.created_at).toISOString(),
           makerAddress,
