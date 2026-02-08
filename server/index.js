@@ -2845,7 +2845,15 @@ app.post('/api/orders', async (req, res) => {
       remaining,
       status: 'open',
       created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
+      updated_at: new Date().toISOString(),
+      // Add liquidity order fields if provided
+      ...(body.isLiquidityOrder && {
+        is_liquidity_order: true,
+        initial_price: body.initialPrice || null,
+        price_curve_type: body.priceCurveType || 'linear',
+        price_curve_params: body.priceCurveParams ? JSON.parse(body.priceCurveParams) : {},
+        liquidity_provider_address: body.liquidityProviderAddress || null
+      })
     }
 
     console.log('[SERVER ORDERS POST] Storing order with base_address:', row.base_address, 'quote_address:', row.quote_address)
@@ -3175,6 +3183,8 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
+
 
 
 
