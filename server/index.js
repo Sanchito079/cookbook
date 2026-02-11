@@ -1771,7 +1771,7 @@ app.get('/api/markets/wbnb/new', async (req, res) => {
     const pages = Number(req.query.pages || 2)
     const duration = (req.query.duration || '1h').toString()
     const page = Math.max(1, Number(req.query.page || 1))
-    const limit = Math.min(200, Math.max(1, Number(req.query.limit || 200))) // Limit to 200 per page
+    const limit = Math.min(50, Math.max(1, Number(req.query.limit || 50))) // Limit to 50 per page for performance
 
     // Get base markets data
     let markets = []
@@ -1843,19 +1843,14 @@ app.get('/api/markets/wbnb/new', async (req, res) => {
     }
     const marketsDeduped = Array.from(byPairFinal.values())
 
-    // Sort: 1) has valid price desc (most important), 2) volumeRaw desc, 3) pair asc (stable)
+    // Sort: 1) volumeRaw desc, 2) has valid price desc, 3) pair asc (stable)
     const marketsFinal = marketsDeduped.sort((a, b) => {
-      // First: prioritize pairs with valid price (not "-")
-      const pa = (a?.price && a.price !== '-') ? 1 : 0
-      const pb = (b?.price && b.price !== '-') ? 1 : 0
-      if (pb !== pa) return pb - pa
-      
-      // Second: sort by volume
       const va = Number.isFinite(parseFloat(a?.volumeRaw)) ? parseFloat(a.volumeRaw) : (Number.isFinite(parseFloat(a?.volume)) ? parseFloat(a.volume) : 0)
       const vb = Number.isFinite(parseFloat(b?.volumeRaw)) ? parseFloat(b.volumeRaw) : (Number.isFinite(parseFloat(b?.volume)) ? parseFloat(b.volume) : 0)
       if (vb !== va) return vb - va
-      
-      // Third: pair name (alphabetical)
+      const pa = (a?.price && a.price !== '-') ? 1 : 0
+      const pb = (b?.price && b.price !== '-') ? 1 : 0
+      if (pb !== pa) return pb - pa
       const ap = (a?.pair || '')
       const bp = (b?.pair || '')
       return ap.localeCompare(bp)
@@ -3291,6 +3286,27 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
