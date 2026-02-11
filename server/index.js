@@ -1843,14 +1843,26 @@ app.get('/api/markets/wbnb/new', async (req, res) => {
     }
     const marketsDeduped = Array.from(byPairFinal.values())
 
-    // Sort: 1) volumeRaw desc, 2) has valid price desc, 3) pair asc (stable)
+    // Sort: 1) has trading data (price, volume, or change) desc, 2) volumeRaw desc, 3) pair asc (stable)
     const marketsFinal = marketsDeduped.sort((a, b) => {
+      // First prioritize pairs with any trading data
+      const aHasData = (a?.price && a.price !== '-' && parseFloat(a.price) > 0) || 
+                     (a?.volume && parseFloat(a.volume) > 0) || 
+                     (a?.change && parseFloat(a.change) !== 0)
+      const bHasData = (b?.price && b.price !== '-' && parseFloat(b.price) > 0) || 
+                     (b?.volume && parseFloat(b.volume) > 0) || 
+                     (b?.change && parseFloat(b.change) !== 0)
+      
+      if (aHasData !== bHasData) {
+        return aHasData ? -1 : 1 // Pairs with data come first
+      }
+
+      // Then sort by volume
       const va = Number.isFinite(parseFloat(a?.volumeRaw)) ? parseFloat(a.volumeRaw) : (Number.isFinite(parseFloat(a?.volume)) ? parseFloat(a.volume) : 0)
       const vb = Number.isFinite(parseFloat(b?.volumeRaw)) ? parseFloat(b.volumeRaw) : (Number.isFinite(parseFloat(b?.volume)) ? parseFloat(b.volume) : 0)
       if (vb !== va) return vb - va
-      const pa = (a?.price && a.price !== '-') ? 1 : 0
-      const pb = (b?.price && b.price !== '-') ? 1 : 0
-      if (pb !== pa) return pb - pa
+
+      // Finally sort by pair name for stability
       const ap = (a?.pair || '')
       const bp = (b?.pair || '')
       return ap.localeCompare(bp)
@@ -2022,7 +2034,32 @@ app.get('/api/markets/search', async (req, res) => {
     // Ensure logos present
     const withLogos = await ensureLogos(network, enrichedResults)
 
-    return res.json({ network, q: qRaw, data: withLogos })
+    // Sort results: 1) has trading data (price, volume, or change) desc, 2) volumeRaw desc, 3) pair asc (stable)
+    const sortedResults = withLogos.sort((a, b) => {
+      // First prioritize pairs with any trading data
+      const aHasData = (a?.price && a.price !== '-' && parseFloat(a.price) > 0) || 
+                     (a?.volume && parseFloat(a.volume) > 0) || 
+                     (a?.change && parseFloat(a.change) !== 0)
+      const bHasData = (b?.price && b.price !== '-' && parseFloat(b.price) > 0) || 
+                     (b?.volume && parseFloat(b.volume) > 0) || 
+                     (b?.change && parseFloat(b.change) !== 0)
+      
+      if (aHasData !== bHasData) {
+        return aHasData ? -1 : 1 // Pairs with data come first
+      }
+
+      // Then sort by volume
+      const va = Number.isFinite(parseFloat(a?.volumeRaw)) ? parseFloat(a.volumeRaw) : (Number.isFinite(parseFloat(a?.volume)) ? parseFloat(a.volume) : 0)
+      const vb = Number.isFinite(parseFloat(b?.volumeRaw)) ? parseFloat(b.volumeRaw) : (Number.isFinite(parseFloat(b?.volume)) ? parseFloat(b.volume) : 0)
+      if (vb !== va) return vb - va
+
+      // Finally sort by pair name for stability
+      const ap = (a?.pair || '')
+      const bp = (b?.pair || '')
+      return ap.localeCompare(bp)
+    })
+
+    return res.json({ network, q: qRaw, data: sortedResults })
   } catch (e) {
     return res.status(500).json({ error: e?.message || String(e) })
   }
@@ -3286,6 +3323,7 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
 
 
 
