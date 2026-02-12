@@ -921,7 +921,7 @@ async function enrichMarketsWithTradingStats(network, markets) {
   if (!SUPABASE_ENABLED || !markets.length) return markets
 
   try {
-    // Get all recent trades for the network
+    // Get all recent trades for the network (reduce limit for faster loading)
     const tradesTable = network === 'crosschain' ? 'cross_chain_trades' : 'fills'
     console.log(`[enrich] querying trades table: ${tradesTable} for network: ${network}`)
 
@@ -929,7 +929,7 @@ async function enrichMarketsWithTradingStats(network, markets) {
       .from(tradesTable)
       .select('*')
       .order('created_at', { ascending: false })
-      .limit(1000) // Get more trades for better stats
+      .limit(500) // Reduced limit for faster performance
 
     if (network !== 'crosschain') {
       query = query.eq('network', network)
@@ -993,8 +993,6 @@ async function enrichMarketsWithTradingStats(network, markets) {
 
         const pairTrades = tradesByPair.get(pairKey) || tradesByPair.get(reversePairKey) || []
 
-        console.log(`[enrich] Checking pair ${baseAddr}/${quoteAddr}, found ${pairTrades.length} trades`)
-
         const enrichedMarket = { ...market }
 
         if (pairTrades.length > 0) {
@@ -1049,7 +1047,6 @@ async function enrichMarketsWithTradingStats(network, markets) {
 
           // Ensure currentPrice is valid
           if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
-            console.warn(`[enrich] Invalid currentPrice for ${baseAddr}/${quoteAddr}: ${currentPrice}, skipping price change calculation`)
             return enrichedMarket
           }
 
@@ -1103,8 +1100,6 @@ async function enrichMarketsWithTradingStats(network, markets) {
               priceChange = ((latestPrice - oldestPrice) / oldestPrice) * 100
             }
           }
-
-          console.log(`[enrich] ${baseAddr}/${quoteAddr}: found ${pairTrades.length} trades, recent24h=${recentTrades24h.length}, price=${currentPrice}, volume=${volume24h}, change=${priceChange}`)
 
           enrichedMarket.price = currentPrice > 0 ? currentPrice.toFixed(8) : (market.price || '-')
           enrichedMarket.change = Number.isFinite(priceChange) ? priceChange.toFixed(2) : '0.00'
@@ -1792,10 +1787,11 @@ app.get('/api/markets/wbnb/new', async (req, res) => {
       })
       totalCount = 1
     } else {
-      // For regular networks, fetch ALL markets first, then sort and paginate
+      // For regular networks, fetch markets with reasonable limit to balance performance and sorting accuracy
+      const fetchLimit = 200 // Fetch more than needed for one page to allow proper sorting
       if (SUPABASE_ENABLED) {
         try {
-          const result = await fetchMarketsFromDb(network, 1, 1000) // Fetch all available markets
+          const result = await fetchMarketsFromDb(network, 1, fetchLimit) // Fetch multiple pages at once
           if (result.data && result.data.length) {
             markets = await ensureLogos(network, result.data)
             totalCount = result.total
@@ -1810,20 +1806,20 @@ app.get('/api/markets/wbnb/new', async (req, res) => {
         const mapped = await refreshNetwork(network, pages, duration)
         if (SUPABASE_ENABLED) {
           try {
-            const result2 = await fetchMarketsFromDb(network, 1, 1000)
+            const result2 = await fetchMarketsFromDb(network, 1, fetchLimit)
             if (result2.data && result2.data.length) {
               markets = await ensureLogos(network, result2.data)
               totalCount = result2.total
             } else {
-              markets = mapped.map(m => ({ ...m, watch_count: 0 }))
+              markets = mapped.slice(0, fetchLimit).map(m => ({ ...m, watch_count: 0 }))
               totalCount = mapped.length
             }
           } catch {
-            markets = mapped
+            markets = mapped.slice(0, fetchLimit)
             totalCount = mapped.length
           }
         } else {
-          markets = mapped.map(m => ({ ...m, watch_count: 0 }))
+          markets = mapped.slice(0, fetchLimit).map(m => ({ ...m, watch_count: 0 }))
           totalCount = mapped.length
         }
       }
@@ -3328,6 +3324,8 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
+
 
 
 
