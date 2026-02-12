@@ -1792,10 +1792,10 @@ app.get('/api/markets/wbnb/new', async (req, res) => {
       })
       totalCount = 1
     } else {
-      // For regular networks, fetch from DB or GeckoTerminal
+      // For regular networks, fetch ALL markets first, then sort and paginate
       if (SUPABASE_ENABLED) {
         try {
-          const result = await fetchMarketsFromDb(network, page, limit)
+          const result = await fetchMarketsFromDb(network, 1, 1000) // Fetch all available markets
           if (result.data && result.data.length) {
             markets = await ensureLogos(network, result.data)
             totalCount = result.total
@@ -1810,20 +1810,20 @@ app.get('/api/markets/wbnb/new', async (req, res) => {
         const mapped = await refreshNetwork(network, pages, duration)
         if (SUPABASE_ENABLED) {
           try {
-            const result2 = await fetchMarketsFromDb(network, page, limit)
+            const result2 = await fetchMarketsFromDb(network, 1, 1000)
             if (result2.data && result2.data.length) {
               markets = await ensureLogos(network, result2.data)
               totalCount = result2.total
             } else {
-              markets = mapped.slice((page - 1) * limit, page * limit).map(m => ({ ...m, watch_count: 0 }))
+              markets = mapped.map(m => ({ ...m, watch_count: 0 }))
               totalCount = mapped.length
             }
           } catch {
-            markets = mapped.slice((page - 1) * limit, page * limit)
+            markets = mapped
             totalCount = mapped.length
           }
         } else {
-          markets = mapped.slice((page - 1) * limit, page * limit).map(m => ({ ...m, watch_count: 0 }))
+          markets = mapped.map(m => ({ ...m, watch_count: 0 }))
           totalCount = mapped.length
         }
       }
@@ -1844,7 +1844,7 @@ app.get('/api/markets/wbnb/new', async (req, res) => {
     const marketsDeduped = Array.from(byPairFinal.values())
 
     // Sort: 1) has trading data (price, volume, or change) desc, 2) volumeRaw desc, 3) pair asc (stable)
-    const marketsFinal = marketsDeduped.sort((a, b) => {
+    const marketsSorted = marketsDeduped.sort((a, b) => {
       // First prioritize pairs with any trading data
       const aHasData = (a?.price && a.price !== '-' && parseFloat(a.price) > 0) || 
                      (a?.volume && parseFloat(a.volume) > 0) || 
@@ -1867,6 +1867,11 @@ app.get('/api/markets/wbnb/new', async (req, res) => {
       const bp = (b?.pair || '')
       return ap.localeCompare(bp)
     })
+
+    // Apply pagination AFTER sorting
+    const startIndex = (page - 1) * limit
+    const endIndex = startIndex + limit
+    const marketsFinal = marketsSorted.slice(startIndex, endIndex)
 
     // Update markets table with enriched data
     if (SUPABASE_ENABLED) {
