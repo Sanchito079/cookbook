@@ -1960,27 +1960,41 @@ app.get('/api/markets/search', async (req, res) => {
     // Normalize
     const q = qRaw.toLowerCase()
 
-    // Pull a large set to filter server-side if RPC filtering operators are limited.
-    // If Supabase supports ilike/or across fields, use it; else fetch and filter in Node.
+    // Check if search term is an address (starts with 0x and has length 42 or partial)
+    const isAddressSearch = q.startsWith('0x') && (q.length === 42 || q.length >= 6)
+
+    // Optimized search based on query type
     let rows = []
     try {
-      // Try Supabase ilike/or query first to reduce payload
-      const { data, error } = await supabase
-        .from('markets')
-        .select('*')
-        .eq('network', network)
-        .or(
-          `pair.ilike.%${q}%,` +
-          `base_symbol.ilike.%${q}%,` +
-          `quote_symbol.ilike.%${q}%,` +
-          `base_address.ilike.%${q}%,` +
-          `quote_address.ilike.%${q}%,` +
-          `pool_address.ilike.%${q}%`
-        )
-        .limit(5000)
-      if (error) throw error
-      rows = data || []
+      if (isAddressSearch) {
+        // For address searches: use optimized query with index support (when available)
+        console.log(`[SEARCH] Address search for: ${q}`)
+        const { data, error } = await supabase
+          .from('markets')
+          .select('*')
+          .eq('network', network)
+          .or(`base_address.ilike.%${q}%,quote_address.ilike.%${q}%,pool_address.ilike.%${q}%`)
+          .limit(200) // Limit to reasonable number for address searches
+        if (error) throw error
+        rows = data || []
+      } else {
+        // For regular searches (symbols, pairs): use broader search
+        console.log(`[SEARCH] Symbol/pair search for: ${q}`)
+        const { data, error } = await supabase
+          .from('markets')
+          .select('*')
+          .eq('network', network)
+          .or(
+            `pair.ilike.%${q}%,` +
+            `base_symbol.ilike.%${q}%,` +
+            `quote_symbol.ilike.%${q}%`
+          )
+          .limit(5000)
+        if (error) throw error
+        rows = data || []
+      }
     } catch (e) {
+      console.error('[SEARCH] Error:', e)
       // Fallback: fetch many and filter locally
       const { data, error } = await supabase
         .from('markets')
@@ -3324,6 +3338,7 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
 
 
 
