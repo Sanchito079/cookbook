@@ -1967,16 +1967,34 @@ app.get('/api/markets/search', async (req, res) => {
     let rows = []
     try {
       if (isAddressSearch) {
-        // For address searches: use optimized query with index support (when available)
+        // For address searches: use EXACT match first (fastest), then partial
         console.log(`[SEARCH] Address search for: ${q}`)
-        const { data, error } = await supabase
+        
+        // 1. Try exact match with case-insensitive comparison
+        const { data: exactData, error: exactError } = await supabase
           .from('markets')
           .select('*')
           .eq('network', network)
-          .or(`base_address.ilike.%${q}%,quote_address.ilike.%${q}%,pool_address.ilike.%${q}%`)
-          .limit(200) // Limit to reasonable number for address searches
-        if (error) throw error
-        rows = data || []
+          .or(`base_address.ilike.${q},quote_address.ilike.${q},pool_address.ilike.${q}`)
+          .limit(20) // Very small limit for speed
+        
+        if (!exactError && exactData && exactData.length > 0) {
+          rows = exactData
+          console.log(`[SEARCH] Found ${rows.length} exact matches`)
+        } else {
+          // 2. Try partial match with minimal fields and very small limit
+          const { data: partialData, error: partialError } = await supabase
+            .from('markets')
+            .select('base_address, quote_address, base_symbol, quote_symbol, pair')
+            .eq('network', network)
+            .or(`base_address.ilike.%${q}%,quote_address.ilike.%${q}%,pool_address.ilike.%${q}%`)
+            .limit(10) // Extremely small limit for speed
+          
+          if (!partialError && partialData && partialData.length > 0) {
+            rows = partialData
+            console.log(`[SEARCH] Found ${rows.length} partial matches`)
+          }
+        }
       } else {
         // For regular searches (symbols, pairs): use broader search
         console.log(`[SEARCH] Symbol/pair search for: ${q}`)
@@ -3338,6 +3356,7 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
 
 
 
