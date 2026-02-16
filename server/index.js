@@ -587,8 +587,11 @@ const ordersMem = []
 //   geckoPoolId: string
 // }
 
-// Fetch trending pools from GeckoTerminal
-async function fetchTrendingPoolsFromGecko({ network = 'bsc', pages = 1, duration = '1h' }) {
+// Helper function for delay
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
+
+// Fetch trending pools from GeckoTerminal with exponential backoff (improved for rate limiting)
+async function fetchTrendingPoolsFromGecko({ network = 'bsc', pages = 1, duration = '1h', retries = 5 }) {
   const results = []
   for (let page = 1; page <= pages; page++) {
     let url
@@ -598,25 +601,89 @@ async function fetchTrendingPoolsFromGecko({ network = 'bsc', pages = 1, duratio
     } else {
       url = `https://api.geckoterminal.com/api/v2/networks/${network}/trending_pools?include=base_token,quote_token&page=${page}&duration=${encodeURIComponent(duration)}`
     }
-    const res = await fetch(url)
-    if (!res.ok) throw new Error(`GeckoTerminal HTTP ${res.status}`)
-    const json = await res.json()
-    results.push(json)
-    if (!json?.data?.length) break
+    
+    // Add longer delay between page requests to prevent rate limiting
+    if (page > 1) await delay(3000) // 3 second delay between pages
+    
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const res = await fetch(url)
+        if (!res.ok) {
+          if (res.status === 429) {
+            // Longer exponential backoff for rate limiting: 10s, 20s, 40s, 60s, 60s
+            const delayTime = Math.min(10000 * Math.pow(2, attempt), 60000)
+            console.warn(`[GeckoTerminal] Rate limited (429), waiting ${delayTime/1000} seconds before retry (attempt ${attempt+1}/${retries+1})...`)
+            await delay(delayTime)
+            continue
+          }
+          throw new Error(`GeckoTerminal HTTP ${res.status}`)
+        }
+        
+        const json = await res.json()
+        
+        // Check for rate limit in response body
+        if (json?.status?.error_code === 429) {
+          const delayTime = Math.min(10000 * Math.pow(2, attempt), 60000)
+          console.warn(`[GeckoTerminal] Rate limit in response, waiting ${delayTime/1000} seconds (attempt ${attempt+1}/${retries+1})...`)
+          await delay(delayTime)
+          continue
+        }
+        
+        results.push(json)
+        console.log(`[GeckoTerminal] Successfully fetched ${network} trending pools page ${page}: ${json?.data?.length || 0} pools`)
+        if (!json?.data?.length) break
+        break // Success, move to next page
+      } catch (error) {
+        if (attempt === retries) {
+          console.error(`[GeckoTerminal] Failed to fetch trending pools after ${retries+1} attempts:`, error.message)
+          throw error
+        }
+        // Longer delay for errors: 5s, 10s, 20s, 40s, 60s
+        const delayTime = Math.min(5000 * Math.pow(2, attempt), 60000)
+        console.warn(`[GeckoTerminal] Error fetching trending pools, retrying after ${delayTime/1000} seconds (attempt ${attempt+1}/${retries+1}):`, error.message)
+        await delay(delayTime)
+      }
+    }
   }
   return results
 }
 
-// Fetch new pools from GeckoTerminal
-async function fetchNewPoolsFromGecko({ network = 'bsc', pages = 1 }) {
+// Fetch new pools from GeckoTerminal with exponential backoff
+async function fetchNewPoolsFromGecko({ network = 'bsc', pages = 1, retries = 3 }) {
   const results = []
   for (let page = 1; page <= pages; page++) {
     const url = `https://api.geckoterminal.com/api/v2/networks/${network}/new_pools?include=base_token,quote_token&page=${page}`
-    const res = await fetch(url)
-    if (!res.ok) throw new Error(`GeckoTerminal new pools HTTP ${res.status}`)
-    const json = await res.json()
-    results.push(json)
-    if (!json?.data?.length) break
+    
+    // Add delay between requests to prevent rate limiting
+    if (page > 1) await delay(1000)
+    
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const res = await fetch(url)
+        if (!res.ok) {
+          if (res.status === 429) {
+            const delayTime = Math.min(1000 * Math.pow(2, attempt), 30000) // Exponential backoff
+            console.warn(`[GeckoTerminal] Rate limited, retrying after ${delayTime/1000} seconds (attempt ${attempt+1}/${retries+1})...`)
+            await delay(delayTime)
+            continue
+          }
+          throw new Error(`GeckoTerminal new pools HTTP ${res.status}`)
+        }
+        
+        const json = await res.json()
+        results.push(json)
+        if (!json?.data?.length) break
+        break // Success, move to next page
+      } catch (error) {
+        if (attempt === retries) {
+          console.error(`[GeckoTerminal] Failed to fetch new pools after ${retries+1} attempts:`, error.message)
+          throw error
+        }
+        const delayTime = Math.min(1000 * Math.pow(2, attempt), 30000)
+        console.warn(`[GeckoTerminal] Error fetching new pools, retrying after ${delayTime/1000} seconds (attempt ${attempt+1}/${retries+1}):`, error.message)
+        await delay(delayTime)
+      }
+    }
   }
   return results
 }
@@ -993,7 +1060,12 @@ async function enrichMarketsWithTradingStats(network, markets) {
 
         const pairTrades = tradesByPair.get(pairKey) || tradesByPair.get(reversePairKey) || []
 
-        const enrichedMarket = { ...market }
+        const enrichedMarket = { 
+          ...market, 
+          price: market.price || '-',
+          change: market.change || '0.00',
+          volume: market.volume || '0'
+        }
 
         if (pairTrades.length > 0) {
           pairTrades.sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
@@ -1305,20 +1377,23 @@ async function fetchMarketsFromDb(network, page = 1, limit = 50) {
 }
 
 async function refreshNetwork(network = 'bsc', pages = 2, duration = '1h') {
-  // Fetch both trending and new pools
-  const [trendingPages, newPages] = await Promise.all([
-    fetchTrendingPoolsFromGecko({ network, pages, duration }),
-    fetchNewPoolsFromGecko({ network, pages })
-  ])
+  console.log(`[Indexer] Refreshing ${network} markets...`)
+  // Fetch only trending pools (removed new pools to reduce API rate limiting)
+  let trendingPages = []
+  
+  try {
+    trendingPages = await fetchTrendingPoolsFromGecko({ network, pages, duration })
+    console.log(`[Indexer] ${network}: Fetched ${trendingPages.length} trending pages`)
+  } catch (error) {
+    console.error(`[Indexer] Error fetching trending pools for ${network}:`, error.message || error)
+  }
 
-  // Map both to markets format
+  // Map to markets format
   const trendingMapped = mapGeckoToMarkets(trendingPages, network)
-  const newMapped = mapGeckoToMarkets(newPages, network)
 
-  // Merge and deduplicate by poolAddress
-  const allMarkets = [...trendingMapped, ...newMapped]
+  // Deduplicate by poolAddress
   const uniqueMarkets = Array.from(
-    allMarkets.reduce((map, market) => {
+    trendingMapped.reduce((map, market) => {
       if (!map.has(market.poolAddress)) {
         map.set(market.poolAddress, market)
       }
@@ -1454,22 +1529,35 @@ async function checkConditionalOrders(network) {
   }
 }
 
-// Background refresher
-const REFRESH_MS = 600_000 // 10 minutes
-setInterval(() => {
-  refreshNetwork('bsc', 2, '1h').catch(() => {})
-  refreshNetwork('base', 2, '1h').catch(() => {})
-  refreshNetwork('solana', 2, '1h').catch(() => {})
+// Background refresher - increased interval to 3 minutes to avoid rate limiting
+const REFRESH_MS = 180_000 // 3 minutes (increased to avoid GeckoTerminal rate limits)
+setInterval(async () => {
+  console.log('[Indexer] Running scheduled refresh...')
+  // Refresh networks with longer delays to avoid hitting GeckoTerminal rate limits
+  await refreshNetwork('bsc', 2, '1h').catch((error) => {
+    console.error('[Indexer] BSC refresh failed:', error.message)
+  })
+  await new Promise(resolve => setTimeout(resolve, 10000)) // 10 second delay between networks
+  
+  await refreshNetwork('base', 2, '1h').catch((error) => {
+    console.error('[Indexer] Base refresh failed:', error.message)
+  })
+  await new Promise(resolve => setTimeout(resolve, 10000)) // 10 second delay between networks
+  
+  await refreshNetwork('solana', 2, '1h').catch((error) => {
+    console.error('[Indexer] Solana refresh failed:', error.message)
+  })
+  
   // checkConditionalOrders disabled to avoid duplicate conditional triggers; executor will manage conditional orders
   // checkConditionalOrders('bsc').catch(() => {})
   // checkConditionalOrders('base').catch(() => {})
   // checkConditionalOrders('solana').catch(() => {})
 }, REFRESH_MS)
 
-// Kick-off initial load (non-blocking)
+// Kick-off initial load (non-blocking) with longer delays
 refreshNetwork('bsc', 2, '1h').catch(() => {})
-refreshNetwork('base', 2, '1h').catch(() => {})
-refreshNetwork('solana', 2, '1h').catch(() => {})
+setTimeout(() => refreshNetwork('base', 2, '1h').catch(() => {}), 15000) // 15 second delay
+setTimeout(() => refreshNetwork('solana', 2, '1h').catch(() => {}), 30000) // 30 second delay
 
 // Routes
 app.get('/health', (req, res) => {
@@ -2037,9 +2125,9 @@ app.get('/api/markets/search', async (req, res) => {
       base: { symbol: row.base_symbol, address: row.base_address, decimals: row.base_decimals, name: row.base_name, logoUrl: row.base_logo_url },
       quote: { symbol: row.quote_symbol, address: row.quote_address, decimals: row.quote_decimals, name: row.quote_name, logoUrl: row.quote_logo_url },
       pair: row.pair,
-      price: row.price,
-      change: row.change,
-      volume: row.volume,
+      price: row.price || '-',
+      change: row.change || '0.00',
+      volume: row.volume || '0',
       poolAddress: row.pool_address,
       geckoPoolId: row.gecko_pool_id,
       pairKey: row.pair_key,
