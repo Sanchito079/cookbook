@@ -3367,7 +3367,8 @@ app.post('/api/liquidity-ladders', async (req, res) => {
       levels = 10,
       spreadType = 'linear', // 'linear' or 'geometric'
       expiration = 0,
-      orders: signedOrders // Array of pre-signed orders from frontend
+      parentOrder, // Single signed parent order from frontend (new approach)
+      orders: signedOrders // Legacy: Array of pre-signed orders from frontend
     } = body
 
     // Validation
@@ -3440,7 +3441,87 @@ app.post('/api/liquidity-ladders', async (req, res) => {
       // Continue anyway - the orders are more important
     }
 
-    // If frontend provided signed orders, use them
+    // NEW APPROACH: Generate child orders in backend from parent order
+    // Parent order is signed once, backend creates all child orders with calculated prices
+    if (parentOrder && parentOrder.order && parentOrder.signature) {
+      const createdOrders = []
+      const parent = parentOrder.order
+      
+      // Calculate amount per level
+      const amountPerLevel = totalAmt / BigInt(numLevels)
+      
+      for (let i = 0; i < numLevels; i++) {
+        const price = priceLevels[i]
+        const levelAmountIn = amountPerLevel
+        const levelAmountOutMin = BigInt(Math.floor(Number(levelAmountIn) * price * 1e18))
+        
+        // Generate unique nonce and salt for each level
+        const levelNonce = String(Number(parent.nonce || 0) + i)
+        const levelSalt = String(Number(parent.salt || 0) + i)
+        
+        const orderId = crypto.randomUUID()
+        const orderHash = sha1(JSON.stringify({ 
+          network, 
+          maker: network === 'solana' ? parent.maker : toLower(parent.maker), 
+          nonce: levelNonce, 
+          tokenIn: network === 'solana' ? parent.tokenIn : toLower(parent.tokenIn), 
+          tokenOut: network === 'solana' ? parent.tokenOut : toLower(parent.tokenOut), 
+          salt: levelSalt
+        }))
+
+        const row = {
+          network,
+          order_id: orderId,
+          order_hash: orderHash,
+          maker: network === 'solana' ? parent.maker : toLower(parent.maker),
+          token_in: network === 'solana' ? parent.tokenIn : toLower(parent.tokenIn),
+          token_out: network === 'solana' ? parent.tokenOut : toLower(parent.tokenOut),
+          amount_in: String(levelAmountIn),
+          amount_out_min: String(levelAmountOutMin),
+          expiration: parent.expiration ? new Date(Number(parent.expiration) * 1000).toISOString() : null,
+          nonce: levelNonce,
+          receiver: network === 'solana' ? parent.receiver : toLower(parent.receiver || ''),
+          salt: levelSalt,
+          // Use parent's signature for all child orders - owner signed the parent which authorizes the ladder
+          signature: parentOrder.signature,
+          order_json: { ...parent, nonce: levelNonce, salt: levelSalt, amountIn: String(levelAmountIn), amountOutMin: String(levelAmountOutMin) },
+          base: network === 'solana' ? baseToken : baseToken.toLowerCase(),
+          quote: network === 'solana' ? quoteToken : quoteToken.toLowerCase(),
+          base_address: network === 'solana' ? baseToken : baseToken.toLowerCase(),
+          quote_address: network === 'solana' ? quoteToken : quoteToken.toLowerCase(),
+          pair: `${baseToken}/${quoteToken}`,
+          side: null,
+          price: String(price),
+          remaining: String(levelAmountIn),
+          status: 'open',
+          ladder_id: ladderId,
+          ladder_level: i + 1,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        }
+
+        const tableName = network === 'crosschain' ? 'cross_chain_orders' : 'orders'
+        const { error: orderError } = await supabase.from(tableName).insert(row)
+        
+        if (orderError) {
+          console.error(`[liquidity-ladders] Error creating order ${i + 1}:`, orderError)
+        } else {
+          createdOrders.push(orderId)
+        }
+      }
+
+      console.log(`[liquidity-ladders] Created ${createdOrders.length} child orders for ladder ${ladderId}`)
+      
+      return res.json({ 
+        ok: true, 
+        ladderId,
+        levelsCreated: createdOrders.length,
+        orderIds: createdOrders,
+        message: `Created ${createdOrders.length} orders from parent signature`
+      })
+    }
+    
+    // OLD APPROACH: If frontend provided signed orders, use them (backwards compatibility)
     if (signedOrders && Array.isArray(signedOrders) && signedOrders.length > 0) {
       const createdOrders = []
       
