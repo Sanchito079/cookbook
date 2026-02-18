@@ -3348,10 +3348,298 @@ app.get('/api/rewards/:address/history', async (req, res) => {
   }
 })
 
+// ===== Liquidity Ladder =====
+// Create a liquidity ladder with multiple staggered orders
+app.post('/api/liquidity-ladders', async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) return res.status(503).json({ error: 'database disabled' })
+    
+    const body = req.body || {}
+    const {
+      network = 'bsc',
+      maker,
+      baseToken,
+      quoteToken,
+      side, // 'buy' or 'sell'
+      totalAmount,
+      priceStart,
+      priceEnd,
+      levels = 10,
+      spreadType = 'linear', // 'linear' or 'geometric'
+      expiration = 0,
+      orders: signedOrders // Array of pre-signed orders from frontend
+    } = body
+
+    // Validation
+    if (!maker || !baseToken || !quoteToken || !side || !totalAmount || !priceStart || !priceEnd) {
+      return res.status(400).json({ error: 'Missing required fields: maker, baseToken, quoteToken, side, totalAmount, priceStart, priceEnd' })
+    }
+
+    if (!['buy', 'sell'].includes(side)) {
+      return res.status(400).json({ error: 'side must be "buy" or "sell"' })
+    }
+
+    if (!['linear', 'geometric'].includes(spreadType)) {
+      return res.status(400).json({ error: 'spreadType must be "linear" or "geometric"' })
+    }
+
+    const numLevels = Math.max(2, Math.min(50, parseInt(levels) || 10))
+    const startPrice = parseFloat(priceStart)
+    const endPrice = parseFloat(priceEnd)
+    const totalAmt = BigInt(totalAmount)
+
+    if (startPrice <= 0 || endPrice <= 0) {
+      return res.status(400).json({ error: 'Prices must be positive numbers' })
+    }
+
+    // Generate ladder ID
+    const ladderId = crypto.randomUUID()
+
+    // Calculate price levels
+    const priceLevels = []
+    for (let i = 0; i < numLevels; i++) {
+      let price
+      if (spreadType === 'linear') {
+        // Linear spacing between prices
+        price = startPrice + (endPrice - startPrice) * (i / (numLevels - 1))
+      } else {
+        // Geometric spacing (each level is a constant ratio from previous)
+        const ratio = Math.pow(endPrice / startPrice, 1 / (numLevels - 1))
+        price = startPrice * Math.pow(ratio, i)
+      }
+      priceLevels.push(price)
+    }
+
+    // Calculate amount per level (split evenly for now)
+    const amountPerLevel = totalAmt / BigInt(numLevels)
+
+    console.log(`[liquidity-ladders] Creating ladder ${ladderId}: ${numLevels} levels, ${side}, ${spreadType} spread`)
+    console.log(`[liquidity-ladders] Price range: ${startPrice} - ${endPrice}`)
+    console.log(`[liquidity-ladders] Amount per level: ${amountPerLevel.toString()}`)
+
+    // Create ladder metadata record
+    const { error: ladderError } = await supabase
+      .from('liquidity_ladders')
+      .insert({
+        id: ladderId,
+        network,
+        maker: network === 'solana' ? maker : maker.toLowerCase(),
+        base_token: network === 'solana' ? baseToken : baseToken.toLowerCase(),
+        quote_token: network === 'solana' ? quoteToken : quoteToken.toLowerCase(),
+        side,
+        total_amount: totalAmount,
+        price_start: priceStart,
+        price_end: priceEnd,
+        levels: numLevels,
+        spread_type: spreadType,
+        status: 'active'
+      })
+
+    if (ladderError) {
+      console.error('[liquidity-ladders] Error creating ladder record:', ladderError)
+      // Continue anyway - the orders are more important
+    }
+
+    // If frontend provided signed orders, use them
+    if (signedOrders && Array.isArray(signedOrders) && signedOrders.length > 0) {
+      const createdOrders = []
+      
+      for (let i = 0; i < signedOrders.length; i++) {
+        const orderData = signedOrders[i]
+        const price = priceLevels[i] || priceLevels[priceLevels.length - 1]
+        
+        const orderId = crypto.randomUUID()
+        const orderHash = sha1(JSON.stringify({ 
+          network, 
+          maker: network === 'solana' ? orderData.order.maker : toLower(orderData.order.maker), 
+          nonce: String(orderData.order.nonce || ''), 
+          tokenIn: network === 'solana' ? orderData.order.tokenIn : toLower(orderData.order.tokenIn), 
+          tokenOut: network === 'solana' ? orderData.order.tokenOut : toLower(orderData.order.tokenOut), 
+          salt: String(orderData.order.salt || '') 
+        }))
+
+        const row = {
+          network,
+          order_id: orderId,
+          order_hash: orderHash,
+          maker: network === 'solana' ? orderData.order.maker : toLower(orderData.order.maker),
+          token_in: network === 'solana' ? orderData.order.tokenIn : toLower(orderData.order.tokenIn),
+          token_out: network === 'solana' ? orderData.order.tokenOut : toLower(orderData.order.tokenOut),
+          amount_in: String(orderData.order.amountIn || '0'),
+          amount_out_min: String(orderData.order.amountOutMin || '0'),
+          expiration: orderData.order.expiration ? new Date(Number(orderData.order.expiration) * 1000).toISOString() : null,
+          nonce: String(orderData.order.nonce || '0'),
+          receiver: network === 'solana' ? orderData.order.receiver : toLower(orderData.order.receiver || ''),
+          salt: String(orderData.order.salt || '0'),
+          signature: orderData.signature || '',
+          order_json: orderData.order,
+          base: network === 'solana' ? baseToken : baseToken.toLowerCase(),
+          quote: network === 'solana' ? quoteToken : quoteToken.toLowerCase(),
+          base_address: network === 'solana' ? baseToken : baseToken.toLowerCase(),
+          quote_address: network === 'solana' ? quoteToken : quoteToken.toLowerCase(),
+          pair: `${baseToken}/${quoteToken}`,
+          side: null,
+          price: String(price),
+          remaining: String(orderData.order.amountIn || '0'),
+          status: 'open',
+          ladder_id: ladderId,
+          ladder_level: i + 1,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        }
+
+        const tableName = network === 'crosschain' ? 'cross_chain_orders' : 'orders'
+        const { error: orderError } = await supabase.from(tableName).insert(row)
+        
+        if (orderError) {
+          console.error(`[liquidity-ladders] Error creating order ${i + 1}:`, orderError)
+        } else {
+          createdOrders.push(orderId)
+        }
+      }
+
+      console.log(`[liquidity-ladders] Created ${createdOrders.length}/${signedOrders.length} orders for ladder ${ladderId}`)
+      
+      return res.json({ 
+        ok: true, 
+        ladderId,
+        levelsCreated: createdOrders.length,
+        orderIds: createdOrders
+      })
+    }
+
+    // If no signed orders provided, return the calculated levels for frontend to sign
+    return res.json({
+      ok: true,
+      ladderId,
+      levels: numLevels,
+      priceLevels,
+      amountPerLevel: amountPerLevel.toString(),
+      message: 'Ladder calculated. Please sign orders and resubmit with signedOrders array.'
+    })
+
+  } catch (e) {
+    console.error('[liquidity-ladders] Error:', e?.message || e)
+    return res.status(500).json({ error: e?.message || String(e) })
+  }
+})
+
+// Get liquidity ladders for a maker
+app.get('/api/liquidity-ladders', async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) return res.status(503).json({ error: 'database disabled' })
+    
+    const maker = req.query.maker ? (req.query.network === 'solana' ? req.query.maker : req.query.maker.toLowerCase()) : null
+    const network = (req.query.network || 'bsc').toString()
+    const status = req.query.status || 'active'
+
+    if (!maker) {
+      return res.status(400).json({ error: 'maker parameter required' })
+    }
+
+    const { data, error } = await supabase
+      .from('liquidity_ladders')
+      .select('*')
+      .eq('maker', maker)
+      .eq('network', network)
+      .eq('status', status)
+      .order('created_at', { ascending: false })
+
+    if (error) throw error
+
+    return res.json({ network, maker, ladders: data || [] })
+  } catch (e) {
+    console.error('[liquidity-ladders] Error fetching ladders:', e?.message || e)
+    return res.status(500).json({ error: e?.message || String(e) })
+  }
+})
+
+// Cancel a liquidity ladder (cancels all orders in the ladder)
+app.post('/api/liquidity-ladders/:id/cancel', async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) return res.status(503).json({ error: 'database disabled' })
+    
+    const ladderId = req.params.id
+    const network = (req.body.network || 'bsc').toString()
+
+    // Update ladder status
+    const { error: ladderError } = await supabase
+      .from('liquidity_ladders')
+      .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+      .eq('id', ladderId)
+
+    if (ladderError) {
+      console.error('[liquidity-ladders] Error updating ladder status:', ladderError)
+    }
+
+    // Cancel all open orders in the ladder
+    const tableName = network === 'crosschain' ? 'cross_chain_orders' : 'orders'
+    const { data: orders, error: fetchError } = await supabase
+      .from(tableName)
+      .select('order_id')
+      .eq('ladder_id', ladderId)
+      .eq('status', 'open')
+
+    if (fetchError) {
+      console.error('[liquidity-ladders] Error fetching ladder orders:', fetchError)
+    }
+
+    let cancelledCount = 0
+    if (orders && orders.length > 0) {
+      const { error: cancelError } = await supabase
+        .from(tableName)
+        .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+        .eq('ladder_id', ladderId)
+        .eq('status', 'open')
+
+      if (cancelError) {
+        console.error('[liquidity-ladders] Error cancelling orders:', cancelError)
+      } else {
+        cancelledCount = orders.length
+      }
+    }
+
+    console.log(`[liquidity-ladders] Cancelled ladder ${ladderId}: ${cancelledCount} orders`)
+
+    return res.json({ 
+      ok: true, 
+      ladderId,
+      ordersCancelled: cancelledCount
+    })
+  } catch (e) {
+    console.error('[liquidity-ladders] Error cancelling ladder:', e?.message || e)
+    return res.status(500).json({ error: e?.message || String(e) })
+  }
+})
+
+// Get orders for a specific ladder
+app.get('/api/liquidity-ladders/:id/orders', async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) return res.status(503).json({ error: 'database disabled' })
+    
+    const ladderId = req.params.id
+    const network = (req.query.network || 'bsc').toString()
+
+    const tableName = network === 'crosschain' ? 'cross_chain_orders' : 'orders'
+    const { data, error } = await supabase
+      .from(tableName)
+      .select('*')
+      .eq('ladder_id', ladderId)
+      .order('ladder_level', { ascending: true })
+
+    if (error) throw error
+
+    return res.json({ ladderId, network, orders: data || [] })
+  } catch (e) {
+    console.error('[liquidity-ladders] Error fetching ladder orders:', e?.message || e)
+    return res.status(500).json({ error: e?.message || String(e) })
+  }
+})
+
 // Endpoint for broadcasting updates (called by executor)
 app.post('/api/broadcast', (req, res) => {
   const { network, base, quote, type, data } = req.body
-console.log('[BROADCAST] Received:', { network, base, quote, type, data })
+  console.log('[BROADCAST] Received:', { network, base, quote, type, data })
   if (!network || !base || !quote || !type) {
     return res.status(400).json({ error: 'Missing required fields' })
   }
