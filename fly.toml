@@ -1,15 +1,15 @@
-# fly.toml app configuration file generated for cookbook-rgmqjq on 2026-01-18T05:17:56Z
+# fly.toml app configuration file generated for cookbook-hjnhgq on 2026-02-20T17:45:29Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'cookbook-rgmqjq'
-primary_region = 'iad'
+app = 'cookbook-hjnhgq'
+primary_region = 'jnb'
 
 [build]
 
 [http_service]
-  internal_port = 80
+  internal_port = 8080
   force_https = true
   auto_stop_machines = 'stop'
   auto_start_machines = true
