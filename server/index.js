@@ -817,18 +817,12 @@ async function getTokenInfoCached(network, address) {
   if (!key) return null
   const cached = tokenInfoCache.get(key)
   const now = Date.now()
-  // Only use cache if it has actual data (not null) and hasn't expired
-  if (cached && (now - (cached.ts || 0) < 15 * 60 * 1000) && cached.symbol) return cached // 15 min TTL for valid data
+  if (cached && (now - (cached.ts || 0) < 15 * 60 * 1000)) return cached // 15 min TTL
   try {
     const info = await fetchTokenInfo(network, key)
-    // Only cache if we got actual data
-    if (info && (info.symbol || info.name || info.logoUrl)) {
-      const record = { ...info, ts: now }
-      tokenInfoCache.set(key, record)
-      return record
-    }
-    // If no data, don't cache - will retry next time
-    return info
+    const record = { ...info, ts: now }
+    tokenInfoCache.set(key, record)
+    return record
   } catch {
     return null
   }
@@ -914,22 +908,6 @@ async function enrichMarketsWithTokenInfo(network, markets) {
   return enriched
 }
 
-// Fetch token logo from CoinGecko as additional fallback
-async function getLogoFromCoinGecko(network, address) {
-  try {
-    // Use CoinGecko's simple token price API to get images
-    const url = `https://api.coingecko.com/api/v3/simple/token_price/${network === 'bsc' ? 'binance-smart-chain' : network}?contract_addresses=${address}&vs_currencies=usd&include_community_data=false&include_sparkline=false`
-    const res = await fetch(url)
-    if (!res.ok) return null
-    const json = await res.json()
-    const data = json[address?.toLowerCase()]
-    if (data?.image) return data.image
-    return null
-  } catch {
-    return null
-  }
-}
-
 // Ensure logos present for markets by consulting tokens table, known logos, and GeckoTerminal as fallback
 async function ensureLogos(network, markets) {
   try {
@@ -978,13 +956,6 @@ async function ensureLogos(network, markets) {
         if (info?.logoUrl) {
           logoByAddr[item.addr] = info.logoUrl
           fetchedRows.push({ network: item.network, address: item.addr, logo_url: info.logoUrl, updated_at: new Date().toISOString() })
-        } else {
-          // Fallback to CoinGecko if GeckoTerminal doesn't have logo
-          const cgLogo = await getLogoFromCoinGecko(item.network, item.addr)
-          if (cgLogo) {
-            logoByAddr[item.addr] = cgLogo
-            fetchedRows.push({ network: item.network, address: item.addr, logo_url: cgLogo, updated_at: new Date().toISOString() })
-          }
         }
       } catch {}
     }
@@ -1235,12 +1206,12 @@ async function upsertMarkets(network, markets) {
       base_address: b || null,
       base_decimals: m.base?.decimals ?? null,
       base_name: m.base?.name || null,
-      base_logo_url: m.base?.logoUrl ?? null,  // Use ?? to preserve empty strings
+      base_logo_url: m.base?.logoUrl || null,
       quote_symbol: m.quote?.symbol || null,
       quote_address: q || null,
       quote_decimals: m.quote?.decimals ?? null,
       quote_name: m.quote?.name || null,
-      quote_logo_url: m.quote?.logoUrl ?? null,  // Use ?? to preserve empty strings
+      quote_logo_url: m.quote?.logoUrl || null,
       pair: m.pair || null,
       price: m.price || null,
       change: m.change || null,
@@ -1258,18 +1229,10 @@ async function upsertMarkets(network, markets) {
     else {
       // Keep the one with more complete data or newer updated_at
       const existing = byPairKey.get(key)
-      const hasNewerData = row.updated_at > existing.updated_at
-      const hasNewBaseSymbol = !existing.base_symbol && row.base_symbol
-      const hasNewQuoteSymbol = !existing.quote_symbol && row.quote_symbol
-      const hasNewBaseLogo = !existing.base_logo_url && row.base_logo_url
-      const hasNewQuoteLogo = !existing.quote_logo_url && row.quote_logo_url
-      
-      if (hasNewerData || hasNewBaseSymbol || hasNewQuoteSymbol || hasNewBaseLogo || hasNewQuoteLogo) {
-        // Merge: keep existing logos if new ones are empty
-        const merged = { ...row }
-        if (!merged.base_logo_url && existing.base_logo_url) merged.base_logo_url = existing.base_logo_url
-        if (!merged.quote_logo_url && existing.quote_logo_url) merged.quote_logo_url = existing.quote_logo_url
-        byPairKey.set(key, merged)
+      if ((row.updated_at > existing.updated_at) ||
+          (!existing.base_symbol && row.base_symbol) ||
+          (!existing.quote_symbol && row.quote_symbol)) {
+        byPairKey.set(key, row)
       }
     }
   }
@@ -1289,13 +1252,9 @@ async function upsertMarkets(network, markets) {
         base_symbol: m.base?.symbol || null,
         base_address: b || null,
         base_decimals: m.base?.decimals ?? null,
-        base_name: m.base?.name || null,
-        base_logo_url: m.base?.logoUrl ?? null,
         quote_symbol: m.quote?.symbol || null,
         quote_address: q || null,
         quote_decimals: m.quote?.decimals ?? null,
-        quote_name: m.quote?.name || null,
-        quote_logo_url: m.quote?.logoUrl ?? null,
         pair: m.pair || null,
         price: m.price || null,
         change: m.change || null,
@@ -3519,10 +3478,7 @@ app.post('/api/liquidity-ladders', async (req, res) => {
           token_out: network === 'solana' ? parent.tokenOut : toLower(parent.tokenOut),
           amount_in: String(levelAmountIn),
           amount_out_min: String(levelAmountOutMin),
-          // Handle expiration: 0 means never expires (store as null in DB, UI will show "never")
-          expiration: (parent.expiration !== undefined && parent.expiration !== null && parent.expiration !== 0) 
-            ? new Date(Number(parent.expiration) * 1000).toISOString() 
-            : null,
+          expiration: parent.expiration ? new Date(Number(parent.expiration) * 1000).toISOString() : null,
           nonce: levelNonce,
           receiver: network === 'solana' ? parent.receiver : toLower(parent.receiver || ''),
           salt: levelSalt,
@@ -3857,7 +3813,6 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
-
 
 
 
