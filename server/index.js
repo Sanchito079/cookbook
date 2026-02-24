@@ -3122,12 +3122,7 @@ app.get('/api/orders', async (req, res) => {
         order_id: r.order_id,
         base_address: r.base_address,
         quote_address: r.quote_address,
-        pair: r.pair,
-        network: r.network,
-        // Include liquidity order identification fields
-        is_liquidity_order: r.is_liquidity_order || false,
-        ladder_id: r.ladder_id || null,
-        ladder_level: r.ladder_level || null
+        pair: r.pair
       }))
 
       return res.json({ network, maker, status, data: orders })
@@ -3455,10 +3450,20 @@ app.post('/api/liquidity-ladders', async (req, res) => {
       // Calculate amount per level
       const amountPerLevel = totalAmt / BigInt(numLevels)
       
+      // Scale factor for price calculation (price is human-readable, e.g., 300.50)
+      // We use 1e8 to preserve price precision while keeping everything as BigInt
+      const PRICE_SCALE = BigInt(1e8)
+      
       for (let i = 0; i < numLevels; i++) {
         const price = priceLevels[i]
         const levelAmountIn = amountPerLevel
-        const levelAmountOutMin = BigInt(Math.floor(Number(levelAmountIn) * price * 1e18))
+        
+        // Calculate amountOutMin using BigInt to avoid precision loss
+        // price is human-readable (e.g., 300.50 USDT per BNB)
+        // amountIn is in wei, so result is: amountIn * price
+        // Convert price to BigInt: price * 1e8, then multiply by amountIn, then divide by 1e8
+        const priceScaled = BigInt(Math.round(price * 1e8))
+        const levelAmountOutMin = (levelAmountIn * priceScaled) / PRICE_SCALE
         
         // Generate unique nonce and salt for each level
         const levelNonce = String(Number(parent.nonce || 0) + i)
@@ -3499,7 +3504,6 @@ app.post('/api/liquidity-ladders', async (req, res) => {
           price: String(price),
           remaining: String(levelAmountIn),
           status: 'open',
-          is_liquidity_order: true,
           ladder_id: ladderId,
           ladder_level: i + 1,
           created_at: new Date().toISOString(),
@@ -3569,7 +3573,6 @@ app.post('/api/liquidity-ladders', async (req, res) => {
           price: String(price),
           remaining: String(orderData.order.amountIn || '0'),
           status: 'open',
-          is_liquidity_order: true,
           ladder_id: ladderId,
           ladder_level: i + 1,
           created_at: new Date().toISOString(),
@@ -3820,6 +3823,7 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
 
 
 
