@@ -3499,6 +3499,7 @@ app.post('/api/liquidity-ladders', async (req, res) => {
           price: String(price),
           remaining: String(levelAmountIn),
           status: 'open',
+          is_liquidity_order: true,
           ladder_id: ladderId,
           ladder_level: i + 1,
           created_at: new Date().toISOString(),
@@ -3568,6 +3569,7 @@ app.post('/api/liquidity-ladders', async (req, res) => {
           price: String(price),
           remaining: String(orderData.order.amountIn || '0'),
           status: 'open',
+          is_liquidity_order: true,
           ladder_id: ladderId,
           ladder_level: i + 1,
           created_at: new Date().toISOString(),
@@ -3818,7 +3820,6 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
-
 
 
 
