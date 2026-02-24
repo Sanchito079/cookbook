@@ -3122,7 +3122,12 @@ app.get('/api/orders', async (req, res) => {
         order_id: r.order_id,
         base_address: r.base_address,
         quote_address: r.quote_address,
-        pair: r.pair
+        pair: r.pair,
+        network: r.network,
+        // Include liquidity order identification fields
+        is_liquidity_order: r.is_liquidity_order || false,
+        ladder_id: r.ladder_id || null,
+        ladder_level: r.ladder_level || null
       }))
 
       return res.json({ network, maker, status, data: orders })
@@ -3813,7 +3818,6 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
-
 
 
 
