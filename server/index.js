@@ -3206,6 +3206,162 @@ app.get('/api/orders', async (req, res) => {
   }
 })
 
+// ===== Market Depth (Order Book Aggregated by Price Levels) =====
+// Professional market depth like Binance/Coinbase - aggregated by price levels with cumulative volumes
+app.get('/api/market-depth', async (req, res) => {
+  try {
+    if (!SUPABASE_ENABLED) return res.status(503).json({ error: 'database disabled' })
+    
+    const network = (req.query.network || 'bsc').toString()
+    const base = network === 'solana' ? req.query.base : toLower(req.query.base)
+    const quote = network === 'solana' ? req.query.quote : toLower(req.query.quote)
+    const limit = Math.min(parseInt(req.query.limit) || 50, 100) // Max 100 price levels
+    
+    if (!base || !quote) return res.status(400).json({ error: 'base and quote required' })
+    
+    console.log('[MARKET DEPTH] Fetching depth for base:', base, 'quote:', quote, 'network:', network, 'limit:', limit)
+    
+    // Fetch decimals for base and quote to calculate prices correctly
+    const [baseDec, quoteDec] = await Promise.all([
+      fetchTokenDecimals(base, network),
+      fetchTokenDecimals(quote, network)
+    ])
+    
+    const nowIso = new Date().toISOString()
+    const tableName = network === 'crosschain' ? 'cross_chain_orders' : 'orders'
+    
+    // Fetch all open orders for this pair
+    let rows = []
+    try {
+      const { data, error } = await supabase
+        .from(tableName)
+        .select('*')
+        .eq('base_address', base)
+        .eq('quote_address', quote)
+        .eq('status', 'open')
+        .gt('remaining', '0')
+        .order('price', { ascending: true })
+        .limit(200) // Fetch more to aggregate
+      
+      if (error) throw error
+      rows = (data || []).filter(r => !r.expiration || r.expiration > nowIso)
+    } catch (dbErr) {
+      console.warn('[market-depth] db fetch failed:', dbErr?.message || dbErr)
+      return res.status(500).json({ error: dbErr?.message || String(dbErr) })
+    }
+    
+    // Aggregate orders by price level
+    const priceLevelsAsks = new Map() // price -> total base amount
+    const priceLevelsBids = new Map() // price -> total base amount
+    
+    for (const r of rows) {
+      const tokenInComp = network === 'solana' ? r.token_in : toLower(r.token_in)
+      const tokenOutComp = network === 'solana' ? r.token_out : toLower(r.token_out)
+      const side = (tokenInComp === base && tokenOutComp === quote) ? 'ask' : (tokenInComp === quote && tokenOutComp === base ? 'bid' : null)
+      
+      if (!side) continue
+      
+      // Calculate price
+      let price = null
+      if (r.price != null) {
+        price = Number(r.price)
+      } else if (side === 'ask') {
+        price = Number(r.amount_out_min) / 10**quoteDec / (Number(r.amount_in) / 10**baseDec)
+      } else if (side === 'bid') {
+        price = Number(r.amount_in) / 10**baseDec / (Number(r.amount_out_min) / 10**quoteDec)
+      }
+      
+      if (!price || price <= 0) continue
+      
+      // Amount in base token (for asks) or calculate equivalent base for bids
+      const remaining = BigInt(r.remaining || 0)
+      let baseAmount = 0
+      
+      if (side === 'ask') {
+        // Selling base for quote - remaining is base amount
+        baseAmount = Number(remaining) / 10**baseDec
+      } else {
+        // Buying base with quote - calculate equivalent base amount
+        // remaining is quote amount, so base = remaining * amountIn / amountOutMin / 10^(quoteDec-baseDec)
+        const amountIn = BigInt(r.amount_in || 0)
+        const amountOutMin = BigInt(r.amount_out_min || 1)
+        if (amountOutMin > 0 && amountIn > 0) {
+          baseAmount = Number(remaining * amountIn / amountOutMin) / 10**baseDec
+        }
+      }
+      
+      if (side === 'ask') {
+        const existing = priceLevelsAsks.get(price) || 0
+        priceLevelsAsks.set(price, existing + baseAmount)
+      } else {
+        const existing = priceLevelsBids.get(price) || 0
+        priceLevelsBids.set(price, existing + baseAmount)
+      }
+    }
+    
+    // Sort prices and calculate cumulative volumes
+    // Asks: sorted ascending (lowest ask first), cumulative from bottom up
+    // Bids: sorted descending (highest bid first), cumulative from top down
+    
+    const askPrices = Array.from(priceLevelsAsks.keys()).sort((a, b) => a - b)
+    const bidPrices = Array.from(priceLevelsBids.keys()).sort((a, b) => b - a)
+    
+    // Build cumulative asks (lowest price first, cumulative increases)
+    const asks = []
+    let cumAsk = 0
+    for (const price of askPrices) {
+      cumAsk += priceLevelsAsks.get(price)
+      asks.push({
+        price: price.toFixed(6),
+        quantity: priceLevelsAsks.get(price).toFixed(6),
+        cumQuantity: cumAsk.toFixed(6)
+      })
+      if (asks.length >= limit) break
+    }
+    
+    // Build cumulative bids (highest price first, cumulative increases)
+    const bids = []
+    let cumBid = 0
+    for (const price of bidPrices) {
+      cumBid += priceLevelsBids.get(price)
+      bids.push({
+        price: price.toFixed(6),
+        quantity: priceLevelsBids.get(price).toFixed(6),
+        cumQuantity: cumBid.toFixed(6)
+      })
+      if (bids.length >= limit) break
+    }
+    
+    // Calculate spread and mid price
+    let spread = null
+    let midPrice = null
+    if (asks.length > 0 && bids.length > 0) {
+      const bestAsk = parseFloat(asks[0].price)
+      const bestBid = parseFloat(bids[0].price)
+      spread = bestAsk - bestBid
+      midPrice = (bestAsk + bestBid) / 2
+    }
+    
+    console.log('[MARKET DEPTH] Returning asks:', asks.length, 'bids:', bids.length)
+    
+    return res.json({
+      base,
+      quote,
+      network,
+      bids,
+      asks,
+      timestamp: Date.now(),
+      spread: spread?.toFixed(6) || null,
+      midPrice: midPrice?.toFixed(6) || null,
+      bestBid: bids[0]?.price || null,
+      bestAsk: asks[0]?.price || null
+    })
+  } catch (e) {
+    console.error('[MARKET DEPTH] Error:', e)
+    return res.status(500).json({ error: e?.message || String(e) })
+  }
+})
+
 // Fatal error handlers to surface early exits
 process.on('unhandledRejection', (reason) => {
   try { console.error('[fatal] unhandledRejection:', reason) } catch {}
@@ -3737,6 +3893,20 @@ app.post('/api/broadcast', (req, res) => {
   broadcastUpdate(network, base, quote, type, data)
   res.json({ success: true })
 })
+
+// ===== Perpetual Trading API =====
+// Import perps modules (using dynamic import for CommonJS)
+import('./perps/index.js')
+  .then(perpsModule => {
+    const perpsRouter = perpsModule.default || perpsModule;
+    if (perpsRouter && perpsRouter.stack) {
+      app.use('/api/perps', perpsRouter);
+      console.log('[PERPS] Routes mounted at /api/perps');
+    }
+  })
+  .catch(err => {
+    console.error('[PERPS] Failed to load perps module:', err);
+  });
 
 // Start HTTP server
 const server = app.listen(PORT, '0.0.0.0', () => {
