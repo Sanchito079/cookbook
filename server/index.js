@@ -3282,11 +3282,11 @@ app.get('/api/market-depth', async (req, res) => {
         baseAmount = Number(remaining) / 10**baseDec
       } else {
         // Buying base with quote - calculate equivalent base amount
-        // remaining is quote amount, so base = remaining * amountIn / amountOutMin / 10^(quoteDec-baseDec)
-        const amountIn = BigInt(r.amount_in || 0)
-        const amountOutMin = BigInt(r.amount_out_min || 1)
-        if (amountOutMin > 0 && amountIn > 0) {
-          baseAmount = Number(remaining * amountIn / amountOutMin) / 10**baseDec
+        // remaining is remaining quote amount, so base = remaining_quote / price
+        // First convert from base units to human readable, then divide by price
+        const remainingQuoteHuman = Number(remaining) / 10**quoteDec
+        if (price > 0) {
+          baseAmount = remainingQuoteHuman / price
         }
       }
       
@@ -3993,6 +3993,7 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
 
 
 
