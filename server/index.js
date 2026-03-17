@@ -65,6 +65,27 @@ const KNOWN_LOGOS = {
 // Cache for token decimals
 const decimalsCache = new Map()
 
+// Cache for orderbook/market data (5 second TTL for fast but fresh data)
+const orderbookCache = new Map()
+const marketDepthCache = new Map()
+const fillsCache = new Map()
+const CACHE_TTL = 5000 // 5 seconds
+const FILLS_CACHE_TTL = 10000 // 10 seconds for fills
+
+// Helper to get cached data if not expired
+const getCachedData = (cache, key) => {
+  const cached = cache.get(key)
+  if (cached && Date.now() - cached.timestamp < cached.ttl) {
+    return cached.data
+  }
+  return null
+}
+
+// Helper to set cached data
+const setCachedData = (cache, key, data, ttl) => {
+  cache.set(key, { data, timestamp: Date.now(), ttl })
+}
+
 // Function to fetch decimals from contract
 const fetchTokenDecimals = async (tokenAddr, network = 'bsc') => {
   if (!tokenAddr) return 18
@@ -1601,6 +1622,17 @@ app.get('/api/fills', async (req, res) => {
     const since = (req.query.since || '').toString()
     const limit = Math.min(Number(req.query.limit || 20), 1000)
 
+    // Check cache first for pair-based queries (most common from mobile UI)
+    // Only cache when: has base/quote, no orderId, no since, limit <= 100
+    const fillsCacheKey = `${network}:${base}:${quote}:${limit}`
+    if (base && quote && !orderId && !since && limit <= 100) {
+      const cachedFills = getCachedData(fillsCache, fillsCacheKey)
+      if (cachedFills) {
+        console.log('[FILLS] Returning cached fills for base:', base, 'quote:', quote)
+        return res.json(cachedFills)
+      }
+    }
+
     let rows = []
 
     if (network === 'crosschain') {
@@ -1783,7 +1815,14 @@ app.get('/api/fills', async (req, res) => {
       }
     }
 
-    return res.json({ network, orderId, base, quote, data: rows })
+    const response = { network, orderId, base, quote, data: rows }
+    
+    // Cache the result for pair-based queries
+    if (base && quote && !orderId && !since && limit <= 100) {
+      setCachedData(fillsCache, fillsCacheKey, response, FILLS_CACHE_TTL)
+    }
+    
+    return res.json(response)
   } catch (e) {
     return res.status(500).json({ error: e?.message || String(e) })
   }
@@ -3081,7 +3120,7 @@ app.get('/api/orders', async (req, res) => {
     console.log('[SERVER ORDERS] Maker:', maker)
     console.log('[SERVER ORDERS] Status:', status)
 
-    // If maker and status are provided, fetch user's orders
+    // If maker and status are provided, fetch user's orders (no caching for user-specific data)
     if (maker && status) {
       console.log('GET /api/orders - fetching user orders for maker:', maker, 'network:', network, 'status:', status)
       const nowIso = new Date().toISOString()
@@ -3130,6 +3169,14 @@ app.get('/api/orders', async (req, res) => {
 
     // Original orderbook logic
     if (!base || !quote) return res.status(400).json({ error: 'base and quote required' })
+
+    // Check cache first
+    const orderbookCacheKey = `${network}:${base}:${quote}`
+    const cachedOrderbook = getCachedData(orderbookCache, orderbookCacheKey)
+    if (cachedOrderbook) {
+      console.log('[SERVER ORDERS] Returning cached orderbook for base:', base, 'quote:', quote)
+      return res.json(cachedOrderbook)
+    }
 
     console.log('[SERVER ORDERS] Fetching orderbook for base:', base, 'quote:', quote, 'network:', network)
 
@@ -3199,7 +3246,12 @@ app.get('/api/orders', async (req, res) => {
 
     console.log('[SERVER ORDERS] Returning asks:', limitedAsks.length, 'bids:', limitedBids.length)
 
-    return res.json({ base, quote, asks: limitedAsks, bids: limitedBids, updatedAt: Date.now() })
+    const response = { base, quote, asks: limitedAsks, bids: limitedBids, updatedAt: Date.now() }
+    
+    // Cache the result
+    setCachedData(orderbookCache, orderbookCacheKey, response, CACHE_TTL)
+    
+    return res.json(response)
   } catch (e) {
     console.error('[SERVER ORDERS] Error:', e)
     return res.status(500).json({ error: e?.message || String(e) })
@@ -3218,6 +3270,14 @@ app.get('/api/market-depth', async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit) || 50, 100) // Max 100 price levels
     
     if (!base || !quote) return res.status(400).json({ error: 'base and quote required' })
+    
+    // Check cache first
+    const depthCacheKey = `${network}:${base}:${quote}:${limit}`
+    const cachedDepth = getCachedData(marketDepthCache, depthCacheKey)
+    if (cachedDepth) {
+      console.log('[MARKET DEPTH] Returning cached depth for base:', base, 'quote:', quote)
+      return res.json(cachedDepth)
+    }
     
     console.log('[MARKET DEPTH] Fetching depth for base:', base, 'quote:', quote, 'network:', network, 'limit:', limit)
     
@@ -3344,7 +3404,7 @@ app.get('/api/market-depth', async (req, res) => {
     
     console.log('[MARKET DEPTH] Returning asks:', asks.length, 'bids:', bids.length)
     
-    return res.json({
+    const response = {
       base,
       quote,
       network,
@@ -3355,7 +3415,12 @@ app.get('/api/market-depth', async (req, res) => {
       midPrice: midPrice?.toFixed(6) || null,
       bestBid: bids[0]?.price || null,
       bestAsk: asks[0]?.price || null
-    })
+    }
+    
+    // Cache the result
+    setCachedData(marketDepthCache, depthCacheKey, response, CACHE_TTL)
+    
+    return res.json(response)
   } catch (e) {
     console.error('[MARKET DEPTH] Error:', e)
     return res.status(500).json({ error: e?.message || String(e) })
@@ -3993,6 +4058,7 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
 
 
 
