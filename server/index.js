@@ -3013,6 +3013,61 @@ app.post('/api/orders', async (req, res) => {
 
     console.log('[SERVER ORDERS POST] Classified side:', side, 'price:', price)
 
+    // ===== Post-Only Validation =====
+    if (body.postOnly === true && price != null && side != null) {
+      console.log('[SERVER ORDERS POST] Post-Only order, checking for immediate match...')
+      try {
+        // Get current orderbook to check if this order would immediately match
+        const tableName = network === 'crosschain' ? 'cross_chain_orders' : 'orders'
+        const { data: existingOrders, error: orderbookError } = await supabase
+          .from(tableName)
+          .select('side, price, maker, remaining, amount_in, amount_out_min')
+          .eq('base_address', base)
+          .eq('quote_address', quote)
+          .eq('status', 'open')
+          .gt('remaining', '0')
+          .neq('maker', network === 'solana' ? order.maker : toLower(order.maker)) // Exclude self-trading
+          .order('price', { ascending: side === 'ask' }) // lowest ask or highest bid first
+          .limit(10)
+
+        if (orderbookError) {
+          console.warn('[SERVER ORDERS POST] Post-Only check failed to fetch orderbook:', orderbookError.message)
+        } else if (existingOrders && existingOrders.length > 0) {
+          // For a BUY order (bid): reject if bestAsk <= your price (would take liquidity)
+          // For a SELL order (ask): reject if bestBid >= your price (would take liquidity)
+          let wouldTaker = false
+          
+          if (side === 'bid') {
+            // Buying: find lowest ask
+            const bestAsk = existingOrders
+              .filter(o => o.side === 'ask' || (o.price !== null && Number(o.price) > 0))
+              .sort((a, b) => Number(a.price || 0) - Number(b.price || 0))[0]
+            if (bestAsk && Number(bestAsk.price) <= price) {
+              console.log('[SERVER ORDERS POST] Post-Only reject: bestAsk', bestAsk.price, '<= order price', price)
+              wouldTaker = true
+            }
+          } else if (side === 'ask') {
+            // Selling: find highest bid
+            const bestBid = existingOrders
+              .filter(o => o.side === 'bid' || (o.price !== null && Number(o.price) > 0))
+              .sort((a, b) => Number(b.price || 0) - Number(a.price || 0))[0]
+            if (bestBid && Number(bestBid.price) >= price) {
+              console.log('[SERVER ORDERS POST] Post-Only reject: bestBid', bestBid.price, '>= order price', price)
+              wouldTaker = true
+            }
+          }
+
+          if (wouldTaker) {
+            return res.status(400).json({ error: 'post-only order would execute immediately' })
+          }
+        }
+      } catch (postOnlyErr) {
+        console.warn('[SERVER ORDERS POST] Post-Only validation error:', postOnlyErr?.message || postOnlyErr)
+        // Don't block order on validation error, just log it
+      }
+    }
+    // ===== End Post-Only Validation =====
+
     const orderId = crypto.randomUUID()
     const orderHash = sha1(JSON.stringify({ network, maker: network === 'solana' ? order.maker : toLower(order.maker), nonce: String(order.nonce || ''), tokenIn: network === 'solana' ? order.tokenIn : toLower(order.tokenIn), tokenOut: network === 'solana' ? order.tokenOut : toLower(order.tokenOut), salt: String(order.salt || '') }))
     const remaining = String(order.amountIn || '0')
@@ -4066,7 +4121,6 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
-
 
 
 
