@@ -3995,7 +3995,15 @@ const broadcastUpdate = (network, base, quote, updateType, data) => {
   const pairKey = `${network}:${base}:${quote}`
   const conns = subscribers.get(pairKey)
   if (conns) {
-    const message = JSON.stringify({ type: updateType, data, timestamp: new Date().toISOString() })
+    // Include network, base, quote in the message so clients can identify the pair
+    const message = JSON.stringify({ 
+      type: updateType, 
+      network,
+      base,
+      quote,
+      data, 
+      timestamp: new Date().toISOString() 
+    })
     conns.forEach(ws => {
       if (ws.readyState === ws.OPEN) {
         ws.send(message)
@@ -4058,7 +4066,6 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
-
 
 
 
