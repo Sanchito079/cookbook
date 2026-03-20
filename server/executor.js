@@ -2605,49 +2605,15 @@ async function processOrders(rows, network = 'bsc') {
   let processedThisCycle = 0
   const maxPerCycle = 5
   
-  // Process market orders first (immediate execution)
-  if (marketOrders.length > 0) {
-    console.log(`[executor] ${network}: processing ${marketOrders.length} market/IOC/FOK orders`)
-    
-    for (const order of marketOrders) {
-      if (processedThisCycle >= maxPerCycle) {
-        console.log(`[executor] ${network}: reached max orders per cycle, stopping`)
-        break
-      }
-      
-      try {
-        let success = false
-        
-        if (order.orderType === 'market') {
-          console.log(`[executor] ${network}: executing market order ${order.order_id}`)
-          success = await executeMarketOrder(order, network)
-        } else if (order.timeInForce === 'ioc') {
-          console.log(`[executor] ${network}: executing IOC order ${order.order_id}`)
-          success = await executeIOCOrder(order, network)
-        } else if (order.timeInForce === 'fok') {
-          console.log(`[executor] ${network}: executing FOK order ${order.order_id}`)
-          success = await executeFOKOrder(order, network)
-        }
-        
-        if (success) {
-          processedThisCycle++
-          console.log(`[executor] ${network}: market/IOC/FOK order ${order.order_id} executed successfully`)
-        }
-      } catch (e) {
-        console.error(`[executor] ${network}: error processing market order ${order.order_id}:`, e?.message || e)
-      }
-    }
-  }
-
-  console.log(`[executor] ${network}: organized ${limitOrdersByPair.size} trading pairs for limit orders`)
-
-  // First, check and expire any orders that have passed their expiration time
+  // FIRST: Check and expire any orders that have passed their expiration time
   const expiredCount = await expireOldOrders(network)
   if (expiredCount > 0) {
     console.log(`[executor] ${network}: expired ${expiredCount} orders`)
   }
 
-  // Process limit orders (traditional order book matching)
+  console.log(`[executor] ${network}: organized ${limitOrdersByPair.size} trading pairs for limit orders`)
+
+  // SECOND: Process limit orders (traditional order book matching) - this builds the orderbook
   for (const [pairKey, { base, quote, bids, asks }] of limitOrdersByPair.entries()) {
     console.log(`[executor] ${network}: pair ${pairKey} - bids: ${bids.length}, asks: ${asks.length}`)
 
@@ -2726,6 +2692,42 @@ async function processOrders(rows, network = 'bsc') {
     
     if (pairMatches > 0) {
       console.log(`[executor] ${network}: completed ${pairMatches} matches for pair ${base}/${quote}`)
+    }
+  }
+
+  // THIRD: Process market orders AFTER limit orders have been matched
+  // This ensures the orderbook is built from limit-limit matches first
+  // Then market orders can fill against any remaining limit orders
+  if (marketOrders.length > 0) {
+    console.log(`[executor] ${network}: processing ${marketOrders.length} market/IOC/FOK orders against orderbook`)
+    
+    for (const order of marketOrders) {
+      if (processedThisCycle >= maxPerCycle) {
+        console.log(`[executor] ${network}: reached max orders per cycle, stopping`)
+        break
+      }
+      
+      try {
+        let success = false
+        
+        if (order.orderType === 'market') {
+          console.log(`[executor] ${network}: executing market order ${order.order_id}`)
+          success = await executeMarketOrder(order, network)
+        } else if (order.timeInForce === 'ioc') {
+          console.log(`[executor] ${network}: executing IOC order ${order.order_id}`)
+          success = await executeIOCOrder(order, network)
+        } else if (order.timeInForce === 'fok') {
+          console.log(`[executor] ${network}: executing FOK order ${order.order_id}`)
+          success = await executeFOKOrder(order, network)
+        }
+        
+        if (success) {
+          processedThisCycle++
+          console.log(`[executor] ${network}: market/IOC/FOK order ${order.order_id} executed successfully`)
+        }
+      } catch (e) {
+        console.error(`[executor] ${network}: error processing market order ${order.order_id}:`, e?.message || e)
+      }
     }
   }
 
@@ -3049,6 +3051,7 @@ async function runOnce(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
 
