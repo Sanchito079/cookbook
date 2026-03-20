@@ -1028,6 +1028,166 @@ async function updateOrderStatus(orderId, newStatus, network = 'bsc') {
   }
 }
 
+// ==================== MARKET ORDER EXECUTION ====================
+
+// Execute a market order immediately using fillOrder
+async function executeMarketOrder(orderRow, network = 'bsc') {
+  const order = normalizeOrderJson(orderRow.order_json || orderRow.order || {})
+  const signature = orderRow.signature || ''
+  
+  if (!order.maker || !order.tokenIn || !order.tokenOut) {
+    console.log(`[executor] ${network}: market order ${orderRow.order_id} missing required fields`)
+    return false
+  }
+  
+  const settlementContract = network === 'base' ? settlementBase : settlement
+  const providerForNetwork = network === 'base' ? providerBase : providerBSC
+  
+  try {
+    // For market orders, we fill the entire remaining amount
+    const amountInToFill = toBN(orderRow.remaining || order.amountIn)
+    
+    // For market orders, we accept any price (0 minimum)
+    const takerMinAmountOut = 0n
+    
+    console.log(`[executor] ${network}: executing market order ${orderRow.order_id}, amountIn: ${amountInToFill.toString()}`)
+    
+    // First check if order is still fillable
+    const available = await settlementContract.availableToFill(order).catch(() => 0n)
+    if (available <= 0n) {
+      console.log(`[executor] ${network}: market order ${orderRow.order_id} not available to fill`)
+      await updateOrderRemaining(orderRow.order_id, 0n, 'filled', network)
+      return false
+    }
+    
+    // Execute the fill
+    const tx = await settlementContract.fillOrder(order, signature, amountInToFill, takerMinAmountOut)
+    console.log(`[executor] ${network}: market order tx sent: ${tx.hash}`)
+    
+    const receipt = await tx.wait()
+    console.log(`[executor] ${network}: market order tx confirmed in block ${receipt.blockNumber}`)
+    
+    // Update order as filled
+    await updateOrderRemaining(orderRow.order_id, 0n, 'filled', network)
+    
+    // Record the fill
+    await recordFill(orderRow, amountInToFill, 0n, receipt, network)
+    
+    return true
+  } catch (e) {
+    const errorMsg = e?.message || String(e)
+    console.error(`[executor] ${network}: market order ${orderRow.order_id} failed:`, errorMsg)
+    
+    // Check if it's a "no fill available" error
+    if (errorMsg.includes('availableToFill') || errorMsg.includes('available')) {
+      await updateOrderRemaining(orderRow.order_id, 0n, 'filled', network)
+    }
+    
+    return false
+  }
+}
+
+// Execute IOC (Immediate-or-Cancel) orders
+async function executeIOCOrder(orderRow, network = 'bsc') {
+  const order = normalizeOrderJson(orderRow.order_json || orderRow.order || {})
+  const signature = orderRow.signature || ''
+  
+  const settlementContract = network === 'base' ? settlementBase : settlement
+  
+  try {
+    const amountInToFill = toBN(orderRow.remaining || order.amountIn)
+    
+    // Check available amount
+    const available = await settlementContract.availableToFill(order).catch(() => 0n)
+    if (available <= 0n) {
+      console.log(`[executor] ${network}: IOC order ${orderRow.order_id} has no available liquidity, cancelling`)
+      await updateOrderStatus(orderRow.order_id, 'cancelled', network)
+      return false
+    }
+    
+    // Fill whatever is available (can be partial)
+    const fillAmount = available < amountInToFill ? available : amountInToFill
+    
+    console.log(`[executor] ${network}: executing IOC order ${orderRow.order_id}, filling: ${fillAmount.toString()} of ${amountInToFill.toString()}`)
+    
+    const tx = await settlementContract.fillOrder(order, signature, fillAmount, 0n)
+    const receipt = await tx.wait()
+    
+    // Calculate remaining
+    const newRemaining = amountInToFill - fillAmount
+    
+    if (newRemaining <= 0n) {
+      await updateOrderRemaining(orderRow.order_id, 0n, 'filled', network)
+    } else {
+      await updateOrderRemaining(orderRow.order_id, newRemaining, 'cancelled', network)
+    }
+    
+    await recordFill(orderRow, fillAmount, 0n, receipt, network)
+    
+    return true
+  } catch (e) {
+    console.error(`[executor] ${network}: IOC order ${orderRow.order_id} failed:`, e?.message || e)
+    await updateOrderStatus(orderRow.order_id, 'cancelled', network)
+    return false
+  }
+}
+
+// Execute FOK (Fill-or-Kill) orders - must fill entirely or not at all
+async function executeFOKOrder(orderRow, network = 'bsc') {
+  const order = normalizeOrderJson(orderRow.order_json || orderRow.order || {})
+  const signature = orderRow.signature || ''
+  
+  const settlementContract = network === 'base' ? settlementBase : settlement
+  
+  try {
+    const amountInToFill = toBN(orderRow.remaining || order.amountIn)
+    
+    // Check if we can fill the FULL amount
+    const available = await settlementContract.availableToFill(order).catch(() => 0n)
+    if (available < amountInToFill) {
+      console.log(`[executor] ${network}: FOK order ${orderRow.order_id} cannot fill fully (available: ${available.toString()}, required: ${amountInToFill.toString()}), cancelling`)
+      await updateOrderStatus(orderRow.order_id, 'cancelled', network)
+      return false
+    }
+    
+    console.log(`[executor] ${network}: executing FOK order ${orderRow.order_id}, full amount: ${amountInToFill.toString()}`)
+    
+    const tx = await settlementContract.fillOrder(order, signature, amountInToFill, 0n)
+    const receipt = await tx.wait()
+    
+    await updateOrderRemaining(orderRow.order_id, 0n, 'filled', network)
+    await recordFill(orderRow, amountInToFill, 0n, receipt, network)
+    
+    return true
+  } catch (e) {
+    console.error(`[executor] ${network}: FOK order ${orderRow.order_id} failed:`, e?.message || e)
+    await updateOrderStatus(orderRow.order_id, 'cancelled', network)
+    return false
+  }
+}
+
+// Record a fill for market/IOC/FOK orders
+async function recordFill(orderRow, amountIn, amountOutMin, receipt, network) {
+  try {
+    const baseAddr = (orderRow.base_address || '').toLowerCase()
+    const quoteAddr = (orderRow.quote_address || '').toLowerCase()
+    const pair = baseAddr && quoteAddr ? `${baseAddr}/${quoteAddr}` : 'unknown'
+    
+    await supabase.from('fills').insert({
+      network: network,
+      buy_order_id: orderRow.side === 'bid' ? orderRow.order_id : null,
+      sell_order_id: orderRow.side === 'ask' ? orderRow.order_id : null,
+      amount_base: amountIn.toString(),
+      amount_quote: amountOutMin.toString(),
+      tx_hash: receipt.hash || '',
+      block_number: receipt.blockNumber,
+      created_at: new Date().toISOString()
+    })
+  } catch (e) {
+    console.warn('[executor] Failed to record fill:', e?.message || e)
+  }
+}
+
 // ==================== REWARD SYSTEM ====================
 
 // Calculate and award rewards for a trade
@@ -1782,7 +1942,52 @@ async function tryMatchPairCrossChain(base, quote, bids, asks) {
   }
 }
 
+// Expire orders that have passed their expiration time
+async function expireOldOrders(network = 'bsc') {
+  const now = new Date().toISOString()
+  let expiredCount = 0
+  
+  try {
+    // Find all open orders that have expired
+    const { data: expiredOrders, error } = await supabase
+      .from('orders')
+      .select('order_id, network, expiration')
+      .eq('network', network)
+      .eq('status', 'open')
+      .lt('expiration', now)
+      .not('expiration', 'is', null)
+    
+    if (error) {
+      console.warn(`[executor] ${network}: error finding expired orders:`, error.message)
+      return 0
+    }
+    
+    if (!expiredOrders || expiredOrders.length === 0) {
+      return 0
+    }
+    
+    console.log(`[executor] ${network}: found ${expiredOrders.length} expired orders to cancel`)
+    
+    // Cancel each expired order
+    for (const order of expiredOrders) {
+      try {
+        await updateOrderStatus(order.order_id, 'expired', network)
+        expiredCount++
+        console.log(`[executor] ${network}: expired order ${order.order_id}`)
+      } catch (e) {
+        console.warn(`[executor] ${network}: failed to expire order ${order.order_id}:`, e?.message)
+      }
+    }
+    
+  } catch (e) {
+    console.error(`[executor] ${network}: error in expireOldOrders:`, e?.message || e)
+  }
+  
+  return expiredCount
+}
+
 async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
+  // Return object: { matched: boolean, buyOrderId?: string, sellOrderId?: string }
   console.log(`[executor] ${network}: sorting ${bids.length} bids and ${asks.length} asks for ${base}/${quote}`)
 
   bids.sort((a, b) => {
@@ -1811,13 +2016,13 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
 
   if (!bestBid || !bestAsk) {
     console.log(`[executor] ${network}: no best bid or ask available for ${base}/${quote}`)
-    return false
+    return { matched: false }
   }
 
   // Skip self-trading
   if (bestBid.maker === bestAsk.maker) {
     console.log(`[executor] ${network}: skipping ${base}/${quote} - same maker (${bestBid.maker})`)
-    return false
+    return { matched: false }
   }
 
   const pBid = priceBid(bestBid)
@@ -1828,12 +2033,12 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
 
   if (pBid === null || pAsk === null) {
     console.log(`[executor] ${network}: null prices detected for ${base}/${quote}`)
-    return false
+    return { matched: false }
   }
 
   if (!(pBid >= pAsk)) {
     console.log(`[executor] ${network}: prices not crossing for ${base}/${quote} - bid: ${Number(pBid) / 1e18}, ask: ${Number(pAsk) / 1e18}`)
-    return false
+    return { matched: false }
   }
 
   console.log(`[executor] ${network}: ✅ MATCHING ${bestBid?.source || 'regular'} bid (${bestBid?.order_id}) with ${bestAsk?.source || 'regular'} ask (${bestAsk?.order_id}) for ${base}/${quote}`)
@@ -1853,7 +2058,7 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
 
   if (buyRemQuote <= 0n || sellRemBase <= 0n) {
     console.log(`[executor] ${network}: skipping ${base}/${quote} - insufficient remaining amounts`)
-    return false
+    return { matched: false }
   }
 
   // Query contract-side availability (skip if unfillable)
@@ -1864,11 +2069,11 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
 
   if (!diag.sigBuyOk || !diag.sigSellOk) {
     console.log(`[executor] ${network}: skipping ${base}/${quote} - signature invalid (buy: ${!!diag.sigBuyOk}, sell: ${!!diag.sigSellOk})`)
-    return false
+    return { matched: false }
   }
   if (diag.availBuy <= 0n || diag.availSell <= 0n) {
     console.log(`[executor] ${network}: skipping ${base}/${quote} - availableToFill zero (buy: ${diag.availBuy.toString()}, sell: ${diag.availSell.toString()})`)
-    return false
+    return { matched: false }
   }
 
   // Convert availBuy (in quote for buy order) to base capacity via buy ratio (floor)
@@ -1879,7 +2084,7 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   let baseOut = minOut(buyRemQuote, buy.amountIn, buy.amountOutMin)
   if (baseOut <= 0n) {
     console.log('[executor] skip: buyer budget insufficient', { buyRemQuote: buyRemQuote.toString(), buyId: buyRow.order_id })
-    return false
+    return { matched: false }
   }
 
   // Cap by seller remaining and on-chain availabilities
@@ -1889,7 +2094,7 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   if (baseOut > baseFromBuyAvail) baseOut = baseFromBuyAvail
   const baseOutAfterCaps = baseOut
   console.log(`[executor] ${network}: calc: baseOut budget=${baseOutBudget.toString()} afterCaps=${baseOutAfterCaps.toString()} sellRemBase=${sellRemBase.toString()} baseFromSellAvail=${baseFromSellAvail.toString()} baseFromBuyAvail=${baseFromBuyAvail.toString()}`)
-  if (baseOut <= 0n) return false
+  if (baseOut <= 0n) return { matched: false }
 
   // Seller requires at least this much quote for that base, use ceil to avoid underpayment
   let quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
@@ -1901,16 +2106,16 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
     const prevBaseOut = baseOut
     baseOut = (buyRemQuote * sell.amountIn) / sell.amountOutMin // floor
     console.log(`[executor] ${network}: adjust: buyer budget insufficient: quoteNeeded=${prevQuoteNeeded.toString()} > buyRemQuote=${buyRemQuote.toString()} . Shrinking baseOut ${prevBaseOut.toString()} -> ${baseOut.toString()}`)
-    if (baseOut <= 0n) return false
+    if (baseOut <= 0n) return { matched: false }
     const beforeCaps2 = baseOut
     if (baseOut > sellRemBase) baseOut = sellRemBase
     if (baseOut > baseFromSellAvail) baseOut = baseFromSellAvail
     if (baseOut > baseFromBuyAvail) baseOut = baseFromBuyAvail
     console.log(`[executor] ${network}: adjust: baseOut after caps=${baseOut.toString()} (preCaps=${beforeCaps2.toString()})`)
-    if (baseOut <= 0n) return false
+    if (baseOut <= 0n) return { matched: false }
     quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
     console.log(`[executor] ${network}: adjust: recomputed quoteNeeded=${quoteNeededBySell.toString()}`)
-    if (quoteNeededBySell > buyRemQuote) return false
+    if (quoteNeededBySell > buyRemQuote) return { matched: false }
   }
 
   // Enforce buyer's min base for the chosen quote (floor)
@@ -1923,7 +2128,7 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
     quoteNeededBySell = ceilDiv(baseOut * sell.amountOutMin, sell.amountIn)
     const buyerMinForAdjustedQuote = minOut(quoteNeededBySell, buy.amountIn, buy.amountOutMin)
     console.log(`[executor] ${network}: constraint: adjusted quoteNeeded=${quoteNeededBySell.toString()} -> buyerMinForAdjustedQuote=${buyerMinForAdjustedQuote.toString()}`)
-    if (buyerMinForAdjustedQuote > baseOut) return false
+    if (buyerMinForAdjustedQuote > baseOut) return { matched: false }
   }
 
   const quoteIn = quoteNeededBySell
@@ -1989,7 +2194,8 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
       } catch (e) {
         console.warn('[executor] min-fill finalization failed:', e?.message || e)
       }
-      return false
+      // Dust guard: return matched: true so the loop knows an order was processed
+      return { matched: true, buyOrderId: buyRow.order_id, sellOrderId: sellRow.order_id, dustSweep: true }
     }
   } catch (e) {
     console.warn('[executor] dust guard error (continuing):', e?.message || e)
@@ -2275,7 +2481,16 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   await updateOrderRemaining(buyRow.order_id, newBuyRem, newBuyRem === 0n ? 'filled' : 'open', network)
   await updateOrderRemaining(sellRow.order_id, newSellRem, newSellRem === 0n ? 'filled' : 'open', network)
   // No need to release explicitly; status is set by updateOrderRemaining
-  return true
+  
+  // Return matched result with order IDs for the loop to track
+  return { 
+    matched: true, 
+    buyOrderId: buyRow.order_id, 
+    sellOrderId: sellRow.order_id,
+    dustSweep: false,
+    newBuyRem: newBuyRem.toString(),
+    newSellRem: newSellRem.toString()
+  }
 }
 
 async function runCrossChain() {
@@ -2355,8 +2570,21 @@ async function runCrossChain() {
 }
 
 async function processOrders(rows, network = 'bsc') {
-  const byPair = new Map()
+  // Separate market orders from limit orders
+  const marketOrders = []
+  const limitOrdersByPair = new Map()
+  
   for (const r of rows) {
+    const orderType = r.order_type || 'limit'
+    const timeInForce = r.time_in_force || 'gtc'
+    
+    // Handle market orders and time-in-force orders
+    if (orderType === 'market' || timeInForce === 'ioc' || timeInForce === 'fok') {
+      marketOrders.push({ ...r, orderType, timeInForce })
+      continue
+    }
+    
+    // Limit orders - group by pair
     const base = (r.base || '').toLowerCase()
     const quote = (r.quote || '').toLowerCase()
     if (!base || !quote) {
@@ -2364,8 +2592,8 @@ async function processOrders(rows, network = 'bsc') {
       continue
     }
     const key = `${base}|${quote}`
-    if (!byPair.has(key)) byPair.set(key, { base, quote, bids: [], asks: [] })
-    const grp = byPair.get(key)
+    if (!limitOrdersByPair.has(key)) limitOrdersByPair.set(key, { base, quote, bids: [], asks: [] })
+    const grp = limitOrdersByPair.get(key)
     const side = classifyRowSide(base, quote, r)
     if (side === 'ask') grp.asks.push(r)
     else if (side === 'bid') grp.bids.push(r)
@@ -2374,11 +2602,53 @@ async function processOrders(rows, network = 'bsc') {
     }
   }
 
-  console.log(`[executor] ${network}: organized into ${byPair.size} trading pairs`)
+  let processedThisCycle = 0
+  const maxPerCycle = 5
+  
+  // Process market orders first (immediate execution)
+  if (marketOrders.length > 0) {
+    console.log(`[executor] ${network}: processing ${marketOrders.length} market/IOC/FOK orders`)
+    
+    for (const order of marketOrders) {
+      if (processedThisCycle >= maxPerCycle) {
+        console.log(`[executor] ${network}: reached max orders per cycle, stopping`)
+        break
+      }
+      
+      try {
+        let success = false
+        
+        if (order.orderType === 'market') {
+          console.log(`[executor] ${network}: executing market order ${order.order_id}`)
+          success = await executeMarketOrder(order, network)
+        } else if (order.timeInForce === 'ioc') {
+          console.log(`[executor] ${network}: executing IOC order ${order.order_id}`)
+          success = await executeIOCOrder(order, network)
+        } else if (order.timeInForce === 'fok') {
+          console.log(`[executor] ${network}: executing FOK order ${order.order_id}`)
+          success = await executeFOKOrder(order, network)
+        }
+        
+        if (success) {
+          processedThisCycle++
+          console.log(`[executor] ${network}: market/IOC/FOK order ${order.order_id} executed successfully`)
+        }
+      } catch (e) {
+        console.error(`[executor] ${network}: error processing market order ${order.order_id}:`, e?.message || e)
+      }
+    }
+  }
 
-  let matchesThisCycle = 0
-  const maxMatchesPerCycle = 5
-  for (const [pairKey, { base, quote, bids, asks }] of byPair.entries()) {
+  console.log(`[executor] ${network}: organized ${limitOrdersByPair.size} trading pairs for limit orders`)
+
+  // First, check and expire any orders that have passed their expiration time
+  const expiredCount = await expireOldOrders(network)
+  if (expiredCount > 0) {
+    console.log(`[executor] ${network}: expired ${expiredCount} orders`)
+  }
+
+  // Process limit orders (traditional order book matching)
+  for (const [pairKey, { base, quote, bids, asks }] of limitOrdersByPair.entries()) {
     console.log(`[executor] ${network}: pair ${pairKey} - bids: ${bids.length}, asks: ${asks.length}`)
 
     if (!bids.length || !asks.length) {
@@ -2387,24 +2657,79 @@ async function processOrders(rows, network = 'bsc') {
     }
 
     console.log(`[executor] ${network}: checking pair ${base}/${quote} for matches`)
-    try {
-      const done = await tryMatchPairOnce(base, quote, bids, asks, network)
-      if (done) {
-        matchesThisCycle++
-        console.log(`[executor] ${network}: successfully matched pair ${base}/${quote} (${matchesThisCycle}/${maxMatchesPerCycle})`)
-        if (matchesThisCycle >= maxMatchesPerCycle) {
-          console.log(`[executor] ${network}: reached max matches per cycle (${maxMatchesPerCycle}), stopping`)
-          break
+    
+    // Loop to match all possible pairs (partial fill support)
+    // IMPORTANT: Only match when there's a DIFFERENT pair of orders, not to split one order into multiple fills
+    let pairMatches = 0
+    let continueMatching = true
+    let lastBuyOrderId = null
+    let lastSellOrderId = null
+    
+    while (continueMatching && processedThisCycle < maxPerCycle) {
+      try {
+        const matchResult = await tryMatchPairOnce(base, quote, bids, asks, network)
+        
+        if (matchResult && matchResult.matched) {
+          // Check if we just matched the same orders (don't split one order into multiple small fills)
+          const sameBuyAsLast = matchResult.buyOrderId === lastBuyOrderId
+          const sameSellAsLast = matchResult.sellOrderId === lastSellOrderId
+          
+          // If both orders are same as last match, stop to avoid infinite splitting
+          if (sameBuyAsLast && sameSellAsLast) {
+            console.log(`[executor] ${network}: same orders matched again, stopping to avoid over-splitting`)
+            continueMatching = false
+            break
+          }
+          
+          processedThisCycle++
+          pairMatches++
+          lastBuyOrderId = matchResult.buyOrderId
+          lastSellOrderId = matchResult.sellOrderId
+          
+          console.log(`[executor] ${network}: matched pair ${base}/${quote} #${pairMatches} (total: ${processedThisCycle}/${maxPerCycle})`)
+          console.log(`[executor] ${network}: buy order ${matchResult.buyOrderId} remaining: ${matchResult.newBuyRem}, sell order ${matchResult.sellOrderId} remaining: ${matchResult.newSellRem}`)
+          
+          // Only remove orders that are FULLY filled (remaining = 0)
+          // If still has remaining, keep in list for potential next match with DIFFERENT counterparty
+          const newBuyRem = BigInt(matchResult.newBuyRem || 0)
+          const newSellRem = BigInt(matchResult.newSellRem || 0)
+          
+          if (newBuyRem === 0n) {
+            bids = bids.filter(b => b.order_id !== matchResult.buyOrderId)
+            console.log(`[executor] ${network}: buy order ${matchResult.buyOrderId} fully filled, removed from bids`)
+          }
+          if (newSellRem === 0n) {
+            asks = asks.filter(a => a.order_id !== matchResult.sellOrderId)
+            console.log(`[executor] ${network}: sell order ${matchResult.sellOrderId} fully filled, removed from asks`)
+          }
+          
+          // If no more orders on one side, stop matching this pair
+          if (!bids.length || !asks.length) {
+            console.log(`[executor] ${network}: no more orders on one side for ${pairKey}, stopping`)
+            continueMatching = false
+          }
+          
+          if (processedThisCycle >= maxPerCycle) {
+            console.log(`[executor] ${network}: reached max matches per cycle (${maxPerCycle}), stopping`)
+            continueMatching = false
+          }
+        } else {
+          // No more matches possible for this pair
+          console.log(`[executor] ${network}: no more matches for pair ${base}/${quote} (tried ${pairMatches} matches)`)
+          continueMatching = false
         }
-      } else {
-        console.log(`[executor] ${network}: no matches found for pair ${base}/${quote}`)
+      } catch (e) {
+        console.error(`[executor] ${network}: match error for ${base}/${quote}:`, e?.message || e)
+        continueMatching = false
       }
-    } catch (e) {
-      console.error(`[executor] ${network}: match error for ${base}/${quote}:`, e?.message || e)
+    }
+    
+    if (pairMatches > 0) {
+      console.log(`[executor] ${network}: completed ${pairMatches} matches for pair ${base}/${quote}`)
     }
   }
 
-  return matchesThisCycle
+  return processedThisCycle
 }
 
 async function runSolana() {
