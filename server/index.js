@@ -3072,6 +3072,12 @@ app.post('/api/orders', async (req, res) => {
     const orderHash = sha1(JSON.stringify({ network, maker: network === 'solana' ? order.maker : toLower(order.maker), nonce: String(order.nonce || ''), tokenIn: network === 'solana' ? order.tokenIn : toLower(order.tokenIn), tokenOut: network === 'solana' ? order.tokenOut : toLower(order.tokenOut), salt: String(order.salt || '') }))
     const remaining = String(order.amountIn || '0')
 
+    // Determine order type, default to 'limit'
+    const orderType = ['market', 'limit', 'stop_loss', 'stop_limit'].includes(body.orderType) ? body.orderType : 'limit'
+    const timeInForce = ['gtc', 'ioc', 'fok', 'gtd'].includes(body.timeInForce) ? body.timeInForce : 'gtc'
+    const postOnly = body.postOnly === true
+    const stopPrice = body.stopPrice ? String(body.stopPrice) : null
+
     const row = {
       network,
       order_id: orderId,
@@ -3096,6 +3102,11 @@ app.post('/api/orders', async (req, res) => {
       price: price != null ? String(price) : null,
       remaining,
       status: 'open',
+      // New order type fields
+      order_type: orderType,
+      time_in_force: timeInForce,
+      post_only: postOnly,
+      stop_price: stopPrice,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
       // Add liquidity order fields if provided
@@ -3107,6 +3118,8 @@ app.post('/api/orders', async (req, res) => {
         liquidity_provider_address: body.liquidityProviderAddress || null
       })
     }
+
+    console.log('[SERVER ORDERS POST] Order type:', orderType, 'timeInForce:', timeInForce, 'postOnly:', postOnly, 'stopPrice:', stopPrice)
 
     console.log('[SERVER ORDERS POST] Storing order with base_address:', row.base_address, 'quote_address:', row.quote_address)
 
