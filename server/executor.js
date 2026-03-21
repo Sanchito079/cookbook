@@ -2696,37 +2696,96 @@ async function processOrders(rows, network = 'bsc') {
   }
 
   // THIRD: Process market orders AFTER limit orders have been matched
-  // This ensures the orderbook is built from limit-limit matches first
-  // Then market orders can fill against any remaining limit orders
+  // Add market orders to the orderbook and match them using the standard matching logic
+  // This ensures market orders match against limit orders properly using matchOrders
   if (marketOrders.length > 0) {
     console.log(`[executor] ${network}: processing ${marketOrders.length} market/IOC/FOK orders against orderbook`)
     
-    for (const order of marketOrders) {
-      if (processedThisCycle >= maxPerCycle) {
-        console.log(`[executor] ${network}: reached max orders per cycle, stopping`)
-        break
+    // Group market orders by pair and add them to the orderbook for matching
+    const marketOrdersByPair = new Map()
+    for (const mOrder of marketOrders) {
+      const base = (mOrder.base || '').toLowerCase()
+      const quote = (mOrder.quote || '').toLowerCase()
+      if (!base || !quote) continue
+      
+      const key = `${base}|${quote}`
+      if (!marketOrdersByPair.has(key)) marketOrdersByPair.set(key, { base, quote, bids: [], asks: [] })
+      const grp = marketOrdersByPair.get(key)
+      const side = classifyRowSide(base, quote, mOrder)
+      if (side === 'ask') grp.asks.push(mOrder)
+      else if (side === 'bid') grp.bids.push(mOrder)
+    }
+    
+    // Now match market orders against limit orders using the standard matching
+    for (const [pairKey, { base, quote, bids: marketBids, asks: marketAsks }] of marketOrdersByPair.entries()) {
+      // Get existing limit orders for this pair
+      const existingPair = limitOrdersByPair.get(pairKey)
+      if (!existingPair) {
+        console.log(`[executor] ${network}: market order pair ${pairKey} has no limit orders to match against`)
+        continue
       }
       
-      try {
-        let success = false
-        
-        if (order.orderType === 'market') {
-          console.log(`[executor] ${network}: executing market order ${order.order_id}`)
-          success = await executeMarketOrder(order, network)
-        } else if (order.timeInForce === 'ioc') {
-          console.log(`[executor] ${network}: executing IOC order ${order.order_id}`)
-          success = await executeIOCOrder(order, network)
-        } else if (order.timeInForce === 'fok') {
-          console.log(`[executor] ${network}: executing FOK order ${order.order_id}`)
-          success = await executeFOKOrder(order, network)
+      // Combine market orders with limit orders for matching
+      const allBids = [...existingPair.bids, ...marketBids]
+      const allAsks = [...existingPair.asks, ...marketAsks]
+      
+      console.log(`[executor] ${network}: matching market orders for ${base}/${quote}: ${allBids.length} bids, ${allAsks.length} asks`)
+      
+      if (!allBids.length || !allAsks.length) {
+        console.log(`[executor] ${network}: market order pair ${pairKey} missing bids or asks`)
+        continue
+      }
+      
+      // Use the standard matching logic
+      let pairMatches = 0
+      let continueMatching = true
+      let lastBuyOrderId = null
+      let lastSellOrderId = null
+      
+      while (continueMatching && processedThisCycle < maxPerCycle) {
+        try {
+          const matchResult = await tryMatchPairOnce(base, quote, allBids, allAsks, network)
+          
+          if (matchResult && matchResult.matched) {
+            const sameBuyAsLast = matchResult.buyOrderId === lastBuyOrderId
+            const sameSellAsLast = matchResult.sellOrderId === lastSellOrderId
+            
+            if (sameBuyAsLast && sameSellAsLast) {
+              continueMatching = false
+              break
+            }
+            
+            processedThisCycle++
+            pairMatches++
+            lastBuyOrderId = matchResult.buyOrderId
+            lastSellOrderId = matchResult.sellOrderId
+            
+            console.log(`[executor] ${network}: market order matched ${base}/${quote} #${pairMatches}`)
+            
+            const newBuyRem = BigInt(matchResult.newBuyRem || 0)
+            const newSellRem = BigInt(matchResult.newSellRem || 0)
+            
+            if (newBuyRem === 0n) {
+              allBids.filter(b => b.order_id !== matchResult.buyOrderId)
+            }
+            if (newSellRem === 0n) {
+              allAsks.filter(a => a.order_id !== matchResult.sellOrderId)
+            }
+            
+            if (!allBids.length || !allAsks.length) {
+              continueMatching = false
+            }
+            
+            if (processedThisCycle >= maxPerCycle) {
+              continueMatching = false
+            }
+          } else {
+            continueMatching = false
+          }
+        } catch (e) {
+          console.error(`[executor] ${network}: market order match error:`, e?.message || e)
+          continueMatching = false
         }
-        
-        if (success) {
-          processedThisCycle++
-          console.log(`[executor] ${network}: market/IOC/FOK order ${order.order_id} executed successfully`)
-        }
-      } catch (e) {
-        console.error(`[executor] ${network}: error processing market order ${order.order_id}:`, e?.message || e)
       }
     }
   }
@@ -3051,7 +3110,6 @@ async function runOnce(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
-
 
 
 
