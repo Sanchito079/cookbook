@@ -3229,7 +3229,8 @@ app.get('/api/orders', async (req, res) => {
         order_id: r.order_id,
         base_address: r.base_address,
         quote_address: r.quote_address,
-        pair: r.pair
+        pair: r.pair,
+        order_type: r.order_type
       }))
 
       return res.json({ network, maker, status, data: orders })
@@ -4134,6 +4135,7 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
 
 
 
