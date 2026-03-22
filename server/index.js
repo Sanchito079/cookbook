@@ -3069,7 +3069,7 @@ app.post('/api/orders', async (req, res) => {
     // ===== End Post-Only Validation =====
 
     const orderId = crypto.randomUUID()
-    const orderHash = sha1(JSON.stringify({ network, maker: network === 'solana' ? order.maker : toLower(order.maker), nonce: String(order.nonce || ''), tokenIn: network === 'solana' ? order.tokenIn : toLower(order.tokenIn), tokenOut: network === 'solana' ? order.tokenOut : toLower(order.tokenOut), salt: String(order.salt || '') }))
+    const orderHash = sha1(JSON.stringify({ network, maker: network === 'solana' ? order.maker : toLower(order.maker), nonce: String(order.nonce ?? order.nonce ?? '0') || '0', tokenIn: network === 'solana' ? order.tokenIn : toLower(order.tokenIn), tokenOut: network === 'solana' ? order.tokenOut : toLower(order.tokenOut), salt: String(order.salt || '') }))
     const remaining = String(order.amountIn || '0')
 
     // Determine order type, default to 'limit'
@@ -3088,7 +3088,7 @@ app.post('/api/orders', async (req, res) => {
       amount_in: String(order.amountIn || '0'),
       amount_out_min: String(order.amountOutMin || '0'),
       expiration: order.expiration ? new Date(Number(order.expiration) * 1000).toISOString() : null,
-      nonce: String(order.nonce || '0'),
+      nonce: order.nonce !== undefined && order.nonce !== null ? String(order.nonce) : '0',
       receiver: network === 'solana' ? order.receiver : toLower(order.receiver || ''),
       salt: String(order.salt || '0'),
       signature,
@@ -3833,7 +3833,7 @@ app.post('/api/liquidity-ladders', async (req, res) => {
         const orderHash = sha1(JSON.stringify({ 
           network, 
           maker: network === 'solana' ? orderData.order.maker : toLower(orderData.order.maker), 
-          nonce: String(orderData.order.nonce || ''), 
+          nonce: orderData.order.nonce !== undefined && orderData.order.nonce !== null ? String(orderData.order.nonce) : '0', 
           tokenIn: network === 'solana' ? orderData.order.tokenIn : toLower(orderData.order.tokenIn), 
           tokenOut: network === 'solana' ? orderData.order.tokenOut : toLower(orderData.order.tokenOut), 
           salt: String(orderData.order.salt || '') 
@@ -4135,6 +4135,7 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
 
 
 
