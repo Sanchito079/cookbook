@@ -2959,31 +2959,14 @@ function classifyOrder(network, base, quote, order, tokenInDec, tokenOutDec) {
   const amountIn = BigInt(order.amountIn || 0n)
   const amountOutMin = BigInt(order.amountOutMin || 0n)
   if (amountIn === 0n) return { side: null, price: null }
-  
-  // For crosschain orders, amountOutMin might be 0. In that case, estimate using 0.5% slippage
-  const DEFAULT_SLIPPAGE = 0.995; // 0.5% slippage tolerance
-  
   // ask: selling base for quote
   if (tokenIn === baseL && tokenOut === quoteL) {
-    let price = null
-    if (amountOutMin > 0n) {
-      price = Number(amountOutMin) / 10**tokenOutDec / (Number(amountIn) / 10**tokenInDec)
-    } else {
-      // Estimate price using default slippage - assumes 1:1 rate as fallback
-      // The actual price will be determined at fill time based on market
-      price = 1 / DEFAULT_SLIPPAGE; // Placeholder, will be calculated at fill time
-    }
+    const price = Number(amountOutMin) / 10**tokenOutDec / (Number(amountIn) / 10**tokenInDec)
     return { side: 'ask', price }
   }
   // bid: selling quote for base
   if (tokenIn === quoteL && tokenOut === baseL) {
-    let price = null
-    if (amountOutMin > 0n) {
-      price = Number(amountIn) / 10**tokenInDec / (Number(amountOutMin) / 10**tokenOutDec)
-    } else {
-      // Estimate price using default slippage
-      price = 1 / DEFAULT_SLIPPAGE;
-    }
+    const price = Number(amountIn) / 10**tokenInDec / (Number(amountOutMin) / 10**tokenOutDec)
     return { side: 'bid', price }
   }
   return { side: null, price: null }
@@ -3314,23 +3297,14 @@ app.get('/api/orders', async (req, res) => {
       const tokenOutComp = network === 'solana' ? r.token_out : toLower(r.token_out)
       const side = (tokenInComp === base && tokenOutComp === quote) ? 'ask' : (tokenInComp === quote && tokenOutComp === base ? 'bid' : null)
       let price = null
-      const amountIn = Number(r.amount_in || 0)
-      const amountOutMin = Number(r.amount_out_min || 0)
-      const hasValidAmountOut = amountOutMin > 0 && amountIn > 0
-      
-      // If price is stored and valid, use it
-      if (r.price != null && r.price !== '0' && r.price !== '1.005') {
+      if (r.price != null) {
         price = Number(r.price)
-      } else if (side === 'ask' && hasValidAmountOut) {
+      } else if (side === 'ask') {
         // ask: selling base for quote, price = amountOutMin / 10^quoteDec / (amountIn / 10^baseDec)
-        price = amountOutMin / 10**quoteDec / (amountIn / 10**baseDec)
-      } else if (side === 'bid' && hasValidAmountOut) {
+        price = Number(r.amount_out_min) / 10**quoteDec / (Number(r.amount_in) / 10**baseDec)
+      } else if (side === 'bid') {
         // bid: selling quote for base, price = amountIn / 10^baseDec / (amountOutMin / 10^quoteDec)
-        price = amountIn / 10**baseDec / (amountOutMin / 10**quoteDec)
-      } else if (side !== null) {
-        // For crosschain orders with amountOutMin=0, use a placeholder price
-        // This will be recalculated at fill time based on actual market rates
-        price = 1.005; // Placeholder price for display purposes
+        price = Number(r.amount_in) / 10**baseDec / (Number(r.amount_out_min) / 10**quoteDec)
       }
       const rec = { id: r.order_id, maker: r.maker, price, amountIn: r.remaining, amountOutMin: r.amount_out_min, tokenIn: r.token_in, tokenOut: r.token_out }
       if (side === 'ask') asks.push(rec)
@@ -3383,10 +3357,34 @@ app.get('/api/market-depth', async (req, res) => {
     
     console.log('[MARKET DEPTH] Fetching depth for base:', base, 'quote:', quote, 'network:', network, 'limit:', limit)
     
+    // For crosschain, we need to determine the actual network for each token
+    // Crosschain pairs have tokens on different networks (e.g., BSC and Base)
+    let baseNetwork = network
+    let quoteNetwork = network
+    
+    if (network === 'crosschain' && SUPABASE_ENABLED) {
+      try {
+        // Look up the network for each token from the tokens table
+        const [baseTokenInfo, quoteTokenInfo] = await Promise.all([
+          supabase.from('tokens').select('network').eq('address', base).in('network', ['bsc', 'base']).limit(1).single(),
+          supabase.from('tokens').select('network').eq('address', quote).in('network', ['bsc', 'base']).limit(1).single()
+        ])
+        if (baseTokenInfo.data) baseNetwork = baseTokenInfo.data.network
+        if (quoteTokenInfo.data) quoteNetwork = quoteTokenInfo.data.network
+        console.log('[MARKET DEPTH] Crosschain token networks - base:', baseNetwork, 'quote:', quoteNetwork)
+      } catch (err) {
+        console.warn('[MARKET DEPTH] Failed to look up token networks:', err.message)
+        // Fall back to default networks
+        baseNetwork = 'bsc'
+        quoteNetwork = 'base'
+      }
+    }
+    
     // Fetch decimals for base and quote to calculate prices correctly
+    // Use the appropriate network for each token (especially important for crosschain)
     const [baseDec, quoteDec] = await Promise.all([
-      fetchTokenDecimals(base, network),
-      fetchTokenDecimals(quote, network)
+      fetchTokenDecimals(base, baseNetwork),
+      fetchTokenDecimals(quote, quoteNetwork)
     ])
     
     const nowIso = new Date().toISOString()
@@ -3402,7 +3400,7 @@ app.get('/api/market-depth', async (req, res) => {
         .eq('quote_address', quote)
         .eq('status', 'open')
         .gt('remaining', '0')
-        .order('price', { ascending: true })
+        .order('created_at', { ascending: false }) // Sort by creation time, more recent first
         .limit(200) // Fetch more to aggregate
       
       if (error) throw error
@@ -3425,19 +3423,12 @@ app.get('/api/market-depth', async (req, res) => {
       
       // Calculate price
       let price = null
-      const amountIn = Number(r.amount_in || 0)
-      const amountOutMin = Number(r.amount_out_min || 0)
-      const hasValidAmountOut = amountOutMin > 0 && amountIn > 0
-      
-      if (r.price != null && r.price !== '0' && r.price !== '1.005') {
+      if (r.price != null) {
         price = Number(r.price)
-      } else if (side === 'ask' && hasValidAmountOut) {
-        price = amountOutMin / 10**quoteDec / (amountIn / 10**baseDec)
-      } else if (side === 'bid' && hasValidAmountOut) {
-        price = amountIn / 10**baseDec / (amountOutMin / 10**quoteDec)
-      } else {
-        // For crosschain orders with amountOutMin=0, use placeholder
-        price = 1.005
+      } else if (side === 'ask') {
+        price = Number(r.amount_out_min) / 10**quoteDec / (Number(r.amount_in) / 10**baseDec)
+      } else if (side === 'bid') {
+        price = Number(r.amount_in) / 10**baseDec / (Number(r.amount_out_min) / 10**quoteDec)
       }
       
       if (!price || price <= 0) continue
