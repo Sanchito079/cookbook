@@ -3300,11 +3300,12 @@ app.get('/api/orders', async (req, res) => {
       if (r.price != null) {
         price = Number(r.price)
       } else if (side === 'ask') {
-        // ask: selling base for quote, price = amountOutMin / 10^quoteDec / (amountIn / 10^baseDec)
+        // Ask: selling base for quote - price = quote per base
         price = Number(r.amount_out_min) / 10**quoteDec / (Number(r.amount_in) / 10**baseDec)
       } else if (side === 'bid') {
-        // bid: selling quote for base, price = amountIn / 10^baseDec / (amountOutMin / 10^quoteDec)
-        price = Number(r.amount_in) / 10**baseDec / (Number(r.amount_out_min) / 10**quoteDec)
+        // Bid: buying base with quote - price = quote per base
+        // amount_in is in quote decimals, amount_out_min is in base decimals
+        price = Number(r.amount_in) / 10**quoteDec / (Number(r.amount_out_min) / 10**baseDec)
       }
       const rec = { id: r.order_id, maker: r.maker, price, amountIn: r.remaining, amountOutMin: r.amount_out_min, tokenIn: r.token_in, tokenOut: r.token_out }
       if (side === 'ask') asks.push(rec)
@@ -3422,13 +3423,20 @@ app.get('/api/market-depth', async (req, res) => {
       if (!side) continue
       
       // Calculate price
+      // For ask: selling base for quote - price = quote received per base
+      // For bid: buying base with quote - price = quote paid per base
       let price = null
       if (r.price != null) {
         price = Number(r.price)
       } else if (side === 'ask') {
+        // Ask: selling base (amount_in = base) for quote (amount_out_min = quote)
+        // Price = quote per base = amount_out_min / amount_in
         price = Number(r.amount_out_min) / 10**quoteDec / (Number(r.amount_in) / 10**baseDec)
       } else if (side === 'bid') {
-        price = Number(r.amount_in) / 10**baseDec / (Number(r.amount_out_min) / 10**quoteDec)
+        // Bid: buying base (amount_out_min = base) with quote (amount_in = quote)
+        // Price = quote per base = amount_in / amount_out_min
+        // amount_in is in quote decimals, amount_out_min is in base decimals
+        price = Number(r.amount_in) / 10**quoteDec / (Number(r.amount_out_min) / 10**baseDec)
       }
       
       if (!price || price <= 0) continue
@@ -4166,8 +4174,6 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
-
-
 
 
 
