@@ -2959,14 +2959,31 @@ function classifyOrder(network, base, quote, order, tokenInDec, tokenOutDec) {
   const amountIn = BigInt(order.amountIn || 0n)
   const amountOutMin = BigInt(order.amountOutMin || 0n)
   if (amountIn === 0n) return { side: null, price: null }
+  
+  // For crosschain orders, amountOutMin might be 0. In that case, estimate using 0.5% slippage
+  const DEFAULT_SLIPPAGE = 0.995; // 0.5% slippage tolerance
+  
   // ask: selling base for quote
   if (tokenIn === baseL && tokenOut === quoteL) {
-    const price = Number(amountOutMin) / 10**tokenOutDec / (Number(amountIn) / 10**tokenInDec)
+    let price = null
+    if (amountOutMin > 0n) {
+      price = Number(amountOutMin) / 10**tokenOutDec / (Number(amountIn) / 10**tokenInDec)
+    } else {
+      // Estimate price using default slippage - assumes 1:1 rate as fallback
+      // The actual price will be determined at fill time based on market
+      price = 1 / DEFAULT_SLIPPAGE; // Placeholder, will be calculated at fill time
+    }
     return { side: 'ask', price }
   }
   // bid: selling quote for base
   if (tokenIn === quoteL && tokenOut === baseL) {
-    const price = Number(amountIn) / 10**tokenInDec / (Number(amountOutMin) / 10**tokenOutDec)
+    let price = null
+    if (amountOutMin > 0n) {
+      price = Number(amountIn) / 10**tokenInDec / (Number(amountOutMin) / 10**tokenOutDec)
+    } else {
+      // Estimate price using default slippage
+      price = 1 / DEFAULT_SLIPPAGE;
+    }
     return { side: 'bid', price }
   }
   return { side: null, price: null }
@@ -3297,14 +3314,23 @@ app.get('/api/orders', async (req, res) => {
       const tokenOutComp = network === 'solana' ? r.token_out : toLower(r.token_out)
       const side = (tokenInComp === base && tokenOutComp === quote) ? 'ask' : (tokenInComp === quote && tokenOutComp === base ? 'bid' : null)
       let price = null
-      if (r.price != null) {
+      const amountIn = Number(r.amount_in || 0)
+      const amountOutMin = Number(r.amount_out_min || 0)
+      const hasValidAmountOut = amountOutMin > 0 && amountIn > 0
+      
+      // If price is stored and valid, use it
+      if (r.price != null && r.price !== '0' && r.price !== '1.005') {
         price = Number(r.price)
-      } else if (side === 'ask') {
+      } else if (side === 'ask' && hasValidAmountOut) {
         // ask: selling base for quote, price = amountOutMin / 10^quoteDec / (amountIn / 10^baseDec)
-        price = Number(r.amount_out_min) / 10**quoteDec / (Number(r.amount_in) / 10**baseDec)
-      } else if (side === 'bid') {
+        price = amountOutMin / 10**quoteDec / (amountIn / 10**baseDec)
+      } else if (side === 'bid' && hasValidAmountOut) {
         // bid: selling quote for base, price = amountIn / 10^baseDec / (amountOutMin / 10^quoteDec)
-        price = Number(r.amount_in) / 10**baseDec / (Number(r.amount_out_min) / 10**quoteDec)
+        price = amountIn / 10**baseDec / (amountOutMin / 10**quoteDec)
+      } else if (side !== null) {
+        // For crosschain orders with amountOutMin=0, use a placeholder price
+        // This will be recalculated at fill time based on actual market rates
+        price = 1.005; // Placeholder price for display purposes
       }
       const rec = { id: r.order_id, maker: r.maker, price, amountIn: r.remaining, amountOutMin: r.amount_out_min, tokenIn: r.token_in, tokenOut: r.token_out }
       if (side === 'ask') asks.push(rec)
@@ -3399,12 +3425,19 @@ app.get('/api/market-depth', async (req, res) => {
       
       // Calculate price
       let price = null
-      if (r.price != null) {
+      const amountIn = Number(r.amount_in || 0)
+      const amountOutMin = Number(r.amount_out_min || 0)
+      const hasValidAmountOut = amountOutMin > 0 && amountIn > 0
+      
+      if (r.price != null && r.price !== '0' && r.price !== '1.005') {
         price = Number(r.price)
-      } else if (side === 'ask') {
-        price = Number(r.amount_out_min) / 10**quoteDec / (Number(r.amount_in) / 10**baseDec)
-      } else if (side === 'bid') {
-        price = Number(r.amount_in) / 10**baseDec / (Number(r.amount_out_min) / 10**quoteDec)
+      } else if (side === 'ask' && hasValidAmountOut) {
+        price = amountOutMin / 10**quoteDec / (amountIn / 10**baseDec)
+      } else if (side === 'bid' && hasValidAmountOut) {
+        price = amountIn / 10**baseDec / (amountOutMin / 10**quoteDec)
+      } else {
+        // For crosschain orders with amountOutMin=0, use placeholder
+        price = 1.005
       }
       
       if (!price || price <= 0) continue
@@ -4142,6 +4175,7 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
 
 
 
