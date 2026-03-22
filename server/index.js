@@ -3153,6 +3153,13 @@ app.post('/api/orders', async (req, res) => {
             token_out: toLower(order.tokenOut),
             amount_in: String(order.amountIn || '0'),
             amount_out_min: String(order.amountOutMin || '0'),
+            nonce: order.nonce !== undefined && order.nonce !== null ? String(order.nonce) : '0',
+            salt: String(order.salt || '0'),
+            signature: signature || '',
+            order_json: order,
+            base_address: base || null,
+            quote_address: quote || null,
+            pair: base && quote ? `${base}/${quote}` : null,
             remaining,
             status: 'open',
             updated_at: new Date().toISOString()
@@ -4135,7 +4142,6 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
-
 
 
 
