@@ -1,3 +1,6 @@
+import dotenv from 'dotenv'
+import path from 'path'
+import { fileURLToPath } from 'url'
 import crypto from 'crypto'
 import fetch from 'node-fetch'
 import { createClient } from '@supabase/supabase-js'
@@ -618,14 +621,12 @@ async function fetchOpenOrdersAll(network = 'bsc') {
 }
 
 async function fetchOpenOrdersCrossChain() {
-  const now = new Date().toISOString()
   const { data, error } = await supabase
     .from('cross_chain_orders')
     .select('*')
     .eq('network', 'crosschain')
     .eq('status', 'open')
     .gt('remaining', '0')
-    .or('expiration.is.null,expiration.gt.' + now)
     .order('updated_at', { ascending: true })
     .limit(500)
   if (error) throw error
@@ -2523,29 +2524,6 @@ async function runCrossChain() {
   console.log(`[executor] cross-chain: starting cross-chain execution cycle`)
 
   try {
-    // FIRST: Check and expire any crosschain orders that have passed their expiration time
-    const now = new Date().toISOString()
-    const { data: expiredCrossChainOrders, error: expiredError } = await supabase
-      .from('cross_chain_orders')
-      .select('order_id, expiration')
-      .eq('status', 'open')
-      .lt('expiration', now)
-      .not('expiration', 'is', null)
-    
-    if (expiredError) {
-      console.warn(`[executor] cross-chain: error finding expired orders:`, expiredError.message)
-    } else if (expiredCrossChainOrders && expiredCrossChainOrders.length > 0) {
-      console.log(`[executor] cross-chain: found ${expiredCrossChainOrders.length} expired orders to cancel`)
-      for (const order of expiredCrossChainOrders) {
-        try {
-          await updateOrderStatus(order.order_id, 'expired', 'crosschain')
-          console.log(`[executor] cross-chain: expired order ${order.order_id}`)
-        } catch (e) {
-          console.warn(`[executor] cross-chain: failed to expire order ${order.order_id}:`, e?.message)
-        }
-      }
-    }
-
     console.log(`[executor] cross-chain: fetching open orders from both networks...`)
     const rows = await fetchOpenOrdersCrossChain()
     console.log(`[executor] cross-chain: fetched ${rows.length} total orders`)
@@ -3197,6 +3175,44 @@ async function runOnce(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
