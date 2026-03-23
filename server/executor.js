@@ -1671,8 +1671,22 @@ async function tryMatchPairCrossChain(base, quote, bids, asks) {
     return false
   }
 
-  if (!(pBid === pAsk)) {
+  // Check if either order is a market order - market orders match at ANY price
+  const isBidMarketOrder = (bestBid.order_type || 'limit') === 'market'
+  const isAskMarketOrder = (bestAsk.order_type || 'limit') === 'market'
+  
+  // For market orders, we allow matching at any price (price crossing)
+  // For limit orders, prices must be equal
+  const pricesCrossing = pBid >= pAsk
+  const pricesEqual = pBid === pAsk
+  
+  if (!(isBidMarketOrder || isAskMarketOrder) && !pricesEqual) {
     console.log(`[executor] cross-chain: prices not equal for ${base}/${quote} - bid: ${Number(pBid) / 1e18}, ask: ${Number(pAsk) / 1e18}`)
+    return false
+  }
+  
+  if ((isBidMarketOrder || isAskMarketOrder) && !pricesCrossing) {
+    console.log(`[executor] cross-chain: market order prices not crossing for ${base}/${quote} - bid: ${Number(pBid) / 1e18}, ask: ${Number(pAsk) / 1e18}`)
     return false
   }
 
@@ -2519,8 +2533,20 @@ async function runCrossChain() {
       return
     }
 
-    const byPair = new Map()
+    // Separate market orders from limit orders
+    const marketOrders = []
+    const limitOrdersByPair = new Map()
+    
     for (const r of rows) {
+      const orderType = r.order_type || 'limit'
+      
+      // Handle market orders
+      if (orderType === 'market') {
+        marketOrders.push(r)
+        continue
+      }
+      
+      // Handle limit orders
       const base = (r.base || '').toLowerCase()
       const quote = (r.quote || '').toLowerCase()
       if (!base || !quote) {
@@ -2528,8 +2554,8 @@ async function runCrossChain() {
         continue
       }
       const key = `${base}|${quote}`
-      if (!byPair.has(key)) byPair.set(key, { base, quote, bids: [], asks: [] })
-      const grp = byPair.get(key)
+      if (!limitOrdersByPair.has(key)) limitOrdersByPair.set(key, { base, quote, bids: [], asks: [] })
+      const grp = limitOrdersByPair.get(key)
       const side = classifyRowSide(base, quote, r)
       if (side === 'ask') grp.asks.push(r)
       else if (side === 'bid') grp.bids.push(r)
@@ -2537,6 +2563,45 @@ async function runCrossChain() {
         console.log(`[executor] cross-chain: order ${r.order_id} has invalid side for pair ${base}/${quote}`)
       }
     }
+    
+    // Process market orders first (if any)
+    if (marketOrders.length > 0) {
+      console.log(`[executor] cross-chain: processing ${marketOrders.length} market orders`)
+      for (const marketOrder of marketOrders) {
+        try {
+          const base = (marketOrder.base || '').toLowerCase()
+          const quote = (marketOrder.quote || '').toLowerCase()
+          
+          // Get existing orders for this pair to match against
+          const existingKey = `${base}|${quote}`
+          const existingPair = limitOrdersByPair.get(existingKey)
+          
+          if (!existingPair || !existingPair.bids.length || !existingPair.asks.length) {
+            console.log(`[executor] cross-chain: market order ${marketOrder.order_id} has no opposing orders to match`)
+            continue
+          }
+          
+          const side = classifyRowSide(base, quote, marketOrder)
+          const opposingBids = side === 'ask' ? existingPair.bids : existingPair.asks
+          const opposingAsks = side === 'bid' ? existingPair.asks : existingPair.bids
+          
+          if (!opposingBids.length || !opposingAsks.length) {
+            console.log(`[executor] cross-chain: market order ${marketOrder.order_id} missing opposing orders`)
+            continue
+          }
+          
+          // Match market order against best opposing orders
+          const done = await tryMatchPairCrossChain(base, quote, opposingBids, opposingAsks, marketOrder)
+          if (done) {
+            console.log(`[executor] cross-chain: market order ${marketOrder.order_id} matched`)
+          }
+        } catch (e) {
+          console.error(`[executor] cross-chain: market order error:`, e?.message || e)
+        }
+      }
+    }
+    
+    const byPair = limitOrdersByPair
 
     console.log(`[executor] cross-chain: organized into ${byPair.size} trading pairs`)
 
@@ -3110,6 +3175,7 @@ async function runOnce(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
+
 
 
 
