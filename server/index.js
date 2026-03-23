@@ -1,3 +1,6 @@
+import express from 'express'
+import cors from 'cors'
+import fetch from 'node-fetch'
 import dotenv from 'dotenv'
 import { createClient } from '@supabase/supabase-js'
 import crypto from 'node:crypto'
@@ -3388,7 +3391,7 @@ app.get('/api/market-depth', async (req, res) => {
     const nowIso = new Date().toISOString()
     const tableName = network === 'crosschain' ? 'cross_chain_orders' : 'orders'
     
-    // Fetch all open orders for this pair (filter out expired orders at DB level)
+    // Fetch all open orders for this pair
     let rows = []
     try {
       const { data, error } = await supabase
@@ -3398,12 +3401,11 @@ app.get('/api/market-depth', async (req, res) => {
         .eq('quote_address', quote)
         .eq('status', 'open')
         .gt('remaining', '0')
-        .or('expiration.is.null,expiration.gt.' + nowIso)
         .order('created_at', { ascending: false }) // Sort by creation time, more recent first
         .limit(200) // Fetch more to aggregate
       
       if (error) throw error
-      rows = data || []
+      rows = (data || []).filter(r => !r.expiration || r.expiration > nowIso)
     } catch (dbErr) {
       console.warn('[market-depth] db fetch failed:', dbErr?.message || dbErr)
       return res.status(500).json({ error: dbErr?.message || String(dbErr) })
@@ -4172,6 +4174,50 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
