@@ -1488,31 +1488,46 @@ const tokenDecimalsCache = new Map()
 async function getTokenDecimalsCached(address, network = 'bsc') {
   try {
     const key = `${network}:${(address || '').toLowerCase()}`
-    if (tokenDecimalsCache.has(key)) return tokenDecimalsCache.get(key)
+    if (tokenDecimalsCache.has(key)) {
+      console.log(`[executor] getTokenDecimalsCached(${address}, ${network}) = ${tokenDecimalsCache.get(key)} [CACHED]`)
+      return tokenDecimalsCache.get(key)
+    }
 
     let dec = null
-    try {
-      const { data: t } = await supabase
-        .from('tokens')
-        .select('address,decimals')
-        .eq('network', network)
-        .eq('address', (address || '').toLowerCase())
-        .limit(1)
-      if (Array.isArray(t) && t.length) {
-        const row = t[0]
-        if (row && row.decimals != null) dec = Number(row.decimals)
-      }
-    } catch {}
-
-    // Hardcoded known tokens as fallback
+    // Hardcoded known tokens as fallback - CHECK FIRST before database
     const addr = (address || '').toLowerCase()
+    if (addr === '0x55d398326f99059ff775485246999027b3197955') dec = 6 // BSC USDT
+    else if (addr === '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c') dec = 18 // BSC WBNB
+    else if (addr === '0x4200000000000000000000000000000000000006') dec = 18 // Base WETH
+    else if (addr === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913') dec = 6  // Base USDC
+    
+    // Only query database if not a known token
     if (dec == null) {
-      if (addr === '0x55d398326f99059ff775485246999027b3197955') dec = 6 // BSC USDT
-      else if (addr === '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c') dec = 18 // BSC WBNB
-      else if (addr === '0x4200000000000000000000000000000000000006') dec = 18 // Base WETH
-      else if (addr === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913') dec = 6  // Base USDC
-      else dec = 18
+      try {
+        const { data: t, error: tokenError } = await supabase
+          .from('tokens')
+          .select('address,decimals')
+          .eq('network', network)
+          .eq('address', (address || '').toLowerCase())
+          .limit(1)
+        if (tokenError) console.log(`[executor] getTokenDecimalsCached DB error for ${address} on ${network}:`, tokenError)
+        if (Array.isArray(t) && t.length) {
+          const row = t[0]
+          if (row && row.decimals != null) dec = Number(row.decimals)
+        } else {
+          console.log(`[executor] getTokenDecimalsCached: token ${address} not found in DB for network ${network}, will use fallback`)
+        }
+      } catch (e) {
+        console.log(`[executor] getTokenDecimalsCached exception:`, e)
+      }
+    } else {
+      console.log(`[executor] getTokenDecimalsCached: using hardcoded value ${dec} for known token ${address}`)
     }
+
+    // Final fallback
+    if (dec == null) dec = 18
+
+    console.log(`[executor] getTokenDecimalsCached(${address}, ${network}) = ${dec}`)
 
     tokenDecimalsCache.set(key, dec)
     return dec
@@ -2155,9 +2170,13 @@ async function tryMatchPairOnce(base, quote, bids, asks, network = 'bsc') {
   try {
     const baseDec = await getTokenDecimalsCached(base, network)
     const quoteDec = await getTokenDecimalsCached(quote, network)
-    // Policy: require at least 0.01 quote token and 1e-6 base token as a minimum chunk size
-    const minQuoteFill = minUnitsForDecimals(quoteDec, 2) // 0.01 quote unit
+    // Policy: require at least 0.001 quote token and 1e-6 base token as a minimum chunk size
+    const minQuoteFill = minUnitsForDecimals(quoteDec, 3) // 0.001 quote unit
     const minBaseFill = minUnitsForDecimals(baseDec, 6)  // 0.000001 base unit
+
+    console.log(`[executor] ${network}: MIN-FILL DEBUG: base=${base} (dec=${baseDec}), quote=${quote} (dec=${quoteDec})`)
+    console.log(`[executor] ${network}: MIN-FILL DEBUG: minQuoteFill=${minQuoteFill} (10^${quoteDec-3}), minBaseFill=${minBaseFill} (10^${baseDec-6})`)
+    console.log(`[executor] ${network}: MIN-FILL DEBUG: quoteIn=${quoteIn}, baseOut=${baseOut}`)
 
     if (quoteIn < minQuoteFill || baseOut < minBaseFill) {
       console.log(`[executor] ${network}: below min-fill -> finalize limiting side. quoteIn=${quoteIn.toString()} (min=${minQuoteFill.toString()}), baseOut=${baseOut.toString()} (min=${minBaseFill.toString()})`)
