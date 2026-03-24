@@ -1961,10 +1961,14 @@ async function expireOldOrders(network = 'bsc') {
   const now = new Date().toISOString()
   let expiredCount = 0
   
+  // Use different table for cross-chain orders
+  const tableName = network === 'crosschain' ? 'cross_chain_orders' : 'orders'
+  console.log(`[expireOldOrders] Checking table: ${tableName} for network: ${network}, current time: ${now}`)
+  
   try {
     // Find all open orders that have expired
     const { data: expiredOrders, error } = await supabase
-      .from('orders')
+      .from(tableName)
       .select('order_id, network, expiration')
       .eq('network', network)
       .eq('status', 'open')
@@ -2524,6 +2528,12 @@ async function runCrossChain() {
   console.log(`[executor] cross-chain: starting cross-chain execution cycle`)
 
   try {
+    // FIRST: Check and expire any orders that have passed their expiration time
+    const expiredCount = await expireOldOrders('crosschain')
+    if (expiredCount > 0) {
+      console.log(`[executor] cross-chain: expired ${expiredCount} orders`)
+    }
+
     console.log(`[executor] cross-chain: fetching open orders from both networks...`)
     const rows = await fetchOpenOrdersCrossChain()
     console.log(`[executor] cross-chain: fetched ${rows.length} total orders`)
@@ -3127,6 +3137,13 @@ async function runOnce(network = 'bsc') {
     console.log(`[executor] ${network}: checking conditional orders...`)
     const triggeredOrderIds = await checkAndTriggerConditionalOrders(network)
 
+    // Then expire any orders that have passed their expiration time
+    console.log(`[executor] ${network}: checking for expired orders...`)
+    const expiredCount = await expireOldOrders(network)
+    if (expiredCount > 0) {
+      console.log(`[executor] ${network}: expired ${expiredCount} orders`)
+    }
+
     // Then fetch and process ALL open orders (including newly triggered ones)
     console.log(`[executor] ${network}: fetching open orders...`)
     const allRows = await fetchOpenOrdersAll(network)
@@ -3175,7 +3192,6 @@ async function runOnce(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
-
 
 
 
