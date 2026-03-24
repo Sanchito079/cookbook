@@ -2990,6 +2990,9 @@ app.post('/api/orders', async (req, res) => {
     console.log('[SERVER ORDERS POST] Processed quote:', quote)
     console.log('[SERVER ORDERS POST] Order tokenIn:', order.tokenIn)
     console.log('[SERVER ORDERS POST] Order tokenOut:', order.tokenOut)
+    console.log('[SERVER ORDERS POST] Order expiration:', order.expiration)
+    console.log('[SERVER ORDERS POST] Order expiration type:', typeof order.expiration)
+    console.log('[SERVER ORDERS POST] Order expiration converted:', order.expiration ? new Date(Number(order.expiration) * 1000).toISOString() : null)
 
     if (!base || !quote) return res.status(400).json({ error: 'base and quote required' })
 
@@ -3120,7 +3123,7 @@ app.post('/api/orders', async (req, res) => {
     }
 
     console.log('[SERVER ORDERS POST] Order type:', orderType, 'timeInForce:', timeInForce, 'postOnly:', postOnly, 'stopPrice:', stopPrice)
-
+    console.log('[SERVER ORDERS POST] Row expiration value:', row.expiration)
     console.log('[SERVER ORDERS POST] Storing order with base_address:', row.base_address, 'quote_address:', row.quote_address)
 
     // Use different table for cross-chain orders
