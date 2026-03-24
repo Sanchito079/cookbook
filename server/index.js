@@ -1516,7 +1516,11 @@ async function checkConditionalOrders(network) {
           token_out: toLower(orderTemplate.tokenOut),
           amount_in: String(orderTemplate.amountIn || '0'),
           amount_out_min: String(orderTemplate.amountOutMin || '0'),
-          expiration: orderTemplate.expiration ? new Date(Number(orderTemplate.expiration) * 1000).toISOString() : null,
+          expiration: (() => {
+            const exp = orderTemplate.expiration;
+            if (typeof exp === 'bigint') return new Date(Number(exp.toString()) * 1000).toISOString();
+            return exp ? new Date(Number(exp) * 1000).toISOString() : null;
+          })(),
           nonce: String(orderTemplate.nonce || '0'),
           receiver: toLower(orderTemplate.receiver || ''),
           salt: String(orderTemplate.salt || '0'),
@@ -3081,6 +3085,13 @@ app.post('/api/orders', async (req, res) => {
     const postOnly = body.postOnly === true
     const stopPrice = body.stopPrice ? String(body.stopPrice) : null
 
+    // Extract expiration - handle BigInt, string, and number formats
+    let orderExpiration = order.expiration;
+    if (typeof orderExpiration === 'bigint') {
+      orderExpiration = orderExpiration.toString();
+    }
+    const expirationValue = orderExpiration ? new Date(Number(orderExpiration) * 1000).toISOString() : null;
+
     const row = {
       network,
       order_id: orderId,
@@ -3090,7 +3101,7 @@ app.post('/api/orders', async (req, res) => {
       token_out: network === 'solana' ? order.tokenOut : toLower(order.tokenOut),
       amount_in: String(order.amountIn || '0'),
       amount_out_min: String(order.amountOutMin || '0'),
-      expiration: order.expiration ? new Date(Number(order.expiration) * 1000).toISOString() : null,
+      expiration: expirationValue,
       nonce: order.nonce !== undefined && order.nonce !== null ? String(order.nonce) : '0',
       receiver: network === 'solana' ? order.receiver : toLower(order.receiver || ''),
       salt: String(order.salt || '0'),
@@ -3156,6 +3167,7 @@ app.post('/api/orders', async (req, res) => {
             token_out: toLower(order.tokenOut),
             amount_in: String(order.amountIn || '0'),
             amount_out_min: String(order.amountOutMin || '0'),
+            expiration: expirationValue,
             nonce: order.nonce !== undefined && order.nonce !== null ? String(order.nonce) : '0',
             salt: String(order.salt || '0'),
             signature: signature || '',
@@ -3820,7 +3832,11 @@ app.post('/api/liquidity-ladders', async (req, res) => {
           token_out: network === 'solana' ? parent.tokenOut : toLower(parent.tokenOut),
           amount_in: String(levelAmountIn),
           amount_out_min: String(levelAmountOutMin),
-          expiration: parent.expiration ? new Date(Number(parent.expiration) * 1000).toISOString() : null,
+          expiration: (() => {
+            const exp = parent.expiration;
+            if (typeof exp === 'bigint') return new Date(Number(exp.toString()) * 1000).toISOString();
+            return exp ? new Date(Number(exp) * 1000).toISOString() : null;
+          })(),
           nonce: levelNonce,
           receiver: network === 'solana' ? parent.receiver : toLower(parent.receiver || ''),
           salt: levelSalt,
@@ -3890,7 +3906,11 @@ app.post('/api/liquidity-ladders', async (req, res) => {
           token_out: network === 'solana' ? orderData.order.tokenOut : toLower(orderData.order.tokenOut),
           amount_in: String(orderData.order.amountIn || '0'),
           amount_out_min: String(orderData.order.amountOutMin || '0'),
-          expiration: orderData.order.expiration ? new Date(Number(orderData.order.expiration) * 1000).toISOString() : null,
+          expiration: (() => {
+            const exp = orderData.order.expiration;
+            if (typeof exp === 'bigint') return new Date(Number(exp.toString()) * 1000).toISOString();
+            return exp ? new Date(Number(exp) * 1000).toISOString() : null;
+          })(),
           nonce: String(orderData.order.nonce || '0'),
           receiver: network === 'solana' ? orderData.order.receiver : toLower(orderData.order.receiver || ''),
           salt: String(orderData.order.salt || '0'),
