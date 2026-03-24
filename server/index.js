@@ -1970,18 +1970,21 @@ app.get('/api/markets/wbnb/new', async (req, res) => {
     }
     const marketsDeduped = Array.from(byPairFinal.values())
 
-    // Sort: 1) has trading data (price, volume, or change) desc, 2) volumeRaw desc, 3) pair asc (stable)
+    // Sort: 1) has ALL trading data (price, volume AND change) desc, 2) volumeRaw desc, 3) pair asc (stable)
     const marketsSorted = marketsDeduped.sort((a, b) => {
-      // First prioritize pairs with any trading data
-      const aHasData = (a?.price && a.price !== '-' && parseFloat(a.price) > 0) || 
-                     (a?.volume && parseFloat(a.volume) > 0) || 
-                     (a?.change && parseFloat(a.change) !== 0)
-      const bHasData = (b?.price && b.price !== '-' && parseFloat(b.price) > 0) || 
-                     (b?.volume && parseFloat(b.volume) > 0) || 
-                     (b?.change && parseFloat(b.change) !== 0)
+      // First prioritize pairs with ALL trading data
+      const aHasPrice = a?.price && a.price !== '-' && parseFloat(a.price) > 0
+      const aHasVolume = a?.volume && parseFloat(a.volume) > 0
+      const aHasChange = a?.change && parseFloat(a.change) !== 0
+      const aHasData = aHasPrice && aHasVolume && aHasChange // ALL fields required
+      
+      const bHasPrice = b?.price && b.price !== '-' && parseFloat(b.price) > 0
+      const bHasVolume = b?.volume && parseFloat(b.volume) > 0
+      const bHasChange = b?.change && parseFloat(b.change) !== 0
+      const bHasData = bHasPrice && bHasVolume && bHasChange // ALL fields required
       
       if (aHasData !== bHasData) {
-        return aHasData ? -1 : 1 // Pairs with data come first
+        return aHasData ? -1 : 1 // Pairs with ALL data come first
       }
 
       // Then sort by volume
