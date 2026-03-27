@@ -1970,24 +1970,25 @@ app.get('/api/markets/wbnb/new', async (req, res) => {
     }
     const marketsDeduped = Array.from(byPairFinal.values())
 
-    // Sort: 1) has ALL trading data (price, volume AND change) desc, 2) volumeRaw desc, 3) pair asc (stable)
+    // Sort: 1) data completeness tier (3 values > 2 values > 1 value > rest), 2) volumeRaw desc, 3) pair asc (stable)
     const marketsSorted = marketsDeduped.sort((a, b) => {
-      // First prioritize pairs with ALL trading data
+      // Calculate data completeness score (0-3)
       const aHasPrice = a?.price && a.price !== '-' && parseFloat(a.price) > 0
       const aHasVolume = a?.volume && parseFloat(a.volume) > 0
       const aHasChange = a?.change && parseFloat(a.change) !== 0
-      const aHasData = aHasPrice && aHasVolume && aHasChange // ALL fields required
+      const aScore = (aHasPrice ? 1 : 0) + (aHasVolume ? 1 : 0) + (aHasChange ? 1 : 0)
       
       const bHasPrice = b?.price && b.price !== '-' && parseFloat(b.price) > 0
       const bHasVolume = b?.volume && parseFloat(b.volume) > 0
       const bHasChange = b?.change && parseFloat(b.change) !== 0
-      const bHasData = bHasPrice && bHasVolume && bHasChange // ALL fields required
+      const bScore = (bHasPrice ? 1 : 0) + (bHasVolume ? 1 : 0) + (bHasChange ? 1 : 0)
       
-      if (aHasData !== bHasData) {
-        return aHasData ? -1 : 1 // Pairs with ALL data come first
+      // Higher score = more complete data = comes first
+      if (aScore !== bScore) {
+        return bScore - aScore // Descending: 3 > 2 > 1 > 0
       }
 
-      // Then sort by volume
+      // Same tier: sort by volume descending
       const va = Number.isFinite(parseFloat(a?.volumeRaw)) ? parseFloat(a.volumeRaw) : (Number.isFinite(parseFloat(a?.volume)) ? parseFloat(a.volume) : 0)
       const vb = Number.isFinite(parseFloat(b?.volumeRaw)) ? parseFloat(b.volumeRaw) : (Number.isFinite(parseFloat(b?.volume)) ? parseFloat(b.volume) : 0)
       if (vb !== va) return vb - va
