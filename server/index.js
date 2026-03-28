@@ -1898,6 +1898,7 @@ app.get('/api/markets/wbnb/new', async (req, res) => {
     const duration = (req.query.duration || '1h').toString()
     const page = Math.max(1, Number(req.query.page || 1))
     const limit = Math.min(50, Math.max(1, Number(req.query.limit || 50))) // Limit to 50 per page for performance
+    const filter = (req.query.filter || 'all').toString() // Filter type: all, trending, new, volume, gainers, losers
 
     // Get base markets data
     let markets = []
@@ -1988,10 +1989,41 @@ app.get('/api/markets/wbnb/new', async (req, res) => {
         return bScore - aScore // Descending: 3 > 2 > 1 > 0
       }
 
-      // Same tier: sort by volume descending
-      const va = Number.isFinite(parseFloat(a?.volumeRaw)) ? parseFloat(a.volumeRaw) : (Number.isFinite(parseFloat(a?.volume)) ? parseFloat(a.volume) : 0)
-      const vb = Number.isFinite(parseFloat(b?.volumeRaw)) ? parseFloat(b.volumeRaw) : (Number.isFinite(parseFloat(b?.volume)) ? parseFloat(b.volume) : 0)
-      if (vb !== va) return vb - va
+      // Apply filter-based sorting
+      switch (filter) {
+        case 'trending':
+        case 'volume':
+          // Sort by volume descending (highest volume first)
+          const vaVol = Number.isFinite(parseFloat(a?.volumeRaw)) ? parseFloat(a.volumeRaw) : (Number.isFinite(parseFloat(a?.volume)) ? parseFloat(a.volume) : 0)
+          const vbVol = Number.isFinite(parseFloat(b?.volumeRaw)) ? parseFloat(b.volumeRaw) : (Number.isFinite(parseFloat(b?.volume)) ? parseFloat(b.volume) : 0)
+          if (vbVol !== vaVol) return vbVol - vaVol
+          break
+        case 'new':
+          // Sort by updated_at timestamp descending (most recently updated first)
+          const aTime = a?.updated_at ? new Date(a.updated_at).getTime() : 0
+          const bTime = b?.updated_at ? new Date(b.updated_at).getTime() : 0
+          if (bTime !== aTime) return bTime - aTime
+          break
+        case 'gainers':
+          // Sort by positive price change descending (highest gainers first)
+          const aChangeGain = parseFloat(String(a?.change || '0').replace('%', ''))
+          const bChangeGain = parseFloat(String(b?.change || '0').replace('%', ''))
+          if (bChangeGain !== aChangeGain) return bChangeGain - aChangeGain
+          break
+        case 'losers':
+          // Sort by negative price change ascending (most negative first)
+          const aChangeLoss = parseFloat(String(a?.change || '0').replace('%', ''))
+          const bChangeLoss = parseFloat(String(b?.change || '0').replace('%', ''))
+          if (aChangeLoss !== bChangeLoss) return aChangeLoss - bChangeLoss
+          break
+        case 'all':
+        default:
+          // Sort by volume descending as default
+          const vaAll = Number.isFinite(parseFloat(a?.volumeRaw)) ? parseFloat(a.volumeRaw) : (Number.isFinite(parseFloat(a?.volume)) ? parseFloat(a.volume) : 0)
+          const vbAll = Number.isFinite(parseFloat(b?.volumeRaw)) ? parseFloat(b.volumeRaw) : (Number.isFinite(parseFloat(b?.volume)) ? parseFloat(b.volume) : 0)
+          if (vbAll !== vaAll) return vbAll - vaAll
+          break
+      }
 
       // Finally sort by pair name for stability
       const ap = (a?.pair || '')
