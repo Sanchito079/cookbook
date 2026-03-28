@@ -1,6 +1,3 @@
-import dotenv from 'dotenv'
-import path from 'path'
-import { fileURLToPath } from 'url'
 import crypto from 'crypto'
 import fetch from 'node-fetch'
 import { createClient } from '@supabase/supabase-js'
@@ -1482,56 +1479,82 @@ const ERC20_MIN_ABI = [
   { inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }], name: 'transfer', outputs: [{ type: 'bool' }], stateMutability: 'nonpayable', type: 'function' }
 ]
 
-// Cached token decimals helper and min-fill calculations
+// Cache for fetched decimals - only stores API-sourced values
 const tokenDecimalsCache = new Map()
+
+// Clear cache at startup to remove any stale/wrong values
+tokenDecimalsCache.clear()
 
 async function getTokenDecimalsCached(address, network = 'bsc') {
   try {
-    const key = `${network}:${(address || '').toLowerCase()}`
+    // Clear cache at startup to avoid stale values
+    if (tokenDecimalsCache.size > 100) {
+      tokenDecimalsCache.clear()
+      console.log('[executor] Token decimals cache cleared due to size')
+    }
+    
+    const addr = (address || '').toLowerCase()
+    const key = `${network}:${addr}`
+
+    // First: Check known hardcoded tokens BEFORE cache (most reliable)
+    if (addr === '0x55d398326f99059ff775485246999027b3197955') return 6 // BSC USDT
+    if (addr === '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c') return 18 // BSC WBNB
+    if (addr === '0x4200000000000000000000000000000000000006') return 18 // Base WETH
+    if (addr === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913') return 6  // Base USDC
+    if (addr === '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d') return 18 // USDC (BSC alt)
+    
+    // For known tokens, check cache second
     if (tokenDecimalsCache.has(key)) {
-      console.log(`[executor] getTokenDecimalsCached(${address}, ${network}) = ${tokenDecimalsCache.get(key)} [CACHED]`)
       return tokenDecimalsCache.get(key)
     }
 
     let dec = null
-    // Hardcoded known tokens as fallback - CHECK FIRST before database
-    const addr = (address || '').toLowerCase()
-    if (addr === '0x55d398326f99059ff775485246999027b3197955') dec = 6 // BSC USDT
-    else if (addr === '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c') dec = 18 // BSC WBNB
-    else if (addr === '0x4200000000000000000000000000000000000006') dec = 18 // Base WETH
-    else if (addr === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913') dec = 6  // Base USDC
-    
-    // Only query database if not a known token
-    if (dec == null) {
+
+    // Second: Try to fetch from the API (same as frontend uses)
       try {
-        const { data: t, error: tokenError } = await supabase
-          .from('tokens')
-          .select('address,decimals')
-          .eq('network', network)
-          .eq('address', (address || '').toLowerCase())
-          .limit(1)
-        if (tokenError) console.log(`[executor] getTokenDecimalsCached DB error for ${address} on ${network}:`, tokenError)
-        if (Array.isArray(t) && t.length) {
-          const row = t[0]
-          if (row && row.decimals != null) dec = Number(row.decimals)
-        } else {
-          console.log(`[executor] getTokenDecimalsCached: token ${address} not found in DB for network ${network}, will use fallback`)
+        const INDEXER_BASE = process.env.INDEXER_BASE || 'https://cookbook-hjnhgq.fly.dev'
+        const res = await fetch(`${INDEXER_BASE}/api/token/info?network=${network}&address=${addr}`)
+        if (res.ok) {
+          const json = await res.json()
+          if (json?.decimals != null) {
+            dec = Number(json.decimals)
+            console.log(`[executor] getTokenDecimalsCached: fetched ${addr} decimals=${dec} from API`)
+          }
         }
       } catch (e) {
-        console.log(`[executor] getTokenDecimalsCached exception:`, e)
+        console.log(`[executor] getTokenDecimalsCached: API fetch failed for ${addr}, trying DB`)
+        
+        // Third: Fallback to database across multiple networks
+        try {
+          const networksToTry = [network, 'bsc', 'base'].filter((v, i, a) => a.indexOf(v) === i)
+          for (const net of networksToTry) {
+            const { data: t } = await supabase
+              .from('tokens')
+              .select('decimals,network')
+              .eq('address', addr)
+              .eq('network', net)
+              .limit(1)
+            if (Array.isArray(t) && t.length > 0 && t[0]?.decimals != null) {
+              dec = Number(t[0].decimals)
+              console.log(`[executor] getTokenDecimalsCached: found ${addr} decimals=${dec} in DB (network=${t[0].network})`)
+              break
+            }
+          }
+        } catch (dbErr) {
+          console.log(`[executor] getTokenDecimalsCached: DB error:`, dbErr.message)
+        }
       }
-    } else {
-      console.log(`[executor] getTokenDecimalsCached: using hardcoded value ${dec} for known token ${address}`)
-    }
 
     // Final fallback
-    if (dec == null) dec = 18
-
-    console.log(`[executor] getTokenDecimalsCached(${address}, ${network}) = ${dec}`)
+    if (dec == null) {
+      dec = 18
+    }
 
     tokenDecimalsCache.set(key, dec)
     return dec
-  } catch { return 18 }
+  } catch { 
+    return 18 
+  }
 }
 
 function minUnitsForDecimals(decimals, fractionDigits) {
@@ -2724,10 +2747,12 @@ async function processOrders(rows, network = 'bsc') {
     let continueMatching = true
     let lastBuyOrderId = null
     let lastSellOrderId = null
+    let bidsArray = bids
+    let asksArray = asks
     
     while (continueMatching && processedThisCycle < maxPerCycle) {
       try {
-        const matchResult = await tryMatchPairOnce(base, quote, bids, asks, network)
+        const matchResult = await tryMatchPairOnce(base, quote, bidsArray, asksArray, network)
         
         if (matchResult && matchResult.matched) {
           // Check if we just matched the same orders (don't split one order into multiple small fills)
@@ -2755,16 +2780,16 @@ async function processOrders(rows, network = 'bsc') {
           const newSellRem = BigInt(matchResult.newSellRem || 0)
           
           if (newBuyRem === 0n) {
-            bids = bids.filter(b => b.order_id !== matchResult.buyOrderId)
+            bidsArray = bidsArray.filter(b => b.order_id !== matchResult.buyOrderId)
             console.log(`[executor] ${network}: buy order ${matchResult.buyOrderId} fully filled, removed from bids`)
           }
           if (newSellRem === 0n) {
-            asks = asks.filter(a => a.order_id !== matchResult.sellOrderId)
+            asksArray = asksArray.filter(a => a.order_id !== matchResult.sellOrderId)
             console.log(`[executor] ${network}: sell order ${matchResult.sellOrderId} fully filled, removed from asks`)
           }
           
           // If no more orders on one side, stop matching this pair
-          if (!bids.length || !asks.length) {
+          if (!bidsArray.length || !asksArray.length) {
             console.log(`[executor] ${network}: no more orders on one side for ${pairKey}, stopping`)
             continueMatching = false
           }
@@ -2820,8 +2845,8 @@ async function processOrders(rows, network = 'bsc') {
       }
       
       // Combine market orders with limit orders for matching
-      const allBids = [...existingPair.bids, ...marketBids]
-      const allAsks = [...existingPair.asks, ...marketAsks]
+      let allBids = [...existingPair.bids, ...marketBids]
+      let allAsks = [...existingPair.asks, ...marketAsks]
       
       console.log(`[executor] ${network}: matching market orders for ${base}/${quote}: ${allBids.length} bids, ${allAsks.length} asks`)
       
@@ -2860,10 +2885,10 @@ async function processOrders(rows, network = 'bsc') {
             const newSellRem = BigInt(matchResult.newSellRem || 0)
             
             if (newBuyRem === 0n) {
-              allBids.filter(b => b.order_id !== matchResult.buyOrderId)
+              allBids = allBids.filter(b => b.order_id !== matchResult.buyOrderId)
             }
             if (newSellRem === 0n) {
-              allAsks.filter(a => a.order_id !== matchResult.sellOrderId)
+              allAsks = allAsks.filter(a => a.order_id !== matchResult.sellOrderId)
             }
             
             if (!allBids.length || !allAsks.length) {
@@ -3211,7 +3236,6 @@ async function runOnce(network = 'bsc') {
     runCrossChain().catch((e) => console.error('[executor] scheduled cross-chain run failed:', e))
   }, EXECUTOR_INTERVAL_MS)
 })()
-
 
 
 
