@@ -3766,15 +3766,20 @@ app.post('/api/liquidity-ladders', async (req, res) => {
     console.log(`[liquidity-ladders] Amount per level: ${amountPerLevel.toString()}`)
 
     // Build ladder auth struct for the LadderSettlement contract
+    // Prices must be scaled by 1e8 for contract compatibility
+    const PRICE_SCALE_NUM = 1e8
+    const priceStartScaled = String(Math.round(parseFloat(priceStart) * PRICE_SCALE_NUM))
+    const priceEndScaled = String(Math.round(parseFloat(priceEnd) * PRICE_SCALE_NUM))
+    
     const ladderAuth = {
       maker: network === 'solana' ? maker : maker.toLowerCase(),
       tokenIn: side === 'sell' ? (network === 'solana' ? baseToken : baseToken.toLowerCase()) : (network === 'solana' ? quoteToken : quoteToken.toLowerCase()),
       tokenOut: side === 'sell' ? (network === 'solana' ? quoteToken : quoteToken.toLowerCase()) : (network === 'solana' ? baseToken : baseToken.toLowerCase()),
       totalAmount: totalAmount,
-      priceStart: priceStart,
-      priceEnd: priceEnd,
+      priceStart: priceStartScaled,
+      priceEnd: priceEndScaled,
       levels: numLevels,
-      expiration: expiration,
+      expiration: expiration || 0,
       nonce: parentOrder?.order?.nonce || '0',
       salt: parentOrder?.order?.salt || String(Date.now())
     }
@@ -4224,6 +4229,7 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
 
 
 
