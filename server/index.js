@@ -387,7 +387,7 @@ const SETTLEMENT_ABI = [
     "type": "function"
   },
 
-  // matchOrders(buy, sigBuy, sell, sigSell, amountBase, amountQuote)
+  // matchOrders(buy, sigBuy, sell, sigSell, amountBase)
   {
     "inputs": [
       {
@@ -424,8 +424,7 @@ const SETTLEMENT_ABI = [
         "type": "tuple"
       },
       { "internalType": "bytes", "name": "sigSell", "type": "bytes" },
-      { "internalType": "uint256", "name": "amountBase", "type": "uint256" },
-      { "internalType": "uint256", "name": "amountQuote", "type": "uint256" }
+      { "internalType": "uint256", "name": "amountBase", "type": "uint256" }
     ],
     "name": "matchOrders",
     "outputs": [],
@@ -3846,8 +3845,7 @@ app.post('/api/liquidity-ladders', async (req, res) => {
           salt: levelSalt,
           // Use parent's signature for all child orders - owner signed the parent which authorizes the ladder
           signature: parentOrder.signature,
-          // Store original parent order data that was actually signed - critical for signature verification
-          order_json: parent,
+          order_json: { ...parent, nonce: levelNonce, salt: levelSalt, amountIn: String(levelAmountIn), amountOutMin: String(levelAmountOutMin) },
           base: network === 'solana' ? baseToken : baseToken.toLowerCase(),
           quote: network === 'solana' ? quoteToken : quoteToken.toLowerCase(),
           base_address: network === 'solana' ? baseToken : baseToken.toLowerCase(),
@@ -4202,6 +4200,7 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
 
 
 
