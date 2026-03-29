@@ -3765,7 +3765,23 @@ app.post('/api/liquidity-ladders', async (req, res) => {
     console.log(`[liquidity-ladders] Price range: ${startPrice} - ${endPrice}`)
     console.log(`[liquidity-ladders] Amount per level: ${amountPerLevel.toString()}`)
 
-    // Create ladder metadata record
+    // Build ladder auth struct for the LadderSettlement contract
+    const ladderAuth = {
+      maker: network === 'solana' ? maker : maker.toLowerCase(),
+      tokenIn: side === 'sell' ? (network === 'solana' ? baseToken : baseToken.toLowerCase()) : (network === 'solana' ? quoteToken : quoteToken.toLowerCase()),
+      tokenOut: side === 'sell' ? (network === 'solana' ? quoteToken : quoteToken.toLowerCase()) : (network === 'solana' ? baseToken : baseToken.toLowerCase()),
+      totalAmount: totalAmount,
+      priceStart: priceStart,
+      priceEnd: priceEnd,
+      levels: numLevels,
+      expiration: expiration,
+      nonce: parentOrder?.order?.nonce || '0',
+      salt: parentOrder?.order?.salt || String(Date.now())
+    }
+    
+    console.log(`[liquidity-ladders] ladderAuth:`, JSON.stringify(ladderAuth))
+    
+    // Create ladder metadata record with ladder_auth and signature
     const { error: ladderError } = await supabase
       .from('liquidity_ladders')
       .insert({
@@ -3780,7 +3796,11 @@ app.post('/api/liquidity-ladders', async (req, res) => {
         price_end: priceEnd,
         levels: numLevels,
         spread_type: spreadType,
-        status: 'active'
+        status: 'active',
+        // New fields for LadderSettlement contract
+        ladder_auth: ladderAuth,
+        ladder_signature: parentOrder?.signature || null,
+        settlement_contract: process.env.LADDER_SETTLEMENT_ADDRESS_BSC || null
       })
 
     if (ladderError) {
@@ -3857,6 +3877,8 @@ app.post('/api/liquidity-ladders', async (req, res) => {
           status: 'open',
           ladder_id: ladderId,
           ladder_level: i + 1,
+          is_ladder_order: true,
+          ladder_level_index: i,
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString()
         }
@@ -3930,6 +3952,8 @@ app.post('/api/liquidity-ladders', async (req, res) => {
           status: 'open',
           ladder_id: ladderId,
           ladder_level: i + 1,
+          is_ladder_order: true,
+          ladder_level_index: i,
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString()
         }
