@@ -10,6 +10,18 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import { WebSocketServer } from 'ws'
 
+// Helper function to safely stringify objects containing BigInt values
+function safeStringify(obj, maxLength = null) {
+  const replacer = (key, value) => {
+    if (typeof value === 'bigint') {
+      return value.toString()
+    }
+    return value
+  }
+  const result = JSON.stringify(obj, replacer)
+  return maxLength ? result.substring(0, maxLength) : result
+}
+
 // Simple indexer service for new WBNB pools on BSC (extensible for other networks)
 // Exposes REST endpoints the UI can consume.
 
@@ -3714,7 +3726,9 @@ app.post('/api/liquidity-ladders', async (req, res) => {
       levels = 10,
       spreadType = 'linear', // 'linear' or 'geometric'
       expiration = 0,
-      parentOrder, // Single signed parent order from frontend (new approach)
+      ladderAuth, // NEW: Direct ladder auth struct from frontend (signed with LadderSettlement domain)
+      signature, // NEW: Signature from frontend (signed with LadderSettlement domain)
+      parentOrder, // Legacy: Single signed parent order from frontend (old approach)
       orders: signedOrders // Legacy: Array of pre-signed orders from frontend
     } = body
 
@@ -3768,23 +3782,59 @@ app.post('/api/liquidity-ladders', async (req, res) => {
     // Build ladder auth struct for the LadderSettlement contract
     // Prices must be scaled by 1e8 for contract compatibility
     const PRICE_SCALE_NUM = 1e8
-    const priceStartScaled = String(Math.round(parseFloat(priceStart) * PRICE_SCALE_NUM))
-    const priceEndScaled = String(Math.round(parseFloat(priceEnd) * PRICE_SCALE_NUM))
     
-    const ladderAuth = {
-      maker: network === 'solana' ? maker : maker.toLowerCase(),
-      tokenIn: side === 'sell' ? (network === 'solana' ? baseToken : baseToken.toLowerCase()) : (network === 'solana' ? quoteToken : quoteToken.toLowerCase()),
-      tokenOut: side === 'sell' ? (network === 'solana' ? quoteToken : quoteToken.toLowerCase()) : (network === 'solana' ? baseToken : baseToken.toLowerCase()),
-      totalAmount: totalAmount,
-      priceStart: priceStartScaled,
-      priceEnd: priceEndScaled,
-      levels: numLevels,
-      expiration: expiration || 0,
-      nonce: parentOrder?.order?.nonce || '0',
-      salt: parentOrder?.order?.salt || String(Date.now())
+    // NEW APPROACH: Use ladderAuth and signature directly from frontend (signed with LadderSettlement domain)
+    // FALLBACK: Build from parentOrder if not provided (legacy support)
+    let ladderAuthToStore
+    let ladderSignatureToStore
+    
+    if (ladderAuth && signature) {
+      // New format: frontend sends ladderAuth struct and signature directly
+      console.log('[liquidity-ladders] Using ladderAuth from frontend (new format)')
+      
+      // Ensure prices are scaled by 1e8
+      const priceStartScaled = String(Math.round(parseFloat(priceStart) * PRICE_SCALE_NUM))
+      const priceEndScaled = String(Math.round(parseFloat(priceEnd) * PRICE_SCALE_NUM))
+      
+      ladderAuthToStore = {
+        maker: network === 'solana' ? ladderAuth.maker : ladderAuth.maker.toLowerCase(),
+        tokenIn: network === 'solana' ? ladderAuth.tokenIn : ladderAuth.tokenIn.toLowerCase(),
+        tokenOut: network === 'solana' ? ladderAuth.tokenOut : ladderAuth.tokenOut.toLowerCase(),
+        totalAmount: ladderAuth.totalAmount,
+        priceStart: priceStartScaled,
+        priceEnd: priceEndScaled,
+        levels: parseInt(ladderAuth.levels) || numLevels,
+        expiration: ladderAuth.expiration || 0,
+        nonce: ladderAuth.nonce || '0',
+        salt: ladderAuth.salt || String(Date.now())
+      }
+      ladderSignatureToStore = signature
+    } else if (parentOrder && parentOrder.order && parentOrder.signature) {
+      // Legacy format: build from parentOrder
+      console.log('[liquidity-ladders] Using parentOrder (legacy format)')
+      const priceStartScaled = String(Math.round(parseFloat(priceStart) * PRICE_SCALE_NUM))
+      const priceEndScaled = String(Math.round(parseFloat(priceEnd) * PRICE_SCALE_NUM))
+      
+      ladderAuthToStore = {
+        maker: network === 'solana' ? parentOrder.order.maker : parentOrder.order.maker.toLowerCase(),
+        tokenIn: side === 'sell' ? (network === 'solana' ? baseToken : baseToken.toLowerCase()) : (network === 'solana' ? quoteToken : quoteToken.toLowerCase()),
+        tokenOut: side === 'sell' ? (network === 'solana' ? quoteToken : quoteToken.toLowerCase()) : (network === 'solana' ? baseToken : baseToken.toLowerCase()),
+        totalAmount: totalAmount,
+        priceStart: priceStartScaled,
+        priceEnd: priceEndScaled,
+        levels: numLevels,
+        expiration: parentOrder.order.expiration || 0,
+        nonce: parentOrder.order.nonce || '0',
+        salt: parentOrder.order.salt || String(Date.now())
+      }
+      ladderSignatureToStore = parentOrder.signature
+    } else {
+      // Neither provided - error
+      return res.status(400).json({ error: 'Either ladderAuth+signature or parentOrder is required' })
     }
     
-    console.log(`[liquidity-ladders] ladderAuth:`, JSON.stringify(ladderAuth))
+    console.log(`[liquidity-ladders] ladderAuth:`, safeStringify(ladderAuthToStore))
+    console.log(`[liquidity-ladders] ladderSignature:`, ladderSignatureToStore?.substring(0, 20) + '...')
     
     // Create ladder metadata record with ladder_auth and signature
     const { error: ladderError } = await supabase
@@ -3803,8 +3853,8 @@ app.post('/api/liquidity-ladders', async (req, res) => {
         spread_type: spreadType,
         status: 'active',
         // New fields for LadderSettlement contract
-        ladder_auth: ladderAuth,
-        ladder_signature: parentOrder?.signature || null,
+        ladder_auth: ladderAuthToStore,
+        ladder_signature: ladderSignatureToStore,
         settlement_contract: process.env.LADDER_SETTLEMENT_ADDRESS_BSC || null
       })
 
@@ -3813,11 +3863,11 @@ app.post('/api/liquidity-ladders', async (req, res) => {
       // Continue anyway - the orders are more important
     }
 
-    // NEW APPROACH: Generate child orders in backend from parent order
-    // Parent order is signed once, backend creates all child orders with calculated prices
-    if (parentOrder && parentOrder.order && parentOrder.signature) {
+    // NEW APPROACH: Generate child orders in backend from ladderAuth (new format) or parentOrder (legacy)
+    // Both formats now store ladderAuth in ladderAuthToStore with the proper LadderSettlement signature
+    if (ladderAuthToStore && ladderSignatureToStore) {
       const createdOrders = []
-      const parent = parentOrder.order
+      const auth = ladderAuthToStore
       
       // Calculate amount per level
       const amountPerLevel = totalAmt / BigInt(numLevels)
@@ -3831,23 +3881,20 @@ app.post('/api/liquidity-ladders', async (req, res) => {
         const levelAmountIn = amountPerLevel
         
         // Calculate amountOutMin using BigInt to avoid precision loss
-        // price is human-readable (e.g., 300.50 USDT per BNB)
-        // amountIn is in wei, so result is: amountIn * price
-        // Convert price to BigInt: price * 1e8, then multiply by amountIn, then divide by 1e8
         const priceScaled = BigInt(Math.round(price * 1e8))
         const levelAmountOutMin = (levelAmountIn * priceScaled) / PRICE_SCALE
         
-        // Generate unique nonce and salt for each level
-        const levelNonce = String(Number(parent.nonce || 0) + i)
-        const levelSalt = String(Number(parent.salt || 0) + i)
+        // Generate unique nonce and salt for each level (from ladderAuth)
+        const levelNonce = String(Number(auth.nonce || 0) + i)
+        const levelSalt = String(Number(auth.salt || 0) + i)
         
         const orderId = crypto.randomUUID()
         const orderHash = sha1(JSON.stringify({ 
           network, 
-          maker: network === 'solana' ? parent.maker : toLower(parent.maker), 
+          maker: auth.maker, 
           nonce: levelNonce, 
-          tokenIn: network === 'solana' ? parent.tokenIn : toLower(parent.tokenIn), 
-          tokenOut: network === 'solana' ? parent.tokenOut : toLower(parent.tokenOut), 
+          tokenIn: auth.tokenIn, 
+          tokenOut: auth.tokenOut, 
           salt: levelSalt
         }))
 
@@ -3855,22 +3902,18 @@ app.post('/api/liquidity-ladders', async (req, res) => {
           network,
           order_id: orderId,
           order_hash: orderHash,
-          maker: network === 'solana' ? parent.maker : toLower(parent.maker),
-          token_in: network === 'solana' ? parent.tokenIn : toLower(parent.tokenIn),
-          token_out: network === 'solana' ? parent.tokenOut : toLower(parent.tokenOut),
+          maker: auth.maker,
+          token_in: auth.tokenIn,
+          token_out: auth.tokenOut,
           amount_in: String(levelAmountIn),
           amount_out_min: String(levelAmountOutMin),
-          expiration: (() => {
-            const exp = parent.expiration;
-            if (typeof exp === 'bigint') return new Date(Number(exp.toString()) * 1000).toISOString();
-            return exp ? new Date(Number(exp) * 1000).toISOString() : null;
-          })(),
+          expiration: auth.expiration ? new Date(Number(auth.expiration) * 1000).toISOString() : null,
           nonce: levelNonce,
-          receiver: network === 'solana' ? parent.receiver : toLower(parent.receiver || ''),
+          receiver: auth.maker, // Ladder orders don't have separate receiver
           salt: levelSalt,
-          // Use parent's signature for all child orders - owner signed the parent which authorizes the ladder
-          signature: parentOrder.signature,
-          order_json: { ...parent, nonce: levelNonce, salt: levelSalt, amountIn: String(levelAmountIn), amountOutMin: String(levelAmountOutMin) },
+          // Use the ladder's signature for all child orders
+          signature: ladderSignatureToStore,
+          order_json: { ...auth, nonce: levelNonce, salt: levelSalt, amountIn: String(levelAmountIn), amountOutMin: String(levelAmountOutMin) },
           base: network === 'solana' ? baseToken : baseToken.toLowerCase(),
           quote: network === 'solana' ? quoteToken : quoteToken.toLowerCase(),
           base_address: network === 'solana' ? baseToken : baseToken.toLowerCase(),
@@ -3881,11 +3924,8 @@ app.post('/api/liquidity-ladders', async (req, res) => {
           remaining: String(levelAmountIn),
           status: 'open',
           ladder_id: ladderId,
-          ladder_level: i + 1,
           is_ladder_order: true,
-          ladder_level_index: i,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString()
+          ladder_level_index: i
         }
 
         const tableName = network === 'crosschain' ? 'cross_chain_orders' : 'orders'
