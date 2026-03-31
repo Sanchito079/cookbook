@@ -3013,6 +3013,12 @@ app.post('/api/orders', async (req, res) => {
     console.log('[SERVER ORDERS POST] Order amountIn type:', typeof order.amountIn)
     console.log('[SERVER ORDERS POST] Order amountOutMin from frontend:', order.amountOutMin)
     console.log('[SERVER ORDERS POST] Order amountOutMin type:', typeof order.amountOutMin)
+    
+    // Get decimals for tokens (early to avoid temporal dead zone issues)
+    const [tokenInDec, tokenOutDec] = await Promise.all([
+      fetchTokenDecimals(order.tokenIn, network),
+      fetchTokenDecimals(order.tokenOut, network)
+    ])
     console.log('[SERVER ORDERS POST] Token decimals - tokenInDec:', tokenInDec, ', tokenOutDec:', tokenOutDec)
     console.log('[SERVER ORDERS POST] Order expiration:', order.expiration)
     console.log('[SERVER ORDERS POST] Order expiration type:', typeof order.expiration)
@@ -3029,12 +3035,6 @@ app.post('/api/orders', async (req, res) => {
     const bSym = (body.baseSymbol || '').toUpperCase()
     const qSym = (body.quoteSymbol || '').toUpperCase()
     if (bSym === 'BNB' || qSym === 'BNB') return res.status(400).json({ error: 'BNB pairs not accepted' })
-
-    // Get decimals for tokens by fetching from contracts
-    const [tokenInDec, tokenOutDec] = await Promise.all([
-      fetchTokenDecimals(order.tokenIn, network),
-      fetchTokenDecimals(order.tokenOut, network)
-    ])
 
     const { side, price } = classifyOrder(network, base, quote, order, tokenInDec, tokenOutDec)
 
@@ -4290,6 +4290,7 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
 
 
 
