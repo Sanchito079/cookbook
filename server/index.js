@@ -3891,7 +3891,8 @@ app.post('/api/liquidity-ladders', async (req, res) => {
       // We use 1e8 to preserve price precision while keeping everything as BigInt
       const PRICE_SCALE = BigInt(1e8)
       
-      // Decimal scale factors for converting amountOutMin to proper wei
+      // Decimal scale factors - the contract expects amountIn and amountOutMin in RAW wei
+      // So we need to multiply by appropriate scale factors
       const BASE_SCALE = BigInt(10) ** BigInt(baseDecimals)
       const QUOTE_SCALE = BigInt(10) ** BigInt(quoteDecimals)
       
@@ -3899,11 +3900,14 @@ app.post('/api/liquidity-ladders', async (req, res) => {
         const price = priceLevels[i]
         const levelAmountIn = amountPerLevel
         
-        // Calculate amountOutMin in quote token wei:
-        // amountOutMin = amountIn * price / (10^baseDecimals) -> then convert to quote wei
-        // Final formula: amountOutMin = (amountIn * price * 10^quoteDecimals) / (10^baseDecimals)
+        // Calculate amountOutMin in RAW quote wei:
+        // 1. Convert levelAmountIn to human-readable: levelAmountIn / BASE_SCALE
+        // 2. Multiply by price to get human-readable quote: * price
+        // 3. Convert to RAW quote wei: * QUOTE_SCALE
+        // Combined: amountOutMin = (levelAmountIn * price * QUOTE_SCALE) / (BASE_SCALE * PRICE_SCALE)
         const priceScaled = BigInt(Math.round(price * 1e8))
         const levelAmountOutMin = (levelAmountIn * priceScaled * QUOTE_SCALE) / (BASE_SCALE * PRICE_SCALE)
+        console.log(`[liquidity-ladders] Level ${i}: amountIn=${levelAmountIn}, price=${price}, amountOutMin=${levelAmountOutMin} (raw quote wei)`)
         
         // Generate unique nonce and salt for each level (from ladderAuth)
         const levelNonce = String(Number(auth.nonce || 0) + i)
@@ -4290,6 +4294,8 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
+
+
 
 
 
