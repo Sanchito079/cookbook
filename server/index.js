@@ -3880,8 +3880,8 @@ app.post('/api/liquidity-ladders', async (req, res) => {
       const auth = ladderAuthToStore
       
       // Get token decimals for proper amount calculation
-      const baseDecimals = await getTokenDecimals(auth.tokenIn, network)
-      const quoteDecimals = await getTokenDecimals(auth.tokenOut, network)
+      const baseDecimals = await fetchTokenDecimals(auth.tokenIn, network)
+      const quoteDecimals = await fetchTokenDecimals(auth.tokenOut, network)
       console.log(`[liquidity-ladders] Token decimals - base: ${baseDecimals}, quote: ${quoteDecimals}`)
       
       // Calculate amount per level
