@@ -200,7 +200,7 @@ const getTokenDecimalsFallback = async (tokenAddr, network = 'bsc') => {
 
 // Settlement config for executor
 const SETTLEMENT_ADDRESS_BSC = process.env.SETTLEMENT_ADDRESS_BSC || '0x76E458478Dc716B751652B78D8Da2B93A4A23189'
-const SETTLEMENT_ADDRESS_BASE = process.env.SETTLEMENT_ADDRESS_BASE || '0xBBf7A39F053BA2B8F4991282425ca61F2D871f45'
+const SETTLEMENT_ADDRESS_BASE = process.env.SETTLEMENT_ADDRESS_BASE || '0x6387aCBcb66fd0f9e64068303c74Ba42c200DAf9'
 const SETTLEMENT_ABI = [
   // custom errors
   { "inputs": [], "name": "BadSignature", "type": "error" },
@@ -3010,7 +3010,10 @@ app.post('/api/orders', async (req, res) => {
     console.log('[SERVER ORDERS POST] Order tokenIn:', order.tokenIn)
     console.log('[SERVER ORDERS POST] Order tokenOut:', order.tokenOut)
     console.log('[SERVER ORDERS POST] Order amountIn from frontend:', order.amountIn)
+    console.log('[SERVER ORDERS POST] Order amountIn type:', typeof order.amountIn)
     console.log('[SERVER ORDERS POST] Order amountOutMin from frontend:', order.amountOutMin)
+    console.log('[SERVER ORDERS POST] Order amountOutMin type:', typeof order.amountOutMin)
+    console.log('[SERVER ORDERS POST] Token decimals - tokenInDec:', tokenInDec, ', tokenOutDec:', tokenOutDec)
     console.log('[SERVER ORDERS POST] Order expiration:', order.expiration)
     console.log('[SERVER ORDERS POST] Order expiration type:', typeof order.expiration)
     console.log('[SERVER ORDERS POST] Order expiration converted:', order.expiration ? new Date(Number(order.expiration) * 1000).toISOString() : null)
@@ -3876,6 +3879,11 @@ app.post('/api/liquidity-ladders', async (req, res) => {
       const createdOrders = []
       const auth = ladderAuthToStore
       
+      // Get token decimals for proper amount calculation
+      const baseDecimals = await getTokenDecimals(auth.tokenIn, network)
+      const quoteDecimals = await getTokenDecimals(auth.tokenOut, network)
+      console.log(`[liquidity-ladders] Token decimals - base: ${baseDecimals}, quote: ${quoteDecimals}`)
+      
       // Calculate amount per level
       const amountPerLevel = totalAmt / BigInt(numLevels)
       
@@ -3883,13 +3891,19 @@ app.post('/api/liquidity-ladders', async (req, res) => {
       // We use 1e8 to preserve price precision while keeping everything as BigInt
       const PRICE_SCALE = BigInt(1e8)
       
+      // Decimal scale factors for converting amountOutMin to proper wei
+      const BASE_SCALE = BigInt(10) ** BigInt(baseDecimals)
+      const QUOTE_SCALE = BigInt(10) ** BigInt(quoteDecimals)
+      
       for (let i = 0; i < numLevels; i++) {
         const price = priceLevels[i]
         const levelAmountIn = amountPerLevel
         
-        // Calculate amountOutMin using BigInt to avoid precision loss
+        // Calculate amountOutMin in quote token wei:
+        // amountOutMin = amountIn * price / (10^baseDecimals) -> then convert to quote wei
+        // Final formula: amountOutMin = (amountIn * price * 10^quoteDecimals) / (10^baseDecimals)
         const priceScaled = BigInt(Math.round(price * 1e8))
-        const levelAmountOutMin = (levelAmountIn * priceScaled) / PRICE_SCALE
+        const levelAmountOutMin = (levelAmountIn * priceScaled * QUOTE_SCALE) / (BASE_SCALE * PRICE_SCALE)
         
         // Generate unique nonce and salt for each level (from ladderAuth)
         const levelNonce = String(Number(auth.nonce || 0) + i)
