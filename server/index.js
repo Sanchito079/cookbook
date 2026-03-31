@@ -199,7 +199,7 @@ const getTokenDecimalsFallback = async (tokenAddr, network = 'bsc') => {
 }
 
 // Settlement config for executor
-const SETTLEMENT_ADDRESS_BSC = process.env.SETTLEMENT_ADDRESS_BSC || '0x7DBA6a1488356428C33cC9fB8Ef3c8462c8679d0'
+const SETTLEMENT_ADDRESS_BSC = process.env.SETTLEMENT_ADDRESS_BSC || '0x76E458478Dc716B751652B78D8Da2B93A4A23189'
 const SETTLEMENT_ADDRESS_BASE = process.env.SETTLEMENT_ADDRESS_BASE || '0xBBf7A39F053BA2B8F4991282425ca61F2D871f45'
 const SETTLEMENT_ABI = [
   // custom errors
@@ -3009,6 +3009,8 @@ app.post('/api/orders', async (req, res) => {
     console.log('[SERVER ORDERS POST] Processed quote:', quote)
     console.log('[SERVER ORDERS POST] Order tokenIn:', order.tokenIn)
     console.log('[SERVER ORDERS POST] Order tokenOut:', order.tokenOut)
+    console.log('[SERVER ORDERS POST] Order amountIn from frontend:', order.amountIn)
+    console.log('[SERVER ORDERS POST] Order amountOutMin from frontend:', order.amountOutMin)
     console.log('[SERVER ORDERS POST] Order expiration:', order.expiration)
     console.log('[SERVER ORDERS POST] Order expiration type:', typeof order.expiration)
     console.log('[SERVER ORDERS POST] Order expiration converted:', order.expiration ? new Date(Number(order.expiration) * 1000).toISOString() : null)
@@ -3147,6 +3149,11 @@ app.post('/api/orders', async (req, res) => {
         liquidity_provider_address: body.liquidityProviderAddress || null
       })
     }
+
+    // DEBUG: Log amount_in value being saved to DB
+    console.log('[SERVER ORDERS POST] Saving to DB - amount_in:', row.amount_in)
+    console.log('[SERVER ORDERS POST] Saving to DB - amount_out_min:', row.amount_out_min)
+    console.log('[SERVER ORDERS POST] Saving to DB - remaining:', row.remaining)
 
     console.log('[SERVER ORDERS POST] Order type:', orderType, 'timeInForce:', timeInForce, 'postOnly:', postOnly, 'stopPrice:', stopPrice)
     console.log('[SERVER ORDERS POST] Row expiration value:', row.expiration)
@@ -4269,7 +4276,6 @@ try {
 } catch (e) {
   console.warn('[executor] failed to load:', e?.message || e)
 }
-
 
 
 
