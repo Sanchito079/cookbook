@@ -199,8 +199,8 @@ const getTokenDecimalsFallback = async (tokenAddr, network = 'bsc') => {
 }
 
 // Settlement config for executor
-const SETTLEMENT_ADDRESS_BSC = process.env.SETTLEMENT_ADDRESS_BSC || '0x76E458478Dc716B751652B78D8Da2B93A4A23189'
-const SETTLEMENT_ADDRESS_BASE = process.env.SETTLEMENT_ADDRESS_BASE || '0x6387aCBcb66fd0f9e64068303c74Ba42c200DAf9'
+const SETTLEMENT_ADDRESS_BSC = process.env.SETTLEMENT_ADDRESS_BSC || '0xEc41847eb0488719fe3e4F619B32e9C780D35AAA'
+const SETTLEMENT_ADDRESS_BASE = process.env.SETTLEMENT_ADDRESS_BASE || '0xf883a8C787eeE95a9eC275F48E549adeEa8bd9e9'
 const SETTLEMENT_ABI = [
   // custom errors
   { "inputs": [], "name": "BadSignature", "type": "error" },
